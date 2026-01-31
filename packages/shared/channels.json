@@ -1,0 +1,53 @@
+{
+    "pets": {
+        "channel_name": "Wholesome Paws",
+        "style_suffix": "Pixar 3D style, soft lighting, cute aesthetic",
+        "voice_id": "en-US-AriaNeural",
+        "anchor_image": "../assets/anchors/pets_character.png",
+        "background_music": "../assets/music/upbeat_happy.mp3",
+        "youtube": {
+            "channel_id": "UC_PETS_CHANNEL_ID",
+            "default_tags": [
+                "pets",
+                "animals",
+                "cute",
+                "funny pets"
+            ],
+            "thumbnail_style": "bright, colorful, expressive faces"
+        }
+    },
+    "history": {
+        "channel_name": "Epic History Tales",
+        "style_suffix": "cinematic, epic, dramatic lighting, historical accuracy",
+        "voice_id": "en-US-GuyNeural",
+        "anchor_image": "../assets/anchors/history_narrator.png",
+        "background_music": "../assets/music/epic_orchestral.mp3",
+        "youtube": {
+            "channel_id": "UC_HISTORY_CHANNEL_ID",
+            "default_tags": [
+                "history",
+                "documentary",
+                "ancient",
+                "civilization"
+            ],
+            "thumbnail_style": "dramatic, sepia tones, bold text"
+        }
+    },
+    "scifi": {
+        "channel_name": "Future Visions",
+        "style_suffix": "cyberpunk, neon lights, futuristic, sci-fi aesthetic",
+        "voice_id": "en-US-JennyNeural",
+        "anchor_image": "../assets/anchors/scifi_character.png",
+        "background_music": "../assets/music/synth_ambient.mp3",
+        "youtube": {
+            "channel_id": "UC_SCIFI_CHANNEL_ID",
+            "default_tags": [
+                "sci-fi",
+                "future",
+                "technology",
+                "space"
+            ],
+            "thumbnail_style": "neon, dark background, glowing elements"
+        }
+    }
+}

@@ -1,0 +1,55 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+generator client_py {
+  provider = "prisma-client-py"
+  output   = "../.venv/Lib/site-packages/prisma"
+  interface = "asyncio"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Channel {
+  id             String   @id @default(cuid())
+  nicheId        String   @unique // e.g., "pets", "history"
+  name           String
+  styleSuffix    String   @db.Text
+  voiceId        String
+  anchorImage    String?
+  bgMusic        String?
+  youtubeId      String?
+  defaultTags    String[]
+  thumbnailStyle String?
+  apiToken       String?  // Encrypted YouTube token path
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  videos         Video[]
+  characters     Character[]
+}
+
+model Character {
+  id        String   @id @default(cuid())
+  channelId String
+  channel   Channel  @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  name      String
+  imageUrl  String
+  createdAt DateTime @default(now())
+}
+
+model Video {
+  id         String   @id @default(cuid())
+  channelId  String
+  channel    Channel  @relation(fields: [channelId], references: [id])
+  title      String
+  status     String   // DRAFT, PROCESSING, UPLOADED
+  script     Json
+  assets     Json?
+  youtubeUrl String?
+  jobId      String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
