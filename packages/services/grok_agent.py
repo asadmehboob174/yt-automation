@@ -679,7 +679,8 @@ class GrokAnimator:
         motion_prompt: str = "",
         style_suffix: str = "Cinematic, dramatic lighting",
         duration: int = 10,
-        aspect_ratio: str = "9:16"
+        aspect_ratio: str = "9:16",
+        dialogue: Optional[str] = None
     ) -> Path:
         """
         Animate an image using Grok Imagine.
@@ -704,7 +705,8 @@ class GrokAnimator:
                 style_suffix=style_suffix,
                 motion_description=motion_prompt,
                 duration=duration_str,
-                aspect=aspect_ratio
+                aspect=aspect_ratio,
+                dialogue=dialogue
             )
             self.generation_count += 1
             logger.info(f"🎥 Generated clip #{self.generation_count}: {result}")

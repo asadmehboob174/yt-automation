@@ -15,12 +15,10 @@ logger = logging.getLogger(__name__)
 class CloudflareImageGenerator:
     """Generate images using Cloudflare Workers AI REST API."""
     
-    # Text-to-Image Model (SDXL - Higher Quality for initial character)
-    TEXT_MODEL = "@cf/stabilityai/stable-diffusion-xl-base-1.0"
+    # Text-to-Image Model (Flux 1 Schnell - Better realism and anatomy)
+    TEXT_MODEL = "@cf/black-forest-labs/flux-1-schnell"
     
-    # Image-to-Image Model (SD 1.5 Img2Img - Better for consistency with reference)
-    # Note: As of early 2026, creating consistent characters often uses 
-    # specific adapters, but img2img with strong guidance is the standard "free" consistent method.
+    # Image-to-Image Model (Keep legacy for now or upgrade if Flux supports img2img)
     IMG2IMG_MODEL = "@cf/runwayml/stable-diffusion-v1-5-img2img"
 
     def __init__(self):
@@ -60,14 +58,12 @@ class CloudflareImageGenerator:
         self.base_url = f"https://api.cloudflare.com/client/v4/accounts/{self.account_id}/ai/run"
 
     async def generate_from_text(self, prompt: str) -> bytes:
-        """Generate high-quality character image from text (SDXL)."""
+        """Generate high-quality character image from text (Flux 1 Schnell)."""
         url = f"{self.base_url}/{self.TEXT_MODEL}"
         
         payload = {
             "prompt": prompt,
-            "num_steps": 20,
-            "height": 1024,
-            "width": 1024
+            "num_steps": 4, # Schnell is fast, 4-8 steps usually enough
         }
         
         return await self._make_request(url, payload)
@@ -109,7 +105,7 @@ class CloudflareImageGenerator:
             "num_steps": 20
         }
         
-        return await self._make_request(url, payload)
+        return await self._make_request(url, payload, is_json_response=False)
 
     async def _download_image(self, url: str) -> bytes:
         async with httpx.AsyncClient() as client:
@@ -117,16 +113,28 @@ class CloudflareImageGenerator:
             resp.raise_for_status()
             return resp.content
 
-    async def _make_request(self, url: str, payload: dict) -> bytes:
+    async def _make_request(self, url: str, payload: dict, is_json_response: bool = True) -> bytes:
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(url, headers=self.headers, json=payload)
             
             if response.status_code != 200:
                 logger.error(f"Cloudflare AI Error: {response.text}")
                 raise RuntimeError(f"Cloudflare AI request failed: {response.text}")
-                
-            # Response is usually the raw image bytes (PNG)
-            return response.content
+            
+            # Flux models return JSON with "result": { "image": "base64..." }
+            if is_json_response:
+                result = response.json()
+                if "result" in result and "image" in result["result"]:
+                     return base64.b64decode(result["result"]["image"])
+                elif "result" in result and isinstance(result["result"], dict):
+                     # Handle other potential JSON structures
+                     logger.warning(f"Unexpected JSON structure: {result.keys()}")
+                     return response.content # Fallback
+                else:
+                    # Some legacy models return binary directly
+                    return response.content
+            else:
+                 return response.content
 
 # Compatibility wrapper to match PuLIDGenerator interface
 class PuLIDGenerator(CloudflareImageGenerator):

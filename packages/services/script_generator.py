@@ -25,6 +25,12 @@ class SceneOutput(BaseModel):
     character_name: str = "Character"
     emotion: str = "neutrally"
 
+    def get_full_image_prompt(self, style_suffix: str = "") -> str:
+        """Combine fields for a complete image generation prompt."""
+        # Add cinematic keywords for realism
+        cinematic_keywords = "Hyper-realistic, 8k resolution, National Geographic photography style, shot on 85mm lens, sharp focus, detailed textures, soft bokeh background, cinematic lighting"
+        return f"{self.character_pose_prompt}, {self.background_description}, {self.camera_angle}, {style_suffix}, {cinematic_keywords}"
+
 
 class VideoScriptOutput(BaseModel):
     """Output schema for complete video script."""
@@ -91,44 +97,54 @@ class ScriptGenerator:
         self._min_interval = 2.0  # 2 seconds between calls (more generous than Gemini)
     
     def _build_prompt(self, topic: str, niche_style: str, scene_count: int = 10) -> str:
-        """Build the prompt for Gemini."""
-        return f"""You are a professional video scriptwriter. Generate a video script about: "{topic}"
+        """Build the prompt for Gemini using the 'Retention-First' framework."""
+        return f"""### ROLE
+Act as an elite YouTube Scriptwriter and Content Strategist specializing in high-retention storytelling. Your goal is to keep viewers watching from the first second until the very end.
 
-Style: {niche_style}
+### WRITING STYLE RULES (STRICT)
+1. NO CLICHÉS: Never start with "Welcome back," "In this video," or "Have you ever wondered."
+2. SHORT SENTENCES: Use punchy, conversational language. Avoid "academic" or "robotic" flow.
+3. THE HOOK: The first 5 seconds must start in the middle of a conflict, a mystery, or a bold claim.
+4. PATTERN INTERRUPTS: Every 45 seconds, insert a "Curiosity Gap" (e.g., "But that was only the beginning," or "Here is where it gets weird.")
+5. SHOW, DON'T TELL: Instead of saying "The dog was happy," describe the visual: "Mochi's tail was blurring from wagging so fast."
 
-Generate exactly {scene_count} scenes. For each scene, provide:
-1. voiceover_text: The narration (2-3 sentences, engaging, hook-focused for first scene)
-2. character_pose_prompt: Detailed character appearance and pose description
-3. background_description: Setting and environment details
-4. duration_in_seconds: 8-12 seconds per scene
-5. camera_angle: "close up", "medium shot", "wide shot", or "extreme close up"
-6. motion_description: What movement happens in the scene
-7. dialogue: Optional spoken dialogue (if character speaks)
-8. character_name: Name of speaking character
-9. emotion: How they speak (e.g., "excitedly", "nervously", "calmly")
+Context:
+Topic: "{topic}"
+Channel Style: {niche_style}
 
-IMPORTANT: The first scene must be a strong hook (15-20 seconds) that grabs attention immediately.
+### STRUCTURAL REQUIREMENTS
+- [HOOK]: 0-15 seconds. High stakes.
+- [THE BUILD]: Introduce the main topic with a unique angle.
+- [CONTENT BLOCKS]: Breakdown of the main points with [VISUAL CUE] tags for B-roll.
+- [THE TWIST]: A piece of information the viewer didn't see coming.
+- [OUTRO]: 5 seconds max. No long goodbyes.
 
+### OUTPUT FORMAT
 Return ONLY valid JSON in this exact format:
 {{
-  "title": "Video Title",
+  "title": "Click-worthy Title",
   "description": "YouTube description (2-3 sentences)",
   "scenes": [
     {{
-      "voiceover_text": "...",
-      "character_pose_prompt": "...",
-      "background_description": "...",
+      "voiceover_text": "Spoken word...",
+      "character_pose_prompt": "Visual description...",
+      "background_description": "Setting...",
       "duration_in_seconds": 10,
       "camera_angle": "medium shot",
-      "motion_description": "...",
+      "motion_description": "Movement...",
       "dialogue": null,
       "character_name": "Character",
       "emotion": "neutrally"
     }}
   ]
-}}"""
+}}
 
-    async def _call_gemini(self, prompt: str, model: str = "gemini-flash-latest", retries: int = 8) -> str:
+(Note: 'scenes' maps to 'script_segments'. 'character_pose_prompt' + 'background_description' + 'motion_description' combined act as 'visual_cue'.)
+
+Generate exactly {scene_count} scenes adhering to the structure above.
+"""
+
+    async def _call_gemini(self, prompt: str, model: str = "gemini-flash-latest", retries: int = 3) -> str:
         """Call Gemini API via HTTP with retry logic for 429 errors."""
         # Log key debug (masked)
         masked_key = f"{self.gemini_key[:4]}...{self.gemini_key[-4:]}" if self.gemini_key else "None"
@@ -141,7 +157,7 @@ Return ONLY valid JSON in this exact format:
                 "parts": [{"text": prompt}]
             }],
             "generationConfig": {
-                "temperature": 0.7,
+                "temperature": 0.8,
                 "maxOutputTokens": 8192
             }
         }
@@ -149,17 +165,21 @@ Return ONLY valid JSON in this exact format:
         import random
         
         async with httpx.AsyncClient() as client:
-            for attempt in range(retries):
+            for attempt in range(retries + 1):
                 try:
                     response = await client.post(url, json=payload, timeout=60.0)
                     
                     if response.status_code == 429:
-                        # More aggressive backoff: 5, 10, 20, 40...
-                        wait_time = (5 * (2 ** (attempt))) + random.uniform(1, 5)
-                        print(f"⚠️ Gemini Rate Limit (429). Waiting {wait_time:.1f}s (Attempt {attempt+1}/{retries})...")
-                        await asyncio.sleep(wait_time)
-                        continue
-                        
+                        if attempt < retries:
+                            # Faster backoff for fewer retries: 3, 6, 12...
+                            wait_time = (3 * (2 ** (attempt))) + random.uniform(1, 3)
+                            print(f"⚠️ Gemini Rate Limit (429). Waiting {wait_time:.1f}s (Attempt {attempt+1}/{retries+1})...")
+                            await asyncio.sleep(wait_time)
+                            continue
+                        else:
+                            print(f"🛑 Gemini Rate Limit reached max attempts ({retries+1}).")
+                            raise httpx.HTTPStatusError("Max retries exceeded for 429", request=response.request, response=response)
+                            
                     response.raise_for_status()
                     result = response.json()
                     
@@ -179,19 +199,32 @@ Return ONLY valid JSON in this exact format:
                         raise ValueError(f"Unexpected Gemini response: {result}")
                         
                 except httpx.HTTPStatusError as e:
-                    if e.response.status_code == 429 and attempt < retries - 1:
-                        # Should be handled by the if block above, but double check
+                    if e.response.status_code == 429 and attempt < retries:
                         continue
                     print(f"❌ Gemini API Error: {e}")
                     raise
                 except Exception as e:
-                    if attempt < retries - 1:
+                    if attempt < retries:
                         print(f"⚠️ Gemini request failed: {e}. Retrying...")
                         await asyncio.sleep(2)
                         continue
-                    print(f"❌ Gemini API Failed after {retries} attempts: {e}")
+                    print(f"❌ Gemini API Failed after {retries+1} attempts: {e}")
                     raise
         return ""
+
+    async def _call_llm(self, prompt: str, gemini_model: str = "gemini-flash-latest") -> str:
+        """Centralized LLM caller with Gemini -> Hugging Face fallback."""
+        print(f"\n✨ Content Engine: Attempting 'Best' model (Gemini {gemini_model})...")
+        try:
+            # Try Gemini first with reduced retries (4 total attempts)
+            result = await self._call_gemini(prompt, model=gemini_model, retries=3)
+            print("✅ Success with Gemini!")
+            return result
+        except Exception as e:
+            print(f"⚠️ Gemini fallback triggered: {e}")
+            print(f"🚀 Switching to 'Reliable' model ({self.HF_MODEL})...")
+            # Clear fallback
+            return await self._call_huggingface(prompt)
 
     async def _call_huggingface(self, prompt: str, max_tokens: int = 4096, timeout: float = 120.0, retries: int = 5) -> str:
         """Call HuggingFace Inference API (OpenAI-compatible) with retry logic."""
@@ -210,7 +243,7 @@ Return ONLY valid JSON in this exact format:
                 {"role": "user", "content": prompt}
             ],
             "max_tokens": max_tokens,
-            "temperature": 0.7,
+            "temperature": 0.8,
             "top_p": 0.95
         }
         
@@ -293,7 +326,7 @@ Return ONLY valid JSON in this exact format:
         """Generate a video script for the given topic."""
         prompt = self._build_prompt(topic, niche_style, scene_count)
         
-        text = await self._call_huggingface(prompt)
+        text = await self._call_llm(prompt)
         
         if "```json" in text:
             text = text.split("```json")[1].split("```")[0]
@@ -313,33 +346,31 @@ Return ONLY valid JSON in this exact format:
         Stage 1: Generate a detailed story narrative in paragraph form.
         User reviews this before proceeding to technical breakdown.
         """
-        prompt = f"""You are a professional storyteller and screenwriter. Create a detailed, engaging story based on this idea:
-
+        prompt = f"""Act as a master storyteller and screenwriter for high-end animated films.
+        
+TASK: Create a gripping, emotional, and visually stunning story narrative based on this idea:
 STORY IDEA: "{story_idea}"
 
-TARGET LENGTH: This story will be adapted into a {scene_count}-scene animated short film with exactly 2 MAIN CHARACTERS.
-STYLE: {style}
-(FOR TESTING: Ensure exactly {scene_count} scenes and exactly 2 characters)
+CONSTRAINTS:
+- Target Length: Adapted into exactly {scene_count} scenes.
+- Characters: Exactly 2 MAIN CHARACTERS with distinct personalities.
+- Style: {style}
 
-Write the story as flowing paragraphs (NOT a scene breakdown yet). Include:
-- Character introductions with personality traits
-- Setting descriptions
-- Plot progression with conflict and resolution
-- Emotional beats and character development
-- A satisfying ending
+STRUCTURE:
+1. The Hook: Start immediately with conflict or mystery.
+2. The Journey: Escalating tension and character growth.
+3. The Climax: A high-stakes moment of truth.
+4. Resolution: Satisfying but leaves a lingering emotion.
 
-The story should be engaging, family-friendly, and visually descriptive.
-Write approximately {scene_count * 2} to {scene_count * 3} paragraphs.
+TONE:
+- Avoid clichés. No "Once upon a time" or generic tropes.
+- Focus on "Show, Don't Tell" regarding emotions.
+- Write in flowing paragraphs (NOT a scene breakdown yet).
+- Length: Approximately {scene_count * 2} to {scene_count * 3} paragraphs.
 
 Output ONLY the story narrative, no headers or metadata."""
 
-        # text = await self._call_huggingface(
-        #     prompt,
-        #     max_tokens=8192,
-        #     timeout=90.0,
-        #     retries=5
-        # )
-        text = await self._call_gemini(prompt)
+        text = await self._call_llm(prompt)
         return text.strip()
 
     def _clean_json_text(self, text: str) -> str:
@@ -356,8 +387,22 @@ Output ONLY the story narrative, no headers or metadata."""
         text = text.strip()
         if not text.startswith("{") and "{" in text:
             text = text[text.find("{"):]
-        if not text.endswith("}") and "}" in text:
-            text = text[:text.rfind("}")+1]
+            
+        # Robustly find the matching closing brace
+        brace_count = 0
+        json_end_index = -1
+        
+        for i, char in enumerate(text):
+            if char == "{":
+                brace_count += 1
+            elif char == "}":
+                brace_count -= 1
+                if brace_count == 0:
+                    json_end_index = i + 1
+                    break
+        
+        if json_end_index != -1:
+            text = text[:json_end_index]
         
         # Step 3: Replace curly/smart quotes with straight quotes
         quote_chars = [
@@ -450,7 +495,7 @@ Create a structured breakdown with:
    - scene_title: Brief title (e.g., "The Discovery")
    - voiceover_text: Narration/Script for this scene (2-3 sentences max).
    - text_to_image_prompt: FULL detailed description for image generation.
-   - character_pose_prompt: Focussed description of character pose/action for consistency.
+   - character_pose_prompt: STRICT 'GOLDEN FORMULA': [Style], [Lighting/Setting]. ([Char 1 Desc]). ([Char 2 Desc]). ACTION: [Specific Action & Camera]. MUST REPEAT STYLE & CHAR DEFS EVERY TIME.
    - background_description: Setting details.
    - image_to_video_prompt: Dynamic movement description.
    - motion_description: Concise motion instruction (e.g. "Pan right", "Character waves").
@@ -458,11 +503,11 @@ Create a structured breakdown with:
    - camera_angle: "wide shot", "close up", etc.
    - dialogue: Character speech with emotion cues, format: '[CHARACTER_NAME]: (emotion) "Speech"'. Use null if no dialogue.
 
-CRITICAL: 
-- Use varied camera angles (Low angle, High angle, Close-up, Wide shot) for cinematic feel
-- First scene must be a strong hook
-- Reference characters by bracketed names like [THE BOY], [THE DRAGON]
-- DO NOT use extra quotes in your output - each string value should have exactly ONE opening quote and ONE closing quote
+CRITICAL RULES FOR 'character_pose_prompt':
+1. ZERO MEMORY: Treat every scene as a standalone job. The AI forgets previous lines.
+2. REPEAT EVERYTHING: You MUST repeat the full Style and full Character Visual Definitions in every single scene.
+3. FORMAT: [STYLE] + [CHARACTER DEFS] + [ACTION]
+   Example: "High-quality Pixar 3D style, cinematic lighting. (Boy: 10yo, slim, red hoodie, jeans). (Cat: orange tabby, fluffy). ACTION: Medium Shot of boy hugging cat."
 
 Return ONLY valid JSON in this exact format:
 {{
@@ -478,13 +523,26 @@ Return ONLY valid JSON in this exact format:
       "scene_title": "The Discovery",
       "voiceover_text": "In the heart of the ancient forest, a boy stumbled upon a secret...",
       "text_to_image_prompt": "A wide, low-angle landscape shot at twilight. [THE BOY] is crouched...",
-      "character_pose_prompt": "[THE BOY] is crouched examining a glowing object...",
+      "character_pose_prompt": "High-quality Pixar 3D style, twilight forest. ([THE BOY]: 10yo, slim, red hoodie, jeans). ACTION: Wide Shot of boy crouching near glowing plant.",
       "background_description": "Ancient forest with bioluminescent plants at twilight...",
       "image_to_video_prompt": "[THE BOY] hesitates, looking around nervously. He slowly reaches out...",
       "motion_description": "[THE BOY] reaches out slowly...",
       "duration_in_seconds": 10,
       "camera_angle": "wide shot",
       "dialogue": "[THE BOY]: (whispering) What is this?"
+    }},
+    {{
+      "scene_number": 2,
+      "scene_title": "The Approach",
+      "voiceover_text": "He moved closer, his breath held tight...",
+      "text_to_image_prompt": "A close-up of [THE BOY]'s face illuminated by the glow...",
+      "character_pose_prompt": "High-quality Pixar 3D style, twilight forest. ([THE BOY]: 10yo, slim, red hoodie, jeans). ACTION: Close-up of boy's face, eyes wide with wonder.",
+      "background_description": "Ancient forest with bioluminescent plants at twilight...",
+      "image_to_video_prompt": "[THE BOY] leans in closer, eyes widening...",
+      "motion_description": "[THE BOY] leans in...",
+      "duration_in_seconds": 5,
+      "camera_angle": "close up",
+      "dialogue": null
     }}
   ]
 }}
@@ -501,7 +559,7 @@ IMPORTANT:
         #     timeout=120.0,
         #     retries=5
         # )
-        text = await self._call_gemini(prompt)
+        text = await self._call_llm(prompt)
         
         print(f"DEBUG: Raw technical breakdown text length: {len(text)}")
         

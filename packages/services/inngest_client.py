@@ -7,7 +7,6 @@ with automatic retries, rate limit handling, and checkpoint recovery.
 import os
 import logging
 from inngest import Inngest
-from inngest.experimental import step_run
 
 logger = logging.getLogger(__name__)
 

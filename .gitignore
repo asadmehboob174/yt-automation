@@ -12,4 +12,6 @@ build
 generated_videos
 /generated/prisma
 chroma_db
+secrets/
+
 

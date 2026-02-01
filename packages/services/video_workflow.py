@@ -253,29 +253,52 @@ async def video_upload_workflow(ctx: Context) -> dict:
 # ============================================
 
 async def generate_scene_images(script: dict, channel_config: dict) -> list[str]:
-    """Generate PuLID character images for each scene."""
-    from .ai_identity import PuLIDGenerator
+    """Generate consistency character images for each scene using Google Whisk."""
+    from .whisk_agent import WhiskAgent
     
-    generator = PuLIDGenerator()
+    # Initialize Whisk Agent
+    # Note: Requires 'python scripts/auth_whisk.py' to be run first for login
+    agent = WhiskAgent(headless=False) # Headful for alpha stability
     storage = R2Storage()
     image_keys = []
     
-    anchor_image_path = channel_config.get("anchorImage")
+    # Determine Aspect Ratio
+    # If "shorts" is in the niche ID or style, use 9:16
+    is_shorts = "shorts" in channel_config.get("nicheId", "").lower() or "shorts" in channel_config.get("styleSuffix", "").lower()
+    logger.info(f"📐 Detected Mode: {'Shorts (9:16)' if is_shorts else 'Landscape (16:9)'}")
+
+    # Generate anchor/consistent character if needed (Optional: Whisk is prompt-based mostly)
+    # anchor_image_path = channel_config.get("anchorImage")
     
-    for i, scene in enumerate(script.get("scenes", [])):
-        logger.info(f"🖼️ Generating image for scene {i+1}")
-        
-        # Generate character image with consistent face
-        image_bytes = await generator.generate(
-            prompt=scene.get("character_pose_prompt", ""),
-            reference_image=anchor_image_path,
-            style_suffix=channel_config.get("styleSuffix", "")
-        )
-        
-        # Upload to R2
-        key = f"clips/{script['niche_id']}/scene_{i:03d}_image.png"
-        storage.upload_asset(image_bytes, key, "image/png")
-        image_keys.append(key)
+    # Prepare Batch
+    prompts = [scene.get("character_pose_prompt", "") for scene in script.get("scenes", [])]
+    style = channel_config.get("styleSuffix", "")
+    
+    logger.info(f"🚀 Starting Auto-Whisk Batch Generation for {len(prompts)} scenes...")
+    
+    # Run Batch (Mimics Auto Whisk Extension)
+    # This keeps the browser open and loops through prompts efficiently
+    batch_results = await agent.generate_batch(
+        prompts=prompts,
+        is_shorts=is_shorts,
+        style_suffix=style,
+        delay_seconds=5
+    )
+    
+    # Process Results
+    for i, (scene, image_bytes) in enumerate(zip(script.get("scenes", []), batch_results)):
+        if not image_bytes:
+            logger.error(f"❌ Skipped scene {i+1} due to generation failure")
+            continue
+            
+        try:
+            # Upload to R2
+            key = f"clips/{script['niche_id']}/scene_{i:03d}_image.png"
+            storage.upload_asset(image_bytes, key, "image/png")
+            image_keys.append(key)
+            logger.info(f"✅ Saved Scene {i+1}: {key}")
+        except Exception as e:
+             logger.error(f"❌ Failed to upload scene {i+1}: {e}")
     
     return image_keys
 
