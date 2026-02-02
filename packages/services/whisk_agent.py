@@ -143,83 +143,43 @@ class WhiskAgent:
                         await sidebar_trigger.first.click(force=True)
                         await asyncio.sleep(0.8)
 
-                # Target the "Subject" h4 header as seen in HTML
-                subject_header = page.locator("h4").filter(has_text="Subject").first
-                if await subject_header.count() > 0:
-                    logger.info("Found Subject section header.")
-                    
-                    for i, char_path in enumerate(character_paths):
-                        logger.info(f"Handling Character Consistency {i+1}/{len(character_paths)}: {char_path.name}")
+                # --- 3a. Handle SUBJECTS (Characters) ---
+                if character_paths:
+                    # Target the "Subject" h4 header as seen in HTML
+                    subject_header = page.locator("h4").filter(has_text="Subject").first
+                    if await subject_header.count() > 0:
+                        logger.info("Found Subject section header.")
                         
-                        # Find potential slots specifically within the sidebar that have a person icon.
-                        # According to HTML, the outer container for a slot has a specific structure.
-                        # We'll look for containers containing the 'person' icon.
-                        slots = page.locator("div:has(i:text('person'))").filter(has_not=page.locator("h1, h2, h3, h4"))
-                        slot_count = await slots.count()
-                        logger.info(f"Detected {slot_count} slots.")
-                        
-                        # If we need more slots, click the 'control_point' button in the Subject section.
-                        if i >= slot_count:
-                            logger.info("Adding new Subject category...")
-                            # Search for the Add button specifically near the Subject header to avoid clicking Scene/Style add buttons
-                            add_btn = page.locator("div").filter(has=page.locator("h4", has_text="Subject")).locator("button[aria-label='Add new category'], button:has(i:text('control_point'))").first
-                            if await add_btn.count() == 0:
-                                # Fallback to global first if local scoping fails
-                                add_btn = page.locator("button[aria-label='Add new category'], button:has(i:text('control_point'))").first
-                                
-                            await add_btn.click()
-                            await asyncio.sleep(2)
-                            slots = page.locator("div:has(i:text('person'))").filter(has_not=page.locator("h1, h2, h3, h4"))
-                            slot_count = await slots.count()
-
-                        target_slot = slots.nth(i)
-                        
-                        try:
-                            # 1. Direct file setting (Mimics Drag and Drop / Direct Upload)
-                            # The user's HTML shows a hidden input[type='file'] inside the container
-                            logger.info(f"Checking for hidden file input in slot {i+1}...")
+                        for i, char_path in enumerate(character_paths):
+                            # STRATEGY: Global Input Management (Stable)
+                            # We use global file inputs, assuming Subjects appear first in the DOM.
                             
-                            # Targeting the hidden input specifically
-                            hidden_input = target_slot.locator("input[type='file']")
-                            if await hidden_input.count() > 0:
-                                logger.info("Uploading via direct file setting on hidden input...")
-                                await hidden_input.first.set_input_files(char_path)
+                            all_inputs = page.locator("input[type='file']")
+                            total_inputs = await all_inputs.count()
+                            
+                            if i >= total_inputs:
+                                logger.info(f"Need Subject slot {i+1} but only {total_inputs} exist. Clicking Add...")
+                                # Robust "Add" button selector (usually the first control_point icon)
+                                add_btn = page.locator("button:has(i:text('control_point')), i:text('control_point')").first
+                                if await add_btn.count() > 0:
+                                    await add_btn.scroll_into_view_if_needed()
+                                    await add_btn.click(force=True)
+                                    await asyncio.sleep(2)
+                                    # Refresh inputs
+                                    all_inputs = page.locator("input[type='file']")
+                            
+                            # Final Upload
+                            if await all_inputs.count() > i:
+                                logger.info(f"Uploading Subject reference to slot {i+1}")
+                                await all_inputs.nth(i).set_input_files(char_path)
                             else:
-                                # 2. Hover Lower Part as requested
-                                logger.info("No file input found, trying hover-reveal...")
-                                await target_slot.scroll_into_view_if_needed()
-                                box = await target_slot.bounding_box()
-                                if box:
-                                    # Hover at 85% depth
-                                    await page.mouse.move(box['x'] + box['width']/2, box['y'] + box['height'] * 0.85)
-                                    await asyncio.sleep(1.2)
-                                else:
-                                    await target_slot.hover()
-                                    await asyncio.sleep(1.2)
-                                
-                                # Target the "Upload Image" button revealed by hover
-                                upload_btn = page.locator("button:has-text('Upload Image')").nth(i)
-                                async with page.expect_file_chooser(timeout=30000) as fc_info:
-                                    await upload_btn.click(force=True)
-                                file_chooser = await fc_info.value
-                                await file_chooser.set_input_files(char_path)
-                                logger.info("Uploaded via revealed button.")
+                                logger.error(f"❌ Failed to find input slot {i+1} for Subject")
                             
-                            await asyncio.sleep(6) # Processing delay
-                        except Exception as e:
-                            logger.error(f"Failed character upload {i+1}: {e}")
-                            # Last chance fallback
-                            try:
-                                all_inputs = page.locator("input[type='file']")
-                                if await all_inputs.count() > i:
-                                    await all_inputs.nth(i).set_input_files(char_path)
-                                    await asyncio.sleep(5)
-                            except: pass
-                    
-                    # Wait for Whisk to analyze the uploaded characters
-                    # The user specifically requested a wait here as analysis takes time.
-                    logger.info("Waiting 12 seconds for Whisk to analyze uploaded characters...")
-                    await asyncio.sleep(12)
+                            await asyncio.sleep(8) # Processing delay
+
+                # --- 3b. Style Handling Removed ---
+                # Reverting to Subject-only stable version as requested.
+
 
             # 2. Enter Prompt
             full_prompt = f"{prompt}, {style_suffix}".strip()
@@ -284,23 +244,48 @@ class WhiskAgent:
             
             # 5. Download Strategy
             # Use the download button if available for better quality, otherwise fallback to img src
-            images = page.locator("img[src^='https://']")
-            count = await images.count()
-            if count > 0:
-                # Hover over the last image to reveal buttons
-                last_img = images.nth(count - 1)
-                await last_img.hover()
+            # Filter for "Main" images (large enough) to avoid icons/avatars
+            # And usually the Result is the LAST valid image (Right side)
+            
+            # Wait a bit for render
+            await asyncio.sleep(2)
+            
+            potential_images = page.locator("img[src^='https://']")
+            count = await potential_images.count()
+            
+            target_img = None
+            valid_images = []
+            
+            for i in range(count):
+                img = potential_images.nth(i)
+                try:
+                    box = await img.bounding_box()
+                    # Filter: Must be substantial size (e.g. > 150px)
+                    if box and box['width'] > 150 and box['height'] > 150:
+                        valid_images.append(img)
+                except:
+                    continue
+            
+            if valid_images:
+                logger.info(f"📸 Found {len(valid_images)} valid images (large size). Selecting the LAST one (Right).")
+                target_img = valid_images[-1] # User specified "Right one", which is usually last in DOM
+            else:
+                logger.warning("⚠️ No large images found. Falling back to simple last text...")
+                if count > 0:
+                    target_img = potential_images.last
+            
+            if target_img:
+                # Hover over the image to reveal buttons
+                await target_img.scroll_into_view_if_needed()
+                await target_img.hover()
                 await asyncio.sleep(0.5)
                 
                 # User's provided HTML for download button contains <i>download</i>
                 # The button is often in a toolbar that appears on hover
                 download_btn = page.locator("button:has(i)").filter(has_text="download").last
                 
-                if await download_btn.count() > 0:
+                if await download_btn.count() > 0 and await download_btn.is_visible():
                     logger.info("💾 Found 'download' button! Triggering download...")
-                    # Sometimes the button needs a real hover/click to register
-                    await download_btn.scroll_into_view_if_needed()
-                    
                     async with page.expect_download() as download_info:
                         # Use JS click as it's more reliable for these floating menus
                         await download_btn.evaluate("el => el.click()")
@@ -325,9 +310,10 @@ class WhiskAgent:
                         return None
                     
                     logger.warning("⚠️ No download button found. Final fallback: img src")
-                    src = await last_img.get_attribute("src")
-                    resp = await page.request.get(src)
-                    return await resp.body()
+                    src = await target_img.get_attribute("src")
+                    if src:
+                        resp = await page.request.get(src)
+                        return await resp.body()
             else:
                 raise RuntimeError("No images found after generation")
 

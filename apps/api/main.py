@@ -550,13 +550,15 @@ async def generate_scene_batch(request: GenerateBatchRequest):
         
         # Character Reference Downloads
         char_local_paths = []
+        style_local_paths = []
         import httpx
         import tempfile
         from pathlib import Path
         
-        if request.character_images:
-            print(f"📥 Downloading {len(request.character_images)} character references for bulk run...")
-            async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient() as client:
+            # 1. Characters
+            if request.character_images:
+                print(f"📥 Downloading {len(request.character_images)} character references for bulk run...")
                 for char in request.character_images:
                     url = char.get("imageUrl")
                     if not url: continue
