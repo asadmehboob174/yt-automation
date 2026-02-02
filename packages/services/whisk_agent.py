@@ -10,11 +10,11 @@ Supports:
 """
 import os
 import asyncio
-import random
 import logging
+import re  # Added for regex header matching
 from pathlib import Path
 from uuid import uuid4
-from typing import Optional
+from typing import Optional, Union, List
 
 from playwright.async_api import async_playwright, Page, BrowserContext, TimeoutError
 
@@ -73,7 +73,8 @@ class WhiskAgent:
         is_shorts: bool = False,
         style_suffix: str = "",
         page: Optional[Page] = None,
-        character_paths: list[Path] = []
+        character_paths: list[Path] = [],
+        style_image_path: Optional[Path] = None
     ) -> bytes:
         """
         Generate a single image.
@@ -220,6 +221,47 @@ class WhiskAgent:
                     # The user specifically requested a wait here as analysis takes time.
                     logger.info("Waiting 12 seconds for Whisk to analyze uploaded characters...")
                     await asyncio.sleep(12)
+                    logger.info("Waiting 12 seconds for Whisk to analyze uploaded characters...")
+                    await asyncio.sleep(12)
+
+            # 1.5 Upload Style Image (New Logic)
+            if style_image_path and style_image_path.exists():
+                 logger.info(f"🎨 Uploading Style Image: {style_image_path.name}")
+                 try:
+                     # Find Style section (scoping by header)
+                     # Whisk now uses ALL CAPS keys usually
+                     style_header = page.locator("h4, div").filter(has_text=re.compile(r"^STYLE$", re.I)).first
+                     
+                     start_y = 0
+                     if await style_header.count() > 0:
+                         box = await style_header.bounding_box()
+                         if box: start_y = box['y']
+                     
+                     # Find file inputs below Style header
+                     # This avoids blindly clicking 'nth' buttons which might be fragile
+                     all_inputs = page.locator("input[type='file']")
+                     target_input = None
+                     
+                     for idx in range(await all_inputs.count()):
+                         inp = all_inputs.nth(idx)
+                         # JS based check for position
+                         y_pos = await inp.evaluate("el => el.getBoundingClientRect().y", timeout=1000)
+                         if y_pos > start_y:
+                             target_input = inp
+                             break # First input below Style header
+                             
+                     if target_input:
+                         await target_input.set_input_files(style_image_path)
+                         logger.info("✅ Style image uploaded successfully.")
+                         await asyncio.sleep(5) # Analysis wait
+                     else:
+                         logger.warning("⚠️ Could not locate specific Style file input. Trying last available input...")
+                         if await all_inputs.count() > 0:
+                             await all_inputs.last.set_input_files(style_image_path)
+                             await asyncio.sleep(5)
+                         
+                 except Exception as e:
+                     logger.error(f"❌ Failed to upload style image: {e}")
 
             # 2. Enter Prompt
             full_prompt = f"{prompt}, {style_suffix}".strip()
@@ -341,7 +383,8 @@ class WhiskAgent:
         is_shorts: bool = False,
         style_suffix: str = "",
         delay_seconds: int = 5,
-        character_paths: list[Path] = []
+        character_paths: list[Path] = [],
+        style_image_path: Optional[Path] = None
     ) -> list[bytes]:
         """
         Generate multiple images in a single session (Bulk Mode).
@@ -368,7 +411,9 @@ class WhiskAgent:
                         is_shorts, 
                         style_suffix, 
                         page=page, # Pass the existing page object
-                        character_paths=character_paths if i == 0 else [] # Upload ONCE per session
+
+                        character_paths=character_paths if i == 0 else [], # Upload ONCE per session
+                        style_image_path=style_image_path if i == 0 else None
                     )
                     results.append(img_bytes)
                     
