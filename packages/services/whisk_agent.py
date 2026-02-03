@@ -36,6 +36,7 @@ class WhiskAgent:
         self.browser = None
         self.pw = None
         self.page = None
+        logger.info("🦄 WhiskAgent initialized (Sequence Flow v3.1 - Style First + Scene Debug)")
         
     async def get_context(self) -> tuple[BrowserContext, any]:
         """Launch browser with persistent profile."""
@@ -67,7 +68,44 @@ class WhiskAgent:
             self.pw = None
         self.page = None
 
+    async def _find_input_for_section(self, page: Page, section_name: str) -> Optional[object]:
+        """Finds a file input associated with a specific section header using JS traversal."""
+        return await page.evaluate(f'''(sectionName) => {{
+            const headers = Array.from(document.querySelectorAll("h1, h2, h3, h4, div"));
+            const targetHeader = headers.find(h => h.innerText.trim().toUpperCase().includes(sectionName));
+            if (!targetHeader) return null;
+            
+            // Find all file inputs
+            const inputs = Array.from(document.querySelectorAll("input[type='file']"));
+            
+            // Find the input that belongs to this header
+            // Logic: The input should be "after" this header and "before" the next significant header
+            
+            let bestInput = null;
+            let minDistance = Infinity;
+            
+            const headerRect = targetHeader.getBoundingClientRect();
+            
+            for (const input of inputs) {{
+                const inputRect = input.getBoundingClientRect();
+                
+                // Must be below the header
+                if (inputRect.y > headerRect.y) {{
+                    const distance = inputRect.y - headerRect.y;
+                    
+                    // Check if there's another header in between
+                    // (This is a simplified check, ideally we'd check DOM structure)
+                    if (distance < minDistance) {{
+                         bestInput = input;
+                         minDistance = distance;
+                    }}
+                }}
+            }}
+            return bestInput; // Returns the DOM element handle (which Playwright converts)
+        }}''', section_name)
+
     async def generate_image(
+
         self, 
         prompt: str, 
         is_shorts: bool = False,
@@ -135,16 +173,89 @@ class WhiskAgent:
                 await page.mouse.click(10, 10)
                 await asyncio.sleep(0.5)
 
-            # 3. Handle Character Consistency (Side Panel)
-            if character_paths:
-                # Ensure sidebar is actually open (if step 0 failed)
-                if await page.locator("h4", has_text="Subject").count() == 0:
+            # 1.4 Ensure Sidebar is open for any uploads
+            logger.info(f"DEBUG: style_image_path={style_image_path}, character_paths_len={len(character_paths) if character_paths else 0}")
+            if style_image_path or character_paths:
+                # Check for "Subject" or "Style" header to see if sidebar is open
+                sidebar_elements = page.locator("h4").filter(has_text=re.compile(r"Subject|Style", re.I))
+                sidebar_count = await sidebar_elements.count()
+                logger.info(f"DEBUG: Sidebar elements count: {sidebar_count}")
+                
+                if sidebar_count == 0:
+                    logger.info("Opening sidebar (ADD IMAGES button)...")
                     sidebar_trigger = page.get_by_text("ADD IMAGES")
                     if await sidebar_trigger.count() > 0:
                         await sidebar_trigger.first.click(force=True)
-                        await asyncio.sleep(0.8)
+                        await asyncio.sleep(2) # Wait for animation and loading
+                    else:
+                        logger.warning("⚠️ Could not find 'ADD IMAGES' trigger button!")
+                else:
+                    logger.info("Sidebar already appears open.")
 
-                # Target the "Subject" h4 header as seen in HTML
+            # 1.5 Upload Style Image (PHASE 1)
+            if style_image_path:
+                exists = style_image_path.exists() if hasattr(style_image_path, "exists") else False
+                logger.info(f"🚀 PHASE 1 START: Style Image Upload. Path: {style_image_path}. Exists: {exists}")
+                
+                if exists:
+                    try:
+                        # Scroll to ensure Style section is visible inside sidebar
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        await asyncio.sleep(1)
+
+                        # Strategy A: Find button by text (Case Insensitive)
+                        # We use regex to match "UPLOAD IMAGE" regardless of case/transform
+                        upload_btn = page.locator("button, div, span").filter(has_text=re.compile(r"UPLOAD IMAGE", re.I)).last
+                        
+                        btn_count = await upload_btn.count()
+                        logger.info(f"DEBUG: 'UPLOAD IMAGE' button count: {btn_count}")
+
+                        if btn_count > 0:
+                            logger.info("Found upload button. Clicking via File Chooser...")
+                            async with page.expect_file_chooser(timeout=30000) as fc_info:
+                                await upload_btn.click(force=True)
+                            file_chooser = await fc_info.value
+                            await file_chooser.set_input_files(style_image_path)
+                            logger.info("✅ SUCCESS: Uploaded via button click.")
+                        else:
+                            logger.warning("⚠️ 'UPLOAD IMAGE' button not found. Trying icons/fallbacks...")
+                            # Strategy B: Find via icons (stylus_note)
+                            icons = page.locator("i").filter(has_text=re.compile(r"stylus_note|location_on", re.I))
+                            logger.info(f"DEBUG: Found {await icons.count()} potential section icons.")
+                            
+                            target_input = page.locator("div").filter(has=page.locator("i", has_text=re.compile(r"stylus_note|location_on", re.I))).locator("input[type='file']").first
+                            if await target_input.count() > 0:
+                                await target_input.set_input_files(style_image_path)
+                                logger.info("✅ SUCCESS: Uploaded via icon-scoped input.")
+                            else:
+                                # Strategy C: Global last resort
+                                all_inputs = page.locator("input[type='file']")
+                                input_count = await all_inputs.count()
+                                logger.info(f"DEBUG: Global file inputs count: {input_count}")
+                                if input_count > 0:
+                                    logger.info("Using global last-resort file input...")
+                                    await all_inputs.last.set_input_files(style_image_path)
+                                    logger.info("✅ SUCCESS: Uploaded via global fallback.")
+                                else:
+                                    logger.error("❌ CRITICAL: No file inputs found on page!")
+
+                        # ALWAYS wait for analysis
+                        logger.info("⏳ Waiting 20 seconds for analysis (Style Phase Pause)...")
+                        await asyncio.sleep(20)
+                            
+                    except Exception as e:
+                        logger.error(f"❌ ERROR in Style Upload Phase: {e}")
+                        await asyncio.sleep(5)
+                else:
+                    logger.warning(f"⚠️ Skipping Phase 1: Style file does not exist at {style_image_path}")
+            else:
+                logger.info("ℹ️ Skipping Phase 1: No style_image_path provided for this scene.")
+
+            # 3. Handle Character Consistency (Side Panel)
+            if character_paths:
+                logger.info("🚀 PHASE 2: Subject Image Uploads")
+                
+                # Check for "Subject" header
                 subject_header = page.locator("h4").filter(has_text="Subject").first
                 if await subject_header.count() > 0:
                     logger.info("Found Subject section header.")
@@ -153,8 +264,6 @@ class WhiskAgent:
                         logger.info(f"Handling Character Consistency {i+1}/{len(character_paths)}: {char_path.name}")
                         
                         # Find potential slots specifically within the sidebar that have a person icon.
-                        # According to HTML, the outer container for a slot has a specific structure.
-                        # We'll look for containers containing the 'person' icon.
                         slots = page.locator("div:has(i:text('person'))").filter(has_not=page.locator("h1, h2, h3, h4"))
                         slot_count = await slots.count()
                         logger.info(f"Detected {slot_count} slots.")
@@ -162,10 +271,8 @@ class WhiskAgent:
                         # If we need more slots, click the 'control_point' button in the Subject section.
                         if i >= slot_count:
                             logger.info("Adding new Subject category...")
-                            # Search for the Add button specifically near the Subject header to avoid clicking Scene/Style add buttons
                             add_btn = page.locator("div").filter(has=page.locator("h4", has_text="Subject")).locator("button[aria-label='Add new category'], button:has(i:text('control_point'))").first
                             if await add_btn.count() == 0:
-                                # Fallback to global first if local scoping fails
                                 add_btn = page.locator("button[aria-label='Add new category'], button:has(i:text('control_point'))").first
                                 
                             await add_btn.click()
@@ -176,22 +283,18 @@ class WhiskAgent:
                         target_slot = slots.nth(i)
                         
                         try:
-                            # 1. Direct file setting (Mimics Drag and Drop / Direct Upload)
-                            # The user's HTML shows a hidden input[type='file'] inside the container
+                            # 1. Direct file setting
                             logger.info(f"Checking for hidden file input in slot {i+1}...")
-                            
-                            # Targeting the hidden input specifically
                             hidden_input = target_slot.locator("input[type='file']")
                             if await hidden_input.count() > 0:
                                 logger.info("Uploading via direct file setting on hidden input...")
                                 await hidden_input.first.set_input_files(char_path)
                             else:
-                                # 2. Hover Lower Part as requested
+                                # 2. Hover Lower Part as fallback
                                 logger.info("No file input found, trying hover-reveal...")
                                 await target_slot.scroll_into_view_if_needed()
                                 box = await target_slot.bounding_box()
                                 if box:
-                                    # Hover at 85% depth
                                     await page.mouse.move(box['x'] + box['width']/2, box['y'] + box['height'] * 0.85)
                                     await asyncio.sleep(1.2)
                                 else:
@@ -218,61 +321,28 @@ class WhiskAgent:
                             except: pass
                     
                     # Wait for Whisk to analyze the uploaded characters
-                    # The user specifically requested a wait here as analysis takes time.
-                    logger.info("Waiting 12 seconds for Whisk to analyze uploaded characters...")
-                    await asyncio.sleep(12)
-                    logger.info("Waiting 12 seconds for Whisk to analyze uploaded characters...")
-                    await asyncio.sleep(12)
+                    logger.info("Waiting 5 seconds after Subject upload...")
+                    await asyncio.sleep(5)
 
-            # 1.5 Upload Style Image (New Logic)
-            if style_image_path and style_image_path.exists():
-                 logger.info(f"🎨 Uploading Style Image: {style_image_path.name}")
-                 try:
-                     # Find Style section (scoping by header)
-                     # Whisk now uses ALL CAPS keys usually
-                     style_header = page.locator("h4, div").filter(has_text=re.compile(r"^STYLE$", re.I)).first
-                     
-                     start_y = 0
-                     if await style_header.count() > 0:
-                         box = await style_header.bounding_box()
-                         if box: start_y = box['y']
-                     
-                     # Find file inputs below Style header
-                     # This avoids blindly clicking 'nth' buttons which might be fragile
-                     all_inputs = page.locator("input[type='file']")
-                     target_input = None
-                     
-                     for idx in range(await all_inputs.count()):
-                         inp = all_inputs.nth(idx)
-                         # JS based check for position
-                         y_pos = await inp.evaluate("el => el.getBoundingClientRect().y", timeout=1000)
-                         if y_pos > start_y:
-                             target_input = inp
-                             break # First input below Style header
-                             
-                     if target_input:
-                         await target_input.set_input_files(style_image_path)
-                         logger.info("✅ Style image uploaded successfully.")
-                         await asyncio.sleep(5) # Analysis wait
-                     else:
-                         logger.warning("⚠️ Could not locate specific Style file input. Trying last available input...")
-                         if await all_inputs.count() > 0:
-                             await all_inputs.last.set_input_files(style_image_path)
-                             await asyncio.sleep(5)
-                         
-                 except Exception as e:
-                     logger.error(f"❌ Failed to upload style image: {e}")
+
 
             # 2. Enter Prompt
             full_prompt = f"{prompt}, {style_suffix}".strip()
             
-            # Clear previous text
+            # Ensure textarea is ready (sometimes analysis locks it)
+            await textarea.wait_for(state="visible", timeout=10000)
             await textarea.click()
+            
+            # Clear previous text
             await page.keyboard.press("Control+A")
             await page.keyboard.press("Backspace")
             
-            await textarea.fill(full_prompt)
-            await asyncio.sleep(0.5)
+            # Type slowly regarding "text is too small" -> likely means "too fast" or race condition
+            # Increased delay to 100ms per user feedback
+            await textarea.type(full_prompt, delay=100) 
+            await asyncio.sleep(1)
+
+
             
             # 3. Click Generate / Submit
             # Wait a moment for validation/UI to update after typing
