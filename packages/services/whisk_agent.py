@@ -12,11 +12,16 @@ import os
 import asyncio
 import logging
 import re  # Added for regex header matching
+import json # Added for locator caching
+import agentql # Added for Live Semantic Discovery
 from pathlib import Path
 from uuid import uuid4
 from typing import Optional, Union, List
 
 from playwright.async_api import async_playwright, Page, BrowserContext, TimeoutError
+from dotenv import load_dotenv
+
+load_dotenv() # Ensure AGENTQL_API_KEY is loaded
 
 logger = logging.getLogger(__name__)
 
@@ -36,73 +41,290 @@ class WhiskAgent:
         self.browser = None
         self.pw = None
         self.page = None
-        logger.info("🦄 WhiskAgent initialized (Sequence Flow v3.1 - Style First + Scene Debug)")
+        self.locator_path = Path(__file__).parent / "whisk_locators.json"
+        logger.info("🦄 WhiskAgent initialized (Hybrid Semantic Flow v4.0)")
         
+    def _load_locators(self):
+        """Load cached locators from JSON."""
+        if self.locator_path.exists():
+            try:
+                with open(self.locator_path, "r") as f:
+                    return json.load(f).get("locators", {})
+            except:
+                return {}
+        return {}
+        
+    def _force_cleanup(self):
+        """Removes lock files that might prevent Chrome from starting."""
+        locks = [
+            self.profile_path / "SingletonLock",
+            self.profile_path / "SingletonCookie",
+            self.profile_path / "SingletonSocket",
+            self.profile_path / "lock",
+            self.profile_path / "Default" / "Site Characteristics Database" / "LOCK",
+            self.profile_path / "Default" / "Sync Data" / "LevelDB" / "LOCK"
+        ]
+        for lock in locks:
+            if lock.exists():
+                try:
+                    lock.unlink()
+                    logger.warning(f"🧹 Removed stale lock file: {lock}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to remove lock {lock}: {e}")
+
     async def get_context(self) -> tuple[BrowserContext, any]:
-        """Launch browser with persistent profile."""
+        """Launch browser with persistent profile and robustness retries."""
+        # 1. Manually patch crash state to prevent "Restore pages" popup
+        self._patch_profile()
+        
         playwright = await async_playwright().start()
         
         args = [
             '--disable-blink-features=AutomationControlled',
             '--no-sandbox',
             '--disable-infobars',
+            '--disable-session-crashed-bubble',
+            '--disable-extensions',
+            '--no-default-browser-check',
+            '--no-first-run',
+            '--disable-gpu',  # Added for stability
+            '--ignore-certificate-errors',
             '--start-maximized'
         ]
         
-        browser = await playwright.chromium.launch_persistent_context(
-            user_data_dir=str(self.profile_path),
-            channel="chrome",
-            headless=self.headless,
-            args=args,
-            viewport=None, # Use actual window size
-        )
-        return browser, playwright
+        for attempt in range(3):
+            try:
+                browser = await playwright.chromium.launch_persistent_context(
+                    user_data_dir=str(self.profile_path),
+                    channel="chrome",
+                    headless=self.headless,
+                    args=args,
+                    viewport=None, # Use actual window size
+                    no_viewport=True,
+                    timeout=20000 # 20s timeout
+                )
+                return browser, playwright
+            except Exception as e:
+                logger.warning(f"⚠️ Browser launch failed (attempt {attempt+1}/3): {e}")
+                if attempt < 2:
+                    logger.info("♻️ Attempting profile cleanup and retry...")
+                    self._force_cleanup()
+                    await asyncio.sleep(2)
+                else:
+                    logger.error("❌ All browser launch attempts failed.")
+                    raise e
+
+    def _patch_profile(self):
+        """Force-clears the Chrome 'Crashed' state in Preferences file."""
+        for sub in ["Default", ""]:
+            pref_path = self.profile_path / sub / "Preferences"
+            if pref_path.exists():
+                try:
+                    with open(pref_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    
+                    # Ensure exit state is Normal
+                    changed = False
+                    if data.get("profile", {}).get("exit_type") != "Normal":
+                        data.setdefault("profile", {})["exit_type"] = "Normal"
+                        changed = True
+                    if data.get("profile", {}).get("exited_cleanly") is not True:
+                        data.setdefault("profile", {})["exited_cleanly"] = True
+                        changed = True
+                    
+                    if changed:
+                        with open(pref_path, 'w', encoding='utf-8') as f:
+                            json.dump(data, f)
+                        logger.info(f"🧹 Patched Chrome Preferences at {pref_path}")
+                except: pass
+
+    async def _get_resilient_locator(self, page: Page, cached, key: str, fallback_selector: str, timeout_ms: int = 3000):
+        """Tries cached locator for a few seconds, then falls back."""
+        cached_selector = cached.get(key)
+        if cached_selector:
+            loc = page.locator(cached_selector)
+            try:
+                # Fast check for the cached one
+                await loc.wait_for(state="attached", timeout=timeout_ms)
+                logger.info(f"🎯 Resilient: Using cached '{key}'")
+                return loc
+            except:
+                logger.warning(f"⚠️ Resilient: Cached '{key}' failed/timed out. Using fallback.")
+        
+        return page.locator(fallback_selector)
+
+    async def _ensure_sidebar_open(self, page: Page):
+        """Robustly opens the sidebar using Live AgentQL Queries."""
+        # Verification: We look for the "Subject" header which only appears in the sidebar
+        sidebar_marker = page.locator("h4, div").filter(has_text=re.compile(r"^Subject$", re.I)).first
+        
+        for attempt in range(5):
+            try:
+                # 1. Quick Visibility Check (STRICT POSITIONAL)
+                if await sidebar_marker.is_visible(timeout=500):
+                    box = await sidebar_marker.bounding_box()
+                    # Sidebar is always on the left edge (X < 200)
+                    if box and box['x'] >= 0 and box['x'] < 200:
+                        logger.info(f"✅ Sidebar verified open (Header at X={box['x']})")
+                        return True
+            except: pass
+
+            logger.info(f"📂 Sidebar NOT verified open (Attempt {attempt+1}/5). Trying trigger...")
+            
+            try:
+                # 2. Live AgentQL Query (Async Safe)
+                if os.getenv("AGENTQL_API_KEY"):
+                    ql_page = await agentql.wrap_async(page) # Use wrap_async for Playwright Async
+                    query = """
+                    {
+                        add_images_button {
+                            xpath
+                        }
+                    }
+                    """
+                    response = await ql_page.query_elements(query)
+                    
+                    if response.add_images_button:
+                        btn = response.add_images_button
+                        logger.info("🤖 AgentQL found sidebar trigger. Clicking...")
+                        try:
+                            await btn.click(force=True, timeout=2000)
+                            await asyncio.sleep(2)
+                        except: pass
+                        
+                        # Verify immediately
+                        if await sidebar_marker.is_visible(timeout=1000):
+                            return True
+                else:
+                    logger.warning("No AGENTQL_API_KEY - skipping AI discovery.")
+            except Exception as ql_err:
+                logger.debug(f"AgentQL attempt failed: {ql_err}")
+
+            # 3. Emergency Backup Strategies
+            # Target the specific yellow button or the text
+            fallbacks = [
+                page.locator("button, div").filter(has_text=re.compile(r"ADD IMAGES", re.I)).last,
+                page.locator("i:text('chevron_right')").locator("xpath=.."),
+                page.locator("button").filter(has=page.locator("i:text('chevron_right')"))
+            ]
+            
+            for f in fallbacks:
+                try:
+                    if await f.count() > 0:
+                        btn = f.first
+                        await btn.scroll_into_view_if_needed()
+                        await btn.click(force=True, timeout=2000)
+                        await asyncio.sleep(2)
+                        if await sidebar_marker.is_visible(timeout=1000):
+                            return True
+                except: continue
+
+            await asyncio.sleep(1)
+
+        return False
 
     async def close(self):
         """Close browser and stop playwright."""
-        if self.browser:
-            await self.browser.close()
+        try:
+            if self.page:
+                await self.page.close()
+            if self.browser:
+                await self.browser.close()
+                self.browser = None
+            if self.pw:
+                await self.pw.stop()
+                self.pw = None
+        except:
+             logger.debug("Browser already closed.")
+        finally:
+            self.page = None
             self.browser = None
-        if self.pw:
-            await self.pw.stop()
             self.pw = None
-        self.page = None
 
-    async def _find_input_for_section(self, page: Page, section_name: str) -> Optional[object]:
-        """Finds a file input associated with a specific section header using JS traversal."""
-        return await page.evaluate(f'''(sectionName) => {{
-            const headers = Array.from(document.querySelectorAll("h1, h2, h3, h4, div"));
-            const targetHeader = headers.find(h => h.innerText.trim().toUpperCase().includes(sectionName));
-            if (!targetHeader) return null;
-            
-            // Find all file inputs
-            const inputs = Array.from(document.querySelectorAll("input[type='file']"));
-            
-            // Find the input that belongs to this header
-            // Logic: The input should be "after" this header and "before" the next significant header
-            
-            let bestInput = null;
-            let minDistance = Infinity;
-            
-            const headerRect = targetHeader.getBoundingClientRect();
-            
-            for (const input of inputs) {{
-                const inputRect = input.getBoundingClientRect();
+    async def _get_section_elements(self, page: Page, section_name: str, selector: str) -> list[object]:
+        """Finds elements (inputs/buttons) strictly between section headers (v7.0 DOM-Sandwich)."""
+        try:
+            result = await page.evaluate('''(args) => {
+                const { sectionName, elementSelector } = args;
+                // 1. Identify only MAJOR Reference Headers (v7.0 Refinement)
+                const candidates = Array.from(document.querySelectorAll("h1, h2, h3, h4, i, span, div, b, button"));
+                const headers = candidates.filter(el => {
+                    const text = (el.textContent || "").trim().toUpperCase();
+                    // MUST be a major section title (SUBJECT, SCENE, STYLE, BACKGROUND)
+                    const isMajorText = text === "SUBJECT" || text === "STYLE" || text === "SCENE" || text === "BACKGROUND" ||
+                                        text === "SUBJECT REFERENCE" || text === "STYLE REFERENCE";
+                    return isMajorText;
+                });
+
+                // 2. Sort headers and filter duplicates
+                headers.sort((a, b) => a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1);
                 
-                // Must be below the header
-                if (inputRect.y > headerRect.y) {{
-                    const distance = inputRect.y - headerRect.y;
-                    
-                    // Check if there's another header in between
-                    // (This is a simplified check, ideally we'd check DOM structure)
-                    if (distance < minDistance) {{
-                         bestInput = input;
-                         minDistance = distance;
-                    }}
-                }}
-            }}
-            return bestInput; // Returns the DOM element handle (which Playwright converts)
-        }}''', section_name)
+                const uniqueHeaders = [];
+                headers.forEach(h => {
+                    const rect = h.getBoundingClientRect();
+                    const last = uniqueHeaders[uniqueHeaders.length - 1];
+                    if (!last || Math.abs(rect.top - last.getBoundingClientRect().top) > 5) {
+                        uniqueHeaders.push(h);
+                    }
+                });
+
+                const headerTexts = uniqueHeaders.map(h => (h.textContent || "").trim());
+
+                // 3. Find our target header
+                const targetHeader = uniqueHeaders.find(h => {
+                    const text = (h.textContent || "").trim().toUpperCase();
+                    if (sectionName === "STYLE") return text.includes("STYLE");
+                    if (sectionName === "SUBJECT") return text.includes("SUBJECT");
+                    if (sectionName === "SCENE" || sectionName === "BACKGROUND") return text.includes("SCENE") || text.includes("BACKGROUND");
+                    return text.includes(sectionName);
+                });
+
+                if (!targetHeader) {
+                    return { indices: [], headerTexts, targetHeaderText: null, nextHeaderText: null };
+                }
+
+                // 4. Find the next major header to create the "Sandwich"
+                const nextHeader = uniqueHeaders[uniqueHeaders.indexOf(targetHeader) + 1];
+
+                // 5. Select all elements matching selector in the entire document
+                const allElements = Array.from(document.querySelectorAll(elementSelector));
+
+                // 6. Filter elements that are strictly BETWEEN targetHeader and nextHeader
+                const indices = [];
+                allElements.forEach((el, idx) => {
+                    const follows = targetHeader.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING;
+                    const precedes = !nextHeader || (el.compareDocumentPosition(nextHeader) & Node.DOCUMENT_POSITION_FOLLOWING);
+                    if (follows && precedes) indices.push(idx);
+                });
+                
+                return { 
+                    indices, 
+                    headerTexts, 
+                    targetHeaderText: (targetHeader.textContent || "").trim(),
+                    nextHeaderText: nextHeader ? (nextHeader.textContent || "").trim() : null 
+                };
+            }''', { sectionName: section_name.toUpperCase(), elementSelector: selector })
+            
+            header_texts = result.get("headerTexts", [])
+            target_header = result.get("targetHeaderText")
+            next_header = result.get("nextHeaderText")
+            indices = result.get("indices", [])
+            
+            logger.info(f"[Sandwich] {section_name}/{selector} | Headers: {header_texts} | Target: {target_header} | Next: {next_header} | Matches: {len(indices)}")
+            
+            if not indices:
+                return []
+                
+            all_elements = await page.query_selector_all(selector)
+            return [all_elements[i] for i in indices if i < len(all_elements)]
+            
+        except Exception as e:
+            logger.debug(f"DOM-Sandwich Search failed for {section_name}/{selector}: {e}")
+            return []
+    async def _find_input_for_section(self, page: Page, section_name: str) -> Optional[object]:
+        """Finds a file input by anchoring on a unique icon or text within a section (v7.0)."""
+        elements = await self._get_section_elements(page, section_name, "input[type='file']")
+        return elements[0] if elements else None
 
     async def generate_image(
 
@@ -112,12 +334,22 @@ class WhiskAgent:
         style_suffix: str = "",
         page: Optional[Page] = None,
         character_paths: list[Path] = [],
-        style_image_path: Optional[Path] = None
+        style_image_path: Optional[Path] = None,
+        dry_run: bool = False
     ) -> bytes:
         """
         Generate a single image.
         Accepts optional 'page' to reuse existing browser session (critical for bulk).
         """
+        logger.info(f"🎨 Whisk generation started. Style: {style_image_path}, Subjects: {len(character_paths)}")
+        for i, p in enumerate(character_paths):
+            exists = p.exists() if hasattr(p, 'exists') else False
+            logger.info(f"  Subject {i+1}: {p} (Exists: {exists})")
+        
+        if style_image_path:
+            exists = style_image_path.exists() if hasattr(style_image_path, 'exists') else False
+            logger.info(f"  Style: {style_image_path} (Exists: {exists})")
+
         browser = None
         pw = None
         
@@ -130,32 +362,57 @@ class WhiskAgent:
             page = self.page
             await page.goto("https://labs.google/fx/tools/whisk/project", timeout=60000)
         
+        # 0. Load Cached Locators
+        cached = self._load_locators()
+        logger.info(f"📍 Loaded {len(cached)} cached locators.")
+        
         try:
             # Check for login requirement
             if "Sign in" in await page.title() or await page.locator("text='Sign in'").count() > 0:
                 logger.error("🛑 Whisk requires login! Please run the login helper script first.")
                 raise RuntimeError("Authentication required. Run 'python scripts/auth_whisk.py'")
 
-            # 0. Fast-path: Sidebar Opening (User wants this clicked within 2s)
-            if character_paths:
-                logger.info("⚡ Attempting immediate sidebar open...")
-                sidebar_trigger = page.get_by_text("ADD IMAGES")
-                try:
-                    # Wait for the trigger to appear (extended to 3s per user request)
-                    await sidebar_trigger.wait_for(state="attached", timeout=3000)
-                    await sidebar_trigger.first.click(force=True)
-                    logger.info("✅ Clicked ADD IMAGES inside 3s window.")
-                    # Let it animate while we do other things
-                except Exception:
-                    logger.info("Sidebar trigger not found instantly, will retry in background flow.")
+            # Cleanup any blocking popups (e.g. Restore pages, cookies)
+            try:
+                # Look for "Restore" or "Close" on modals
+                restore_btn = page.locator("button").filter(has_text=re.compile(r"Restore", re.I))
+                if await restore_btn.count() > 0 and await restore_btn.first.is_visible():
+                    logger.info("🧹 Cleaning up 'Restore pages' popup...")
+                    await restore_btn.first.click(force=True)
+                    await asyncio.sleep(1)
+            except: pass
+
+            # 1. Ensure Sidebar is open for any uploads (BLOCKING)
+            if style_image_path or character_paths:
+                sidebar_ok = await self._ensure_sidebar_open(page)
+                if not sidebar_ok:
+                    logger.error("🛑 Sidebar failed to open! Aborting generation to prevent mis-typing.")
+                    raise UIChangedError("Sidebar failed to open. Check 'ADD IMAGES' button.")
+            else:
+                logger.info("ℹ️ Text-only mode detected (Master Cast). Skipping sidebar opening.")
 
             # 1. Wait for the main interface (textarea)
-            textarea = page.locator("textarea[placeholder*='Describe your idea']")
+            textarea_selector = "textarea[placeholder*='Describe your idea']"
+            
+            # EMERGENCY: One last check for the Restore popup which blocks the textarea
+            try:
+                restore_btn = page.locator("button").filter(has_text=re.compile(r"Restore", re.I))
+                if await restore_btn.count() > 0 and await restore_btn.first.is_visible():
+                    logger.info("🧹 Pre-type Cleanup: Clicking 'Restore'...")
+                    await restore_btn.first.click(force=True)
+                    await asyncio.sleep(1)
+            except: pass
+
+            textarea = await self._get_resilient_locator(
+                page, cached, "prompt_textarea", textarea_selector
+            )
+            
             try:
                 await textarea.wait_for(state="visible", timeout=30000)
             except TimeoutError:
-                logger.error("❌ Could not find Whisk prompt input.")
-                raise UIChangedError("Whisk UI not loaded.")
+                # If sidebar is open, Whisk might be shifted. Try a generic selector.
+                textarea = page.locator("textarea").last
+                await textarea.wait_for(state="visible", timeout=5000)
 
             # 2. Set Aspect Ratio
             target_aspect = "Portrait" if is_shorts else "Landscape"
@@ -173,213 +430,201 @@ class WhiskAgent:
                 await page.mouse.click(10, 10)
                 await asyncio.sleep(0.5)
 
-            # 1.4 Ensure Sidebar is open for any uploads
-            logger.info(f"DEBUG: style_image_path={style_image_path}, character_paths_len={len(character_paths) if character_paths else 0}")
-            if style_image_path or character_paths:
-                # Check for "Subject" or "Style" header to see if sidebar is open
-                sidebar_elements = page.locator("h4").filter(has_text=re.compile(r"Subject|Style", re.I))
-                sidebar_count = await sidebar_elements.count()
-                logger.info(f"DEBUG: Sidebar elements count: {sidebar_count}")
-                
-                if sidebar_count == 0:
-                    logger.info("Opening sidebar (ADD IMAGES button)...")
-                    sidebar_trigger = page.get_by_text("ADD IMAGES")
-                    if await sidebar_trigger.count() > 0:
-                        await sidebar_trigger.first.click(force=True)
-                        await asyncio.sleep(2) # Wait for animation and loading
-                    else:
-                        logger.warning("⚠️ Could not find 'ADD IMAGES' trigger button!")
-                else:
-                    logger.info("Sidebar already appears open.")
+            # 2. Set Aspect Ratio
 
             # 1.5 Upload Style Image (PHASE 1)
             if style_image_path:
                 exists = style_image_path.exists() if hasattr(style_image_path, "exists") else False
-                logger.info(f"🚀 PHASE 1 START: Style Image Upload. Path: {style_image_path}. Exists: {exists}")
+                if not exists:
+                    logger.error(f"❗ CRITICAL: Style image file MISSING: {style_image_path}.")
                 
-                if exists:
+                if (style_image_path and exists):
+                    logger.info(f"🚀 PHASE 1: Style Upload. Path: {style_image_path}")
                     try:
-                        # Scroll to ensure Style section is visible inside sidebar
-                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                        await asyncio.sleep(1)
-
-                        # Strategy A: Find button by text (Case Insensitive)
-                        # We use regex to match "UPLOAD IMAGE" regardless of case/transform
-                        upload_btn = page.locator("button, div, span").filter(has_text=re.compile(r"UPLOAD IMAGE", re.I)).last
+                        # Identify Sidebar for scoping
+                        sidebar = page.locator(".prebs, aside, [class*='sidebar'], [style*='overflow-y']").first
                         
-                        btn_count = await upload_btn.count()
-                        logger.info(f"DEBUG: 'UPLOAD IMAGE' button count: {btn_count}")
+                        # 1. DEFENSIVE SCROLL (Multi-strategy)
+                        uploaded = False
+                        scroll_selectors = ['aside', '[class*="sidebar"]', '.prebs', '[style*=' + "'overflow-y'" + ']']
+                        
+                        for scroll_pos in [0, 500, 1000, 1800]: # Brute force scan
+                            logger.info(f"Scanning sidebar for 'Style' (Scroll: {scroll_pos})...")
+                            try:
+                                await page.evaluate(f"""(pos, selectors) => {{
+                                    for (const sel of selectors) {{
+                                        const el = document.querySelector(sel);
+                                        if (el && (el.scrollHeight > el.clientHeight)) {{
+                                            el.scrollTop = pos; return;
+                                        }}
+                                    }}
+                                }}""", scroll_pos, scroll_selectors)
+                            except: pass
+                            await asyncio.sleep(1)
 
-                        if btn_count > 0:
-                            logger.info("Found upload button. Clicking via File Chooser...")
-                            async with page.expect_file_chooser(timeout=30000) as fc_info:
-                                await upload_btn.click(force=True)
-                            file_chooser = await fc_info.value
-                            await file_chooser.set_input_files(style_image_path)
-                            logger.info("✅ SUCCESS: Uploaded via button click.")
-                        else:
-                            logger.warning("⚠️ 'UPLOAD IMAGE' button not found. Trying icons/fallbacks...")
-                            # Strategy B: Find via icons (stylus_note)
-                            icons = page.locator("i").filter(has_text=re.compile(r"stylus_note|location_on", re.I))
-                            logger.info(f"DEBUG: Found {await icons.count()} potential section icons.")
-                            
-                            target_input = page.locator("div").filter(has=page.locator("i", has_text=re.compile(r"stylus_note|location_on", re.I))).locator("input[type='file']").first
-                            if await target_input.count() > 0:
-                                await target_input.set_input_files(style_image_path)
-                                logger.info("✅ SUCCESS: Uploaded via icon-scoped input.")
-                            else:
-                                # Strategy C: Global last resort
-                                all_inputs = page.locator("input[type='file']")
-                                input_count = await all_inputs.count()
-                                logger.info(f"DEBUG: Global file inputs count: {input_count}")
-                                if input_count > 0:
-                                    logger.info("Using global last-resort file input...")
-                                    await all_inputs.last.set_input_files(style_image_path)
-                                    logger.info("✅ SUCCESS: Uploaded via global fallback.")
-                                else:
-                                    logger.error("❌ CRITICAL: No file inputs found on page!")
+                            # 2. SURGICAL JS DISCOVERY (v7.0 DOM-Sandwich)
+                            js_inputs = await self._get_section_elements(page, "STYLE", "input[type='file']")
+                            if js_inputs:
+                                logger.info("✅ DOM-Sandwich found Style input. Injecting...")
+                                await js_inputs[0].set_input_files(style_image_path)
+                                uploaded = True
+                                break
+                        
+                        # 3. SCOPED LOCATOR (Secondary Fallback)
+                        if not uploaded:
+                            logger.info("Sandwich discovery missed. Trying scoped locator within Style section...")
+                            style_header = page.locator("h1, h2, h3, h4, span, i").filter(has_text=re.compile(r"Style|stylus_note", re.I)).last
+                            style_area = page.locator("div").filter(has=style_header).last
+                            style_input = style_area.locator("input[type='file']")
+                            if await style_input.count() > 0:
+                                await style_input.first.set_input_files(style_image_path)
+                                uploaded = True
+                                logger.info("✅ Scoped locator found Style input.")
 
-                        # ALWAYS wait for analysis
-                        logger.info("⏳ Waiting 20 seconds for analysis (Style Phase Pause)...")
-                        await asyncio.sleep(20)
+                        # 4. AGENTQL FALLBACK (Tertiary)
+                        if not uploaded:
+                            logger.info("Scoped locators missed. Trying AgentQL with sidebar focus...")
+                            try:
+                                ql_page = await agentql.wrap_async(page)
+                                query = "{ sidebar { style_section { upload_box } } }"
+                                response = await ql_page.query_elements(query)
+                                if response.sidebar.style_section.upload_box:
+                                    async with page.expect_file_chooser(timeout=10000) as fc_info:
+                                        await response.sidebar.style_section.upload_box.click(force=True)
+                                    await (await fc_info.value).set_input_files(style_image_path)
+                                    uploaded = True
+                            except: pass
+
+                        if not uploaded:
+                            logger.error("❌ CRITICAL: All Style upload methods failed.")
+                            raise UIChangedError("Could not locate Style upload slot.")
+                        
+                        logger.info("✅ SUCCESS: Phase 1 (Style) complete. Waiting for analysis...")
+                        await asyncio.sleep(10)
                             
                     except Exception as e:
                         logger.error(f"❌ ERROR in Style Upload Phase: {e}")
                         await asyncio.sleep(5)
                 else:
-                    logger.warning(f"⚠️ Skipping Phase 1: Style file does not exist at {style_image_path}")
+                    logger.warning(f"⚠️ Skipping Phase 1: Style file missing/invalid.")
             else:
                 logger.info("ℹ️ Skipping Phase 1: No style_image_path provided for this scene.")
 
-            # 3. Handle Character Consistency (Side Panel)
+            # 3. Handle Character Consistency (PHASE 2 - DOM-Sandwich Slotting)
             if character_paths:
-                logger.info("🚀 PHASE 2: Subject Image Uploads")
-                
-                # Check for "Subject" header
-                subject_header = page.locator("h4").filter(has_text="Subject").first
-                if await subject_header.count() > 0:
-                    logger.info("Found Subject section header.")
-                    
+                logger.info(f"🚀 PHASE 2: Subject Image Uploads. Count: {len(character_paths)}")
+                try:
                     for i, char_path in enumerate(character_paths):
-                        logger.info(f"Handling Character Consistency {i+1}/{len(character_paths)}: {char_path.name}")
-                        
-                        # Find potential slots specifically within the sidebar that have a person icon.
-                        slots = page.locator("div:has(i:text('person'))").filter(has_not=page.locator("h1, h2, h3, h4"))
-                        slot_count = await slots.count()
-                        logger.info(f"Detected {slot_count} slots.")
-                        
-                        # If we need more slots, click the 'control_point' button in the Subject section.
-                        if i >= slot_count:
-                            logger.info("Adding new Subject category...")
-                            add_btn = page.locator("div").filter(has=page.locator("h4", has_text="Subject")).locator("button[aria-label='Add new category'], button:has(i:text('control_point'))").first
-                            if await add_btn.count() == 0:
+                        # RE-SCAN: Find all file inputs strictly inside the Subject sandwich
+                        inputs = await self._get_section_elements(page, "SUBJECT", "input[type='file']")
+                        count = len(inputs)
+                        logger.info(f"Subject sandwich has {count} inputs. Need index {i}.")
+
+                        # Add new slot if needed
+                        if i >= count:
+                            logger.info(f"Adding new Subject slot (slot {i+1})...")
+                            # Find add button inside Subject sandwich
+                            add_btns = await self._get_section_elements(page, "SUBJECT", "button[aria-label='Add new category'], button:has(i:text('control_point'))")
+                            if not add_btns:
+                                # Generic fallback if sandwich button fails
                                 add_btn = page.locator("button[aria-label='Add new category'], button:has(i:text('control_point'))").first
-                                
-                            await add_btn.click()
-                            await asyncio.sleep(2)
-                            slots = page.locator("div:has(i:text('person'))").filter(has_not=page.locator("h1, h2, h3, h4"))
-                            slot_count = await slots.count()
-
-                        target_slot = slots.nth(i)
-                        
-                        try:
-                            # 1. Direct file setting
-                            logger.info(f"Checking for hidden file input in slot {i+1}...")
-                            hidden_input = target_slot.locator("input[type='file']")
-                            if await hidden_input.count() > 0:
-                                logger.info("Uploading via direct file setting on hidden input...")
-                                await hidden_input.first.set_input_files(char_path)
+                                await add_btn.click()
                             else:
-                                # 2. Hover Lower Part as fallback
-                                logger.info("No file input found, trying hover-reveal...")
-                                await target_slot.scroll_into_view_if_needed()
-                                box = await target_slot.bounding_box()
-                                if box:
-                                    await page.mouse.move(box['x'] + box['width']/2, box['y'] + box['height'] * 0.85)
-                                    await asyncio.sleep(1.2)
-                                else:
-                                    await target_slot.hover()
-                                    await asyncio.sleep(1.2)
-                                
-                                # Target the "Upload Image" button revealed by hover
-                                upload_btn = page.locator("button:has-text('Upload Image')").nth(i)
-                                async with page.expect_file_chooser(timeout=30000) as fc_info:
-                                    await upload_btn.click(force=True)
-                                file_chooser = await fc_info.value
-                                await file_chooser.set_input_files(char_path)
-                                logger.info("Uploaded via revealed button.")
+                                await add_btns[0].click()
                             
-                            await asyncio.sleep(6) # Processing delay
-                        except Exception as e:
-                            logger.error(f"Failed character upload {i+1}: {e}")
-                            # Last chance fallback
-                            try:
-                                all_inputs = page.locator("input[type='file']")
-                                if await all_inputs.count() > i:
-                                    await all_inputs.nth(i).set_input_files(char_path)
-                                    await asyncio.sleep(5)
-                            except: pass
+                            await asyncio.sleep(4) # Allow UI to settle
+                            inputs = await self._get_section_elements(page, "SUBJECT", "input[type='file']")
+                            count = len(inputs)
+
+                        if i < count:
+                            logger.info(f"Uploading Character {i+1} to Subject sandwich input {i}...")
+                            await inputs[i].set_input_files(char_path)
+                            await asyncio.sleep(2)
+                        else:
+                            logger.error(f"❌ Failed to find/create Subject slot for character {i+1}")
                     
-                    # Wait for Whisk to analyze the uploaded characters
-                    logger.info("Waiting 5 seconds after Subject upload...")
-                    await asyncio.sleep(5)
+                    logger.info("⏳ Waiting 10 seconds for character analysis...")
+                    await asyncio.sleep(10)
+                except Exception as e:
+                    logger.error(f"❌ Error in Subject Upload Phase: {e}")
 
 
 
-            # 2. Enter Prompt
-            full_prompt = f"{prompt}, {style_suffix}".strip()
+            # 2. Enter Prompt (Clean up commas)
+            full_prompt = f"{prompt.strip().rstrip(',')}, {style_suffix.strip().lstrip(',')}".strip().strip(",")
             
             # Ensure textarea is ready (sometimes analysis locks it)
             await textarea.wait_for(state="visible", timeout=10000)
             await textarea.click()
             
-            # Clear previous text
-            await page.keyboard.press("Control+A")
-            await page.keyboard.press("Backspace")
-            
-            # Type slowly regarding "text is too small" -> likely means "too fast" or race condition
-            # Increased delay to 100ms per user feedback
-            await textarea.type(full_prompt, delay=100) 
-            await asyncio.sleep(1)
+            # Clear previous text and entry
+            await textarea.fill(full_prompt)
+            await asyncio.sleep(0.5)
 
 
             
             # 3. Click Generate / Submit
+            if dry_run:
+                logger.info("🛑 DRY RUN: Skipping Generate click.")
+                return b"dry_run_bytes"
+
             # Wait a moment for validation/UI to update after typing
             await asyncio.sleep(2)
             
-            # Strategy A: User's confirmed HTML (<button><i>arrow_forward</i></button>)
-            # Also try aria-label as it's often present
-            submit_btn = page.locator("button:has(i)").filter(has_text="arrow_forward")
-            
-            if await submit_btn.count() == 0:
-                 submit_btn = page.locator("button[aria-label='Submit prompt'], button[aria-label='Generate']")
-            
-            if await submit_btn.count() > 0:
-                submit_btn = submit_btn.first # Take the first if multiple
-                logger.info("Found 'Submit' button. Checking state...")
-                
-                # Wait for disabled attribute to vanish
-                for _ in range(10): # retry for 5 seconds
-                    is_disabled = await submit_btn.get_attribute("disabled")
-                    if is_disabled is None:
-                        logger.info("✅ Button is active!")
-                        break
-                    logger.info("⏳ Button still disabled/validating...")
-                    await asyncio.sleep(0.5)
-                
+            # Strategy A: Live AgentQL Query (Direct and Robust)
+            submit_btn = None
+            is_ql_submit = False
+            try:
+                ql_page = await agentql.wrap_async(page)
+                # Query for generate_button directly to get interactable element
+                query = "{ generate_button }"
+                response = await ql_page.query_elements(query)
+                if response.generate_button:
+                    submit_btn = response.generate_button
+                    is_ql_submit = True
+                    logger.info("🤖 AgentQL found Generate button.")
+            except Exception as ql_err:
+                logger.debug(f"AgentQL submit detection failed: {ql_err}")
+
+            # Strategy B: Whisk-Native Fallbacks
+            if not is_ql_submit:
+                 if not submit_btn or await submit_btn.count() == 0:
+                    fallbacks = [
+                        # The circular arrow button next to the prompt
+                        page.locator("button:has(i)").filter(has_text="arrow_forward"),
+                        # Or any button with a right arrow icon
+                        page.locator("button").filter(has=page.locator("i, svg").filter(has_text=re.compile(r"arrow|send|forward", re.I))),
+                        # Last resort: ARIA label
+                        page.locator("button[aria-label*='Generate'], button[aria-label*='Submit']")
+                    ]
+                    for f in fallbacks:
+                        if await f.count() > 0:
+                            submit_btn = f.first
+                            break
+
+            if submit_btn:
+                # Type check: AgentQL nodes don't have .count()
+                if not is_ql_submit:
+                    if await submit_btn.count() == 0:
+                         logger.error("❌ Failed to find submit button via fallbacks.")
+                         raise UIChangedError("Submit button missing.")
+                    submit_btn = submit_btn.first 
+                    logger.info(f"Found 'Submit' button ('{await submit_btn.inner_text()}'). Checking state...")
+
                 # Force Click using JavaScript (Bypasses overlays/hit-tests)
                 try:
-                    await submit_btn.evaluate("el => el.click()")
-                    logger.info("🚀 Clicked 'Submit' (via JS force-click)")
+                    if is_ql_submit:
+                        await submit_btn.click(force=True)
+                    else:
+                        await submit_btn.evaluate("el => el.click()")
+                    logger.info("🚀 Clicked 'Generate'")
                 except Exception as e:
-                     logger.warning(f"JS Click failed: {e}. Trying standard click...")
+                     logger.warning(f"Click failed: {e}. Trying standard click...")
                      await submit_btn.click(force=True)
             
             else:
                 logger.warning("⚠️ Specific 'arrow_forward' button not found. Trying generics...")
                 # Strategy C: The Big Arrow Button is usually the last button with an SVG or Icon in the main area
-                # We can target the circle button class if we knew it, but last button is a decent guess for "Send"
                 possible_btns = page.locator("button:has(svg), button:has(i)")
                 count = await possible_btns.count()
                 if count > 0:
