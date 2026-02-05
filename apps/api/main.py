@@ -6,6 +6,7 @@ job status, and Inngest webhook handling.
 """
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
 import os
@@ -55,6 +56,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# Global Lock for Browser Automation (Playwright Profile Serialization)
+BROWSER_LOCK = asyncio.Lock()
 
 # ============================================
 # Models
@@ -410,6 +414,7 @@ class GenerateImageRequest(BaseModel):
     character_name: str
     prompt: str
     niche_id: str
+    is_shorts: bool = False
 
 class GenerateSceneImageRequest(BaseModel):
     scene_index: int
@@ -422,6 +427,7 @@ class GenerateVideoRequest(BaseModel):
     imageUrl: str
     prompt: str
     dialogue: Optional[str] = None
+    camera_angle: Optional[str] = "Medium Shot"
     niche_id: str
 
 @app.post("/scripts/generate")
@@ -511,11 +517,32 @@ async def generate_breakdown(request: GenerateBreakdownRequest):
     
     try:
         generator = ScriptGenerator()
-        breakdown = await generator.generate_technical_breakdown(
-            story_narrative=request.story_narrative,
-            scene_count=scene_count,
-            style=channel.styleSuffix or "High-quality Pixar/Disney 3D Render"
+        
+        # Check for Manual Script Template Markers (Case-insensitive & Emoji-tolerant)
+        narrative_upper = request.story_narrative.upper()
+        is_manual = (
+            "CHARACTER MASTER PROMPTS" in narrative_upper or 
+            "PART 1" in narrative_upper or 
+            "CHARACTER BIOS" in narrative_upper or 
+            "STORYBOARD" in narrative_upper
         )
+        
+        if is_manual:
+            print("ℹ️ Manual Script Template Detected! Parsing via Regex Extraction...")
+            breakdown = await generator.parse_manual_script_llm(request.story_narrative)
+        else:
+            # Secondary check for known script markers even if headers are missing
+            markers = ["SCENE 1", "SCENE:", "SHOT:", "TEXT-TO-IMAGE PROMPT", "IMAGE-TO-VIDEO PROMPT", "DIALOGUE:"]
+            if any(m in narrative_upper for m in markers):
+                print("ℹ️ Manual Script Content Detected (Secondary Check). Parsing manually...")
+                breakdown = await generator.parse_manual_script_llm(request.story_narrative)
+            else:
+                print(f"⚠️ Input not recognized as Manual Script. Start: {narrative_upper[:100]}")
+                breakdown = await generator.generate_technical_breakdown(
+                    story_narrative=request.story_narrative,
+                    scene_count=scene_count,
+                    style=channel.styleSuffix or "High-quality Pixar/Disney 3D Render"
+                )
         return breakdown.model_dump()
     except Exception as e:
         import traceback
@@ -623,15 +650,14 @@ async def generate_character_image(request: GenerateImageRequest):
         channel = await db.channel.find_unique(where={"nicheId": request.niche_id})
         style_suffix = channel.styleSuffix if (channel and channel.styleSuffix) else ""
         
-        # Initialize Agent
-        agent = WhiskAgent(headless=False)
-        
-        # Generate
-        image_bytes = await agent.generate_image(
-            prompt=request.prompt,
-            is_shorts=False,
-            style_suffix=style_suffix
-        )
+        # Initialize Agent and Generate with Global Lock
+        async with BROWSER_LOCK:
+            agent = WhiskAgent(headless=False)
+            image_bytes = await agent.generate_image(
+                prompt=request.prompt,
+                is_shorts=request.is_shorts,
+                style_suffix=style_suffix
+            )
         
         if not image_bytes:
             raise HTTPException(status_code=500, detail="Whisk failed to generate character image")
@@ -773,6 +799,7 @@ async def generate_video(request: GenerateVideoRequest):
                 motion_prompt=request.prompt,
                 style_suffix="Cinematic, Pixar-style 3D animation",
                 duration=10,
+                camera_angle=request.camera_angle or "Medium Shot",
                 aspect_ratio="9:16",
                 dialogue=request.dialogue
             )
@@ -818,11 +845,11 @@ async def generate_video(request: GenerateVideoRequest):
 # ============================================
 
 class StitchVideosRequest(BaseModel):
-    video_urls: list[str]  # URLs of scene videos to stitch
+    video_urls: list[str]
     niche_id: str
     title: str = "Stitched Video"
-    niche_type: str = "general"  # e.g. 'horror', 'relaxation', 'documentary', 'action'
-
+    niche_type: str = "general"
+    music_mood: Optional[str] = None # New field for manual selection
 
 @app.post("/videos/stitch")
 async def stitch_videos(request: StitchVideosRequest):
@@ -889,20 +916,84 @@ async def stitch_videos(request: StitchVideosRequest):
         
         if not local_clips:
             raise HTTPException(status_code=400, detail="No videos could be downloaded")
+
+        # 1.5 Validate Clips (Check for corruption)
+        print(f"🕵️ Validating {len(local_clips)} clips...")
+        import ffmpeg as ffprobe_lib
+        corrupt_indices = []
+        corrupt_urls = []
         
-        # 2. Stitch with FFmpeg (with black fade transitions)
-        # Determine format from niche or assume Short if not specified, 
-        # but ideal is to detect from FIRST video clip or Niche settings.
-        # Since we don't have explicit format in request, let's infer from aspect ratio of first clip?
-        # Better: Add target_resolution to editor call.
+        for i, clip_path in enumerate(local_clips):
+            is_valid = False
+            try:
+                # Check size first
+                if clip_path.stat().st_size < 1000: # < 1KB is definitely wrong
+                     print(f"   ❌ Clip {i} {clip_path.name} is too small ({clip_path.stat().st_size} bytes)")
+                else:
+                    # Check with ffprobe
+                    ffprobe_lib.probe(str(clip_path))
+                    is_valid = True
+            except Exception as e:
+                print(f"   ❌ Clip {i} {clip_path.name} is invalid/corrupt: {e}")
+            
+            if not is_valid:
+                corrupt_indices.append(i)
+                corrupt_urls.append(request.video_urls[i])
+
+        if corrupt_indices:
+            print(f"⚠️ Found {len(corrupt_indices)} corrupt clips! Aborting stitch.")
+            # Cleanup
+            for p in local_clips:
+                try: p.unlink() 
+                except: pass
+                
+            # Return distinct error code for Frontend to handle
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "detail": "Corrupt video clips detected",
+                    "code": "CORRUPT_CLIPS",
+                    "corrupt_indices": corrupt_indices,
+                    "corrupt_urls": corrupt_urls
+                }
+            )
+
+        # 2. Stitch with FFmpeg
+        # Fetch actual Channel Config to determine format accurately
+        target_res = (1920, 1080) # Default to Landscape
+        channel_config = None
         
-        # Default to 9:16 (Shorts) if we can't tell, or 16:9 if it looks wide.
-        # Let's use 1080x1920 (Vertical) as default for "Shorts" automation usually.
-        # But if 'horizontal' or 'long' in niche type, maybe 1920x1080?
+        try:
+             # We can't access 'db' directly easily since it's global in main.py but we are inside a function.
+             # Actually, 'db' is available in global scope.
+             channel = await db.channel.find_unique(where={"nicheId": request.niche_id})
+             if channel:
+                 print(f"🔧 System Config: Name='{channel.name}', Niche='{channel.nicheId}', Style='{channel.styleSuffix}'")
+                 
+                 is_shorts = (
+                     "shorts" in channel.nicheId.lower() or 
+                     "shorts" in (channel.styleSuffix or "").lower()
+                 )
+                 
+                 if is_shorts:
+                     target_res = (1080, 1920)
+                     print(f"📐 Aspect Ratio: 9:16 Vertical (Shorts detected)")
+                 else:
+                     target_res = (1920, 1080) 
+                     print(f"📐 Aspect Ratio: 16:9 Landscape (Standard)")
+             else:
+                 print(f"⚠️ Channel config not found for {request.niche_id}, falling back to request.niche_type")
+                 # Fallback logic
+                 if "shorts" in request.niche_type.lower() or "vertical" in request.niche_type.lower():
+                      target_res = (1080, 1920)
+                      print(f"📐 Aspect Ratio Fallback: 9:16 Vertical")
+                 else:
+                      print(f"📐 Aspect Ratio Fallback: 16:9 Landscape")
+
+        except Exception as e:
+            print(f"⚠️ Error fetching channel config: {e}. Defaulting to Landscape.")
         
-        target_res = (1080, 1920) # Portrait default
-        if "landscape" in request.niche_type or "long" in request.niche_type:
-             target_res = (1920, 1080)
+        print(f"🔧 Stitching {len(local_clips)} clips with 0.4s black fade transitions (Target: {target_res})...")
         
         print(f"🔧 Stitching {len(local_clips)} clips with 0.4s black fade transitions (Target: {target_res})...")
         editor = FFmpegVideoEditor(output_dir=temp_dir)
@@ -912,7 +1003,7 @@ async def stitch_videos(request: StitchVideosRequest):
         stitched_path = editor.stitch_clips_with_fade(
             local_clips, 
             stitched_path, 
-            fade_duration=0.4,
+            fade_duration=0.3,
             target_resolution=target_res
         )
         print(f"   ✅ Stitched video created: {stitched_path}")
@@ -927,12 +1018,47 @@ async def stitch_videos(request: StitchVideosRequest):
         from services.mood_analyzer import MoodAnalyzer
         
         # Determine music mood using LLM (smart matching)
-        print(f"🧠 Analyzing video context for music selection...")
-        analyzer = MoodAnalyzer()
-        music_mood = analyzer.analyze_mood(title=request.title, niche=request.niche_type)
-        print(f"   📎 Context: '{request.title}' ({request.niche_type}) -> Music mood: {music_mood}")
+        # Check for Manual Music Override from Channel Config
+        music_path = None
+        music_mood = request.music_mood or "auto" # Initialize scope
         
-        music_path = generate_background_music(video_duration, mood=music_mood)
+        # 1. Check for Explicit User Selection (Render UI)
+        if request.music_mood and request.music_mood.lower() != "auto":
+            print(f"🎵 Manual selection detected: '{request.music_mood}'")
+            try:
+                music_path = generate_background_music(video_duration, mood=request.music_mood)
+            except Exception as e:
+                print(f"   ⚠️ Failed to generate manual music: {e}. Falling back to config/auto.")
+                music_path = None
+
+        # 2. Check for Channel Config Override
+        if not music_path and channel_config and channel_config.bgMusic:
+             print(f"🎵 Found manual background music override for channel.")
+             try:
+                 storage_downloader = R2Storage()
+                 music_path = temp_dir / "manual_bgm.mp3"
+                 storage_downloader.download(channel_config.bgMusic, music_path)
+                 print(f"   ✅ Downloaded manual BGM: {music_path.name}")
+             except Exception as e:
+                 print(f"   ⚠️ Failed to download manual BGM: {e}. Falling back to AI selection.")
+                 music_path = None
+
+        # 3. Auto-Analyze Mood (Fallback)
+        if not music_path:
+            print(f"🧠 Analyzing video context for music selection...")
+            analyzer = MoodAnalyzer()
+            music_mood = analyzer.analyze_mood(title=request.title, niche=request.niche_type)
+            print(f"   📎 Context: '{request.title}' ({request.niche_type}) -> Music mood: {music_mood}")
+            
+            # If niche is 'pets', force 'happy' instead of 'cute' which maps to Carefree (Toon style)
+            if "pet" in request.niche_type.lower() and music_mood == "cute":
+                 music_mood = "happy" # Wallpaper is less annoying than Carefree
+            
+            try:
+                music_path = generate_background_music(video_duration, mood=music_mood)
+            except Exception as e:
+                print(f"   ❌ Music generation failed: {e}")
+                music_path = None
         music_size = music_path.stat().st_size / 1024
         print(f"   ✅ Generated {video_duration:.1f}s of '{music_mood}' ambient music ({music_size:.1f} KB)")
         

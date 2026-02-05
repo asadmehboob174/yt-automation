@@ -16,90 +16,95 @@ class MusicLibrary:
     
     # Kevin MacLeod (incompetech.com) - Licensed under Creative Commons: By Attribution 4.0 License
     # Kevin MacLeod (incompetech.com) - Licensed under Creative Commons: By Attribution 4.0 License
+    # Curated High-Quality Royalty Free Music (Kevin MacLeod / Incompetech)
+    # Mirroring the "YouTube Audio Library" vibe with trusted Creative Commons sources.
     TRACKS = {
+        # --- Cinematic / Epic ---
+        "epic": {
+            "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Curse%20of%20the%20Scarab.mp3",
+            "filename": "curse_of_the_scarab.mp3"
+        },
         "dramatic": {
             "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Volatile%20Reaction.mp3",
             "filename": "volatile_reaction.mp3"
         },
         "cinematic": {
-            # Impact Moderato (Suspense/Action)
-            "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Impact%20Moderato.mp3",
-            "filename": "impact_moderato.mp3"
+            "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Thunderbird.mp3",
+            "filename": "thunderbird.mp3"
         },
-        "calm": {
-            # Clear Waters (Relaxing/Documentary)
-            "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Clear%20Waters.mp3",
-            "filename": "clear_waters.mp3"
-        },
+        
+        # --- Horror / Dark ---
         "horror": {
-            # The Hive (Horror/Dark)
             "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/The%20Hive.mp3",
             "filename": "the_hive.mp3"
         },
-        "adventurous": {
-            # Adventure Meme (Light Adventure)
-            "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Adventure%20Meme.mp3",
-            "filename": "adventure_meme.mp3"
+        "suspense": {
+            "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Giant%20Wyrm.mp3",
+            "filename": "giant_wyrm.mp3"
         },
+        "scary": {
+             "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Gathering%20Darkness.mp3",
+             "filename": "gathering_darkness.mp3"
+        },
+
+        # --- Happy / Upbeat / YT Vlogger ---
         "cute": {
-            # Kawaii Kitsune (Cute/Happy)
-            "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Kawaii%20Kitsune.mp3",
-            "filename": "kawaii_kitsune.mp3"
+             # Changed from Carefree (Too cartoonish) to Wallpaper (Happy/Clean)
+             "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Wallpaper.mp3", 
+             "filename": "wallpaper.mp3"
         },
         "travel": {
-            # Life of Riley (Upbeat/Travel/Vlog)
-            "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Life%20of%20Riley.mp3",
+            "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Life%20of%20Riley.mp3", 
             "filename": "life_of_riley.mp3"
+        },
+        "happy": {
+            "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Wallpaper.mp3", 
+            "filename": "wallpaper.mp3"
+        },
+        
+        # --- Calm / Documentary ---
+        "calm": {
+            # Meditating Beat Link was bad, reverting to Clear Waters which is a classic
+            "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Clear%20Waters.mp3",
+            "filename": "clear_waters.mp3"
+        },
+        "peace": {
+             "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Porch%20Swing%20Days%20-%20slower.mp3",
+             "filename": "porch_swing_days.mp3"
         },
         "beauty": {
-            # Life of Riley is also great for beauty/lifestyle
-            "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Life%20of%20Riley.mp3",
-            "filename": "life_of_riley.mp3"
+            "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Somewhere%20Sunny.mp3",
+            "filename": "somewhere_sunny.mp3"
         },
-        "suspense": {
-             # Impact Moderato works well here
-            "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Impact%20Moderato.mp3",
-            "filename": "impact_moderato.mp3"
-        },
-        "hiphop": {
-            # Protofunk (Funk/HipHop)
-            "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Protofunk.mp3",
-            "filename": "protofunk.mp3"
-        },
-        "edm": {
-            # Loopster (Electronic/Fitness)
-            "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Loopster.mp3",
-            "filename": "loopster.mp3"
-        },
-        "rock": {
-            # Malt Shop Bop (Upbeat Rock)
-            "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Malt%20Shop%20Bop.mp3",
-            "filename": "malt_shop_bop.mp3"
-        },
-        "piano": {
-            # Touching Moments (Touching/Piano)
-            "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Touching%20Moments.mp3",
-            "filename": "touching_moments.mp3"
-        },
+
+        # --- Emotional / Sad ---
         "sorrow": {
-            # Heartbreaking (Sad/Sorrow)
             "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Heartbreaking.mp3",
             "filename": "heartbreaking.mp3"
         },
-        "classical": {
-            # Canon in D Major
-            "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Canon%20in%20D%20Major.mp3",
-            "filename": "canon_in_d.mp3"
+        "piano": {
+            "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Touching%20Moments%20Two%20-%20Higher.mp3",
+            "filename": "touching_moments_two.mp3"
         },
-        "epic": {
-            # Curse of the Scarab (Epic/History)
-            "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Curse%20of%20the%20Scarab.mp3",
-            "filename": "curse_of_scarab.mp3"
+
+        # --- Action / Rock ---
+        "rock": {
+            "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Malt%20Shop%20Bop.mp3",
+            "filename": "malt_shop_bop.mp3"
+        },
+        "action": {
+            "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Movement%20Proposition.mp3",
+            "filename": "movement_proposition.mp3"
+        },
+        
+        # --- Urban / HipHop ---
+        "hiphop": {
+            "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Rollin%20at%205.mp3",
+            "filename": "rollin_at_5.mp3"
         },
         "jazz": {
-            # Faster Does It (Jazz/Comedy)
-            "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Faster%20Does%20It.mp3",
-            "filename": "faster_does_it.mp3"
+             "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Bass%20Walker.mp3",
+             "filename": "bass_walker.mp3"
         }
     }
     

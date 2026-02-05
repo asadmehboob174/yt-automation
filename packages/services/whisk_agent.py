@@ -28,6 +28,8 @@ class WhiskAgent:
     """
     Automates Google Whisk for image generation.
     """
+    # Global Lock to prevent concurrent browser launches (Playwright persistent profile restriction)
+    _lock = asyncio.Lock()
     
     def __init__(self, headless: bool = False):
         self.headless = headless
@@ -36,27 +38,72 @@ class WhiskAgent:
         self.browser = None
         self.pw = None
         self.page = None
-        logger.info("🦄 WhiskAgent initialized (Sequence Flow v3.1 - Style First + Scene Debug)")
+        self.gen_count = 0
+        self.refresh_threshold = 1000  # DISABLED: Only refresh on explicit error, not proactively.
+        logger.info("🦄 WhiskAgent initialized (Sequence Flow v3.3 - No Auto-Refresh)")
         
+    async def _clean_stale_locks(self):
+        """Removes Singleton lock files and kills dangling chrome processes."""
+        
+        # Windows-specific process cleanup
+        if os.name == 'nt':
+            try:
+                # Force kill any dangling chrome/chromium processes to free the profile lock
+                # Use /T to kill child processes (like the renderer) too
+                os.system('taskkill /F /IM chrome.exe /T 2>nul')
+                os.system('taskkill /F /IM chromium.exe /T 2>nul')
+                logger.info("🔪 Force killed dangling browser processes on Windows.")
+                await asyncio.sleep(1)
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to kill processes: {e}")
+
+        locks = ["SingletonLock", "SingletonCookie", "SingletonSocket"]
+        for lock in locks:
+            lock_path = self.profile_path / lock
+            if lock_path.exists():
+                try:
+                    lock_path.unlink()
+                    logger.info(f"🧹 Removed stale lock: {lock}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not remove lock {lock}: {e}")
+
     async def get_context(self) -> tuple[BrowserContext, any]:
-        """Launch browser with persistent profile."""
-        playwright = await async_playwright().start()
-        
-        args = [
-            '--disable-blink-features=AutomationControlled',
-            '--no-sandbox',
-            '--disable-infobars',
-            '--start-maximized'
-        ]
-        
-        browser = await playwright.chromium.launch_persistent_context(
-            user_data_dir=str(self.profile_path),
-            channel="chrome",
-            headless=self.headless,
-            args=args,
-            viewport=None, # Use actual window size
-        )
-        return browser, playwright
+        """Launch browser with persistent profile and retry logic for lock handling."""
+        async with self._lock:
+            playwright = await async_playwright().start()
+            
+            args = [
+                '--disable-blink-features=AutomationControlled',
+                '--no-sandbox',
+                '--start-maximized',
+            ]
+            
+            MAX_RETRIES = 5
+            for attempt in range(MAX_RETRIES):
+                try:
+                    browser = await playwright.chromium.launch_persistent_context(
+                        user_data_dir=str(self.profile_path),
+                        headless=self.headless,
+                        args=args,
+                        viewport=None, 
+                    )
+                    return browser, playwright
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    if "target page, context or browser has been closed" in error_msg or "existing browser session" in error_msg or "in use" in error_msg:
+                        logger.warning(f"⚠️ Browser Lock detected (Attempt {attempt+1}/{MAX_RETRIES}). Cleaning and retrying...")
+                        
+                        # Only cleanup on retry
+                        await self._clean_stale_locks()
+                        await asyncio.sleep(2 * (attempt + 1)) # Exponential backoff
+                    else:
+                        logger.error(f"❌ Unexpected browser launch error: {e}")
+                        # Cleanup playwright if we fail
+                        await playwright.stop()
+                        raise e
+            
+            await playwright.stop()
+            raise RuntimeError("Failed to launch browser after multiple cleanup attempts.")
 
     async def close(self):
         """Close browser and stop playwright."""
@@ -67,6 +114,28 @@ class WhiskAgent:
             await self.pw.stop()
             self.pw = None
         self.page = None
+
+    async def _handle_session_refresh(self, page: Page) -> bool:
+        """Restarts the project state to clear memory leaks."""
+        self.gen_count += 1
+        
+        if self.gen_count >= self.refresh_threshold:
+            logger.info(f"♻️ Refresh Threshold ({self.refresh_threshold}) reached. Cleaning session...")
+            
+            # 1. Clear IndexedDB and LocalStorage (Whisk stores project state here)
+            await page.evaluate("() => { localStorage.clear(); sessionStorage.clear(); }")
+            
+            # 2. Hard Reload the URL
+            try:
+                await page.goto("https://labs.google/fx/tools/whisk/project", wait_until="networkidle", timeout=60000)
+            except:
+                await page.reload()
+            
+            # 3. Reset counter
+            self.gen_count = 0
+            logger.info("🚀 Session refreshed. Memory cleared.")
+            return True
+        return False
 
     async def _find_input_for_section(self, page: Page, section_name: str) -> Optional[object]:
         """Finds a file input associated with a specific section header using JS traversal."""
@@ -104,8 +173,39 @@ class WhiskAgent:
             return bestInput; // Returns the DOM element handle (which Playwright converts)
         }}''', section_name)
 
-    async def generate_image(
+    async def _dismiss_dialogs(self, page: Page):
+        """Helper to clear stacked modals."""
+        for attempt in range(4): # Increased attempts
+            try:
+                # 1. Common Action Buttons
+                # Added 'Explore' based on typical "New Feature" dialogs
+                dialog_btn = page.locator("button").filter(
+                    has_text=re.compile(r"^(CONTINUE|NEXT|GOT IT|START CREATING|DONE|EXPLORE)$", re.I)
+                ).first
+                
+                if await dialog_btn.count() > 0 and await dialog_btn.is_visible():
+                    logger.info(f"👋 Found dialog button '{await dialog_btn.inner_text()}'. Clicking...")
+                    await dialog_btn.click()
+                    await asyncio.sleep(0.5)
+                    continue 
+                
+                # 2. Explicit Close Icon (X)
+                close_icon = page.locator("button[aria-label='Close'], button[aria-label='close']").first
+                if await close_icon.count() > 0 and await close_icon.is_visible():
+                     logger.info("👋 Found Close icon. Clicking...")
+                     await close_icon.click()
+                     await asyncio.sleep(0.5)
+                     
+                # 3. Escape Key (Universal closer)
+                # Only on later attempts to avoid closing wanted things too early? 
+                # Actually, safe to try if we are blocked.
+                if attempt > 1:
+                     await page.keyboard.press("Escape")
+                     
+            except Exception:
+                pass
 
+    async def generate_image(
         self, 
         prompt: str, 
         is_shorts: bool = False,
@@ -135,6 +235,9 @@ class WhiskAgent:
             if "Sign in" in await page.title() or await page.locator("text='Sign in'").count() > 0:
                 logger.error("🛑 Whisk requires login! Please run the login helper script first.")
                 raise RuntimeError("Authentication required. Run 'python scripts/auth_whisk.py'")
+            
+            # 0. Handle Onboarding Dialogs (Loop to clear stacked modals)
+            await self._dismiss_dialogs(page)
 
             # 0. Fast-path: Sidebar Opening (User wants this clicked within 2s)
             if character_paths:
@@ -321,8 +424,19 @@ class WhiskAgent:
                             except: pass
                     
                     # Wait for Whisk to analyze the uploaded characters
-                    logger.info("Waiting 5 seconds after Subject upload...")
-                    await asyncio.sleep(5)
+                    # User requested specific timings: 1img->8s, 2imgs->13s, 3imgs->16s
+                    count = len(character_paths)
+                    if count == 1:
+                        wait_time = 8
+                    elif count == 2:
+                        wait_time = 13
+                    elif count == 3:
+                        wait_time = 16
+                    else:
+                        wait_time = 5 + (count * 5) # Fallback
+                        
+                    logger.info(f"⏳ Waiting {wait_time} seconds for Subject Analysis ({count} images)...")
+                    await asyncio.sleep(wait_time)
 
 
 
@@ -331,15 +445,40 @@ class WhiskAgent:
             
             # Ensure textarea is ready (sometimes analysis locks it)
             await textarea.wait_for(state="visible", timeout=10000)
-            await textarea.click()
             
-            # Clear previous text
-            await page.keyboard.press("Control+A")
-            await page.keyboard.press("Backspace")
+            # Robust Click with Interception Handling
+            # If a dialog (like "Credits") appears *after* our initial check, this catches it.
+            for attempt in range(3):
+                try:
+                    await textarea.click(timeout=3000)
+                    break # Success!
+                except Exception as e:
+                    logger.warning(f"⚠️ Textarea click intercepted (Attempt {attempt+1}): {e}")
+                    
+                    # Check specifically for the Credits/Flow dialog mentioned in logs
+                    # "Use your credits across Whisk and now Flow..."
+                    credits_dialog_text = page.locator("text='Use your credits'")
+                    if await credits_dialog_text.count() > 0:
+                        logger.info("👋 'Credits' dialog detected. Attempting to dismiss...")
+                        # Try generic closers again
+                        await self._dismiss_dialogs(page)
+                    else:
+                        # Try generic closers anyway
+                        await self._dismiss_dialogs(page)
+                        
+                    await asyncio.sleep(1)
+            else:
+                 # Final attempt force click if loop exhausted
+                 await textarea.click(force=True)
             
-            # Type slowly regarding "text is too small" -> likely means "too fast" or race condition
-            # Increased delay to 100ms per user feedback
-            await textarea.type(full_prompt, delay=100) 
+            # Clear previous text and enter new prompt instantly
+            # Using fill() instead of type() as it clears and fills almost instantly,
+            # avoiding slow character-by-character typing.
+            
+            # Clean unwanted text from input if present (Safety Net)
+            full_prompt = full_prompt.replace("Text-to-Image Prompt:", "").strip()
+            
+            await textarea.fill(full_prompt)
             await asyncio.sleep(1)
 
 
@@ -389,57 +528,234 @@ class WhiskAgent:
                 else:
                     logger.error("❌ Could not find ANY Generate/Submit button!")
 
+            # 3.5 Safety Check (User Request)
+            # After clicking 'Generate', check for the 'Content Safety' popup
+            # It usually appears quickly.
+            try:
+                safety_popup = page.locator("text=/policy|safety|guidelines/i")
+                if await safety_popup.count() > 0:
+                    logger.error("🚫 Safety Filter Triggered!")
+                    # Click the 'Dismiss' or 'Close' button to unblock the UI
+                    await page.locator("button:has-text('Dismiss'), button:has-text('Close')").first.click()
+                    raise RuntimeError("Safety Filter Violation")
+            except Exception as e:
+                # If checking fails, just ignore, it likely doesn't exist
+                if "Safety Filter" in str(e): raise e
+                pass
+
             # 4. Wait for Generation
             logger.info("⏳ Waiting for image generation...")
             # Ideally detect the spinner or new image appearing
             await asyncio.sleep(12) 
             
             # 5. Download Strategy
-            # Use the download button if available for better quality, otherwise fallback to img src
-            images = page.locator("img[src^='https://']")
-            count = await images.count()
-            if count > 0:
-                # Hover over the last image to reveal buttons
-                last_img = images.nth(count - 1)
-                await last_img.hover()
-                await asyncio.sleep(0.5)
+            # The download button is in a floating overlay on the top-right of the image.
+            # We must aggressively hover to reveal it.
+            
+            # CRITICAL FIX: The "Subject" images in the sidebar might be picked up if we just use .last
+            # We must identify the MAIN generated image. 
+            # Strategy: The main image will be significantly LARGER than any thumbnail.
+            
+            # CRITICAL FIX: The "Subject" images in the sidebar might be picked up if we just use .last
+            # We must identify the MAIN generated image. 
+            # Strategy: The main image will be significantly LARGER than any thumbnail.
+            
+            # CRITICAL FIX: Retry logic to wait for the main image to render large enough
+            # Sometimes it takes a moment to snap into full size layout
+            
+            target_img = None
+            target_img = None
+            max_area = 0
+            
+            # Increased wait time for slower generations (up to 30s)
+            for attempt in range(15):
+                logger.info(f"🔍 Scan Attempt {attempt+1}/15 for Main Image...")
                 
-                # User's provided HTML for download button contains <i>download</i>
-                # The button is often in a toolbar that appears on hover
-                download_btn = page.locator("button:has(i)").filter(has_text="download").last
+                # Relaxed selector to include blob: and data: URLs
+                images = page.locator("img") 
+                count = await images.count()
                 
-                if await download_btn.count() > 0:
-                    logger.info("💾 Found 'download' button! Triggering download...")
-                    # Sometimes the button needs a real hover/click to register
-                    await download_btn.scroll_into_view_if_needed()
-                    
-                    async with page.expect_download() as download_info:
-                        # Use JS click as it's more reliable for these floating menus
-                        await download_btn.evaluate("el => el.click()")
-                    
-                    download = await download_info.value
-                    temp_path = await download.path()
-                    if temp_path:
-                        with open(temp_path, "rb") as f:
-                            return f.read()
-                    return None
+                current_max_area = 0
+                current_best_img = None
+                
+                for i in range(count):
+                    img = images.nth(i)
+                    try:
+                        # Filter out tiny icons immediately
+                        if await img.get_attribute("width") == "24": continue 
+                        
+                        box = await img.bounding_box()
+                        if box:
+                             area = box['width'] * box['height']
+                             x_coord = box['x']
+                             y_coord = box['y']
+                             
+                             logger.debug(f"   [Img {i}] {int(box['width'])}x{int(box['height'])} @ ({int(x_coord)},{int(y_coord)}) Area={int(area)}")
+
+                             # SPATIAL FILTER: Ignore Sidebar (Left < 300px) and Header (Top < 40px)
+                             if x_coord < 300:
+                                 logger.debug(f"   -> Ignored (Sidebar Item)")
+                                 continue
+                             if y_coord < 40:
+                                 logger.debug(f"   -> Ignored (Header Item)")
+                                 continue
+
+                             # Threshold: 15,000 (relaxed for 9:16 and mobile views)
+                             if area > 15000: 
+                                 # CRITICAL FIX: Use >= to select the LAST (newest) image if sizes are equal
+                                 # This fixes the issue where it hovered over the previous row's image
+                                 if area >= current_max_area:
+                                     current_max_area = area
+                                     current_best_img = img
+                    except:
+                        continue
+                
+                if current_best_img:
+                    target_img = current_best_img
+                    max_area = current_max_area
+                    logger.info(f"✅ Found Main Image candidates. Best Area: {int(max_area)}px")
+                    break
                 else:
-                    logger.warning("⚠️ Could not find <i>download</i> button. Trying aria-label fallback...")
-                    fallback_dl = page.locator("button[aria-label*='Download']").last
-                    if await fallback_dl.count() > 0:
-                        async with page.expect_download() as download_info:
-                            await fallback_dl.evaluate("el => el.click()")
-                        download = await download_info.value
-                        temp_path = await download.path()
+                    logger.warning("⚠️ No large images found yet. Waiting 2s...")
+                    await asyncio.sleep(2)
+            
+            if target_img:
+                logger.info(f"✅ LOCK ON: Main Image (Area: {int(max_area)}px). Processing download...")
+                last_img = target_img # Use this as the target
+                
+                # 1. Trigger Hover: specific move to top-right corner where buttons live
+                logger.info("🖱️ Move mouse to image top-right to reveal buttons...")
+                box = await last_img.bounding_box()
+                if box:
+                    # Move to center first
+                    await page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                    await asyncio.sleep(0.2)
+                    # Move to top-right (where the toolbar usually is)
+                    await page.mouse.move(box["x"] + box["width"] - 40, box["y"] + 40, steps=10)
+                    await asyncio.sleep(0.5)
+                else:
+                    await last_img.hover()
+                    await asyncio.sleep(0.5)
+
+                # 2. Find Download Button
+                # It usually has an icon named 'download' or 'file_download'
+                # It is often a <button> containing an <i> or <svg>
+                
+                # Strategy: Look for button with specific icon text within the general area
+                # We filter by visibility because the hover should make it visible
+                download_btns = page.locator("button").filter(has=page.locator("i, span", has_text=re.compile(r"download|file_download|save_alt", re.I)))
+                
+                target_btn = None
+                img_box = await last_img.bounding_box()
+                
+                # Iterate to find the one that is visible AND inside the main image area
+                cnt = await download_btns.count()
+                logger.debug(f"found {cnt} potential download buttons. Filtering by location...")
+                
+                for i in range(cnt):
+                    btn = download_btns.nth(i)
+                    if await btn.is_visible():
+                        if img_box:
+                            btn_box = await btn.bounding_box()
+                            if btn_box:
+                                # Check if button is roughly within the image (allow some margin for overlay)
+                                # Button Center
+                                bx = btn_box['x'] + btn_box['width']/2
+                                by = btn_box['y'] + btn_box['height']/2
+                                
+                                # Image bounds
+                                ix = img_box['x']
+                                iy = img_box['y']
+                                iw = img_box['width']
+                                ih = img_box['height']
+                                
+                                if (bx >= ix and bx <= ix + iw) and (by >= iy and by <= iy + ih):
+                                    target_btn = btn
+                                    logger.info(f"✅ Found button inside main image at ({int(bx)}, {int(by)})")
+                                    break
+                                else:
+                                    logger.debug(f"   -> Ignored button at ({int(bx)}, {int(by)}) - Outside Main Image")
+                        else:
+                             # Fallback if no box (shouldn't happen for main img)
+                             target_btn = btn
+                             break
+                
+                # Fallback: Try aria-label
+                if not target_btn:
+                     aria_btns = page.locator("button[aria-label*='Download']")
+                     cnt_aria = await aria_btns.count()
+                     for i in range(cnt_aria):
+                        btn = aria_btns.nth(i)
+                        if await btn.is_visible():
+                             # Same spatial check
+                             if img_box:
+                                btn_box = await btn.bounding_box()
+                                if btn_box:
+                                    bx = btn_box['x'] + btn_box['width']/2
+                                    by = btn_box['y'] + btn_box['height']/2
+                                    if (bx >= img_box['x'] and bx <= img_box['x'] + img_box['width']):
+                                        target_btn = btn
+                                        break
+                             else:
+                                target_btn = btn
+                                break
+
+                if target_btn:
+                    logger.info("💾 Found visible download button! Clicking...")
+                    
+                    # Robust Click Loop for Download
+                    download_obj = None
+                    for attempt in range(3):
+                        try:
+                            async with page.expect_download(timeout=30000) as download_info:
+                                await target_btn.click(timeout=5000)
+                            download_obj = await download_info.value
+                            break
+                        except Exception as e:
+                            logger.warning(f"⚠️ Download click intercepted/failed (Attempt {attempt+1}): {e}")
+                            await self._dismiss_dialogs(page)
+                            await asyncio.sleep(1)
+                            
+                            if attempt == 2:
+                                # Final desperate attempt with force
+                                try:
+                                    logger.info("🔥 Final Attempt: Force clicking download...")
+                                    async with page.expect_download(timeout=30000) as download_info:
+                                        await target_btn.click(force=True)
+                                    download_obj = await download_info.value
+                                except Exception:
+                                    logger.error("❌ Force click failed.")
+                    
+                    if download_obj:
+                        temp_path = await download_obj.path()
                         if temp_path:
                             with open(temp_path, "rb") as f:
                                 return f.read()
                         return None
+                    # If failed, fall through to blob logic below
                     
-                    logger.warning("⚠️ No download button found. Final fallback: img src")
+                else:
+                    logger.warning("⚠️ No visible download button found inside main image area.")
+                    # Final fallback: Download via src
+                    import base64
+                    logger.info("⬇️ Fallback: Downloading via IMG SRC (Blob Support)...")
                     src = await last_img.get_attribute("src")
-                    resp = await page.request.get(src)
-                    return await resp.body()
+                    
+                    if src.startswith("blob:"):
+                        # Use browser-side fetch to get blob contents as base64
+                        b64_data = await page.evaluate("""async (url) => {
+                            const response = await fetch(url);
+                            const blob = await response.blob();
+                            return new Promise((resolve) => {
+                                const reader = new FileReader();
+                                reader.onloadend = () => resolve(reader.result.split(',')[1]);
+                                reader.readAsDataURL(blob);
+                            });
+                        }""", src)
+                        return base64.b64decode(b64_data)
+                    else:
+                        resp = await page.request.get(src)
+                        return await resp.body()
             else:
                 raise RuntimeError("No images found after generation")
 
@@ -468,6 +784,7 @@ class WhiskAgent:
             await page.goto("https://labs.google/fx/tools/whisk/project", timeout=60000)
             
             err_count = 0
+            was_refreshed = False
             for i, prompt in enumerate(prompts):
                 logger.info(f"🔄 Bulk Generation {i+1}/{len(prompts)}")
                 
@@ -475,25 +792,55 @@ class WhiskAgent:
                 # Replace any internal newlines with spaces to prevent job fragmentation
                 clean_prompt = prompt.replace("\n", " ").replace("\r", " ").strip()
                 
-                try:
-                    img_bytes = await self.generate_image(
-                        clean_prompt, 
-                        is_shorts, 
-                        style_suffix, 
-                        page=page, # Pass the existing page object
+                # RETRY LOGIC for each prompt in batch
+                MAX_RETRIES = 3
+                success = False
+                
+                for attempt in range(MAX_RETRIES):
+                    try:
+                        logger.info(f"🔄 Generation Attempt {attempt+1}/{MAX_RETRIES} for prompt {i+1}...")
+                        # Determine if we need to upload characters
+                        # 1. First item (i==0)
+                        # 2. First attempt of that item (attempt==0)
+                        # 3. OR if we just refreshed the session (was_refreshed)
+                        should_upload_chars = ((i == 0 or was_refreshed) and attempt == 0)
 
-                        character_paths=character_paths if i == 0 else [], # Upload ONCE per session
-                        style_image_path=style_image_path if i == 0 else None
-                    )
-                    results.append(img_bytes)
-                    
-                    # Wait between generations
-                    logger.info(f"💤 Waiting {delay_seconds}s...")
-                    await asyncio.sleep(delay_seconds)
-                    err_count = 0 # Reset error count on success
-                    
-                except Exception as e:
-                    logger.error(f"❌ Failed to generate prompt {i+1}: {e}")
+                        img_bytes = await self.generate_image(
+                            clean_prompt, 
+                            is_shorts, 
+                            style_suffix, 
+                            page=page, # Pass the existing page object # Upload ONCE per session
+                            character_paths=character_paths if should_upload_chars else [], 
+                            style_image_path=style_image_path if should_upload_chars else None
+                        )
+
+                        if img_bytes:
+                            results.append(img_bytes)
+                            success = True
+                            
+                            if should_upload_chars:
+                                was_refreshed = False
+                            
+                            # Validated success
+                            # Call the refresh watchdog after each generation
+                            was_refreshed = await self._handle_session_refresh(page)
+                            
+                            # Wait between generations
+                            logger.info(f"💤 Waiting {delay_seconds}s...")
+                            await asyncio.sleep(delay_seconds)
+                            err_count = 0 # Reset error count on success
+                            break # Move to next prompt
+                        else:
+                            raise RuntimeError("Generated image bytes empty")
+                            
+                    except Exception as e:
+                        logger.error(f"❌ Batch Item {i+1} Attempt {attempt+1} Failed: {e}")
+                        if attempt < MAX_RETRIES - 1:
+                            await asyncio.sleep(5)
+                        else:
+                            logger.error(f"🛑 Failed to generate prompt {i+1} after {MAX_RETRIES} attempts.")
+                
+                if not success:
                     results.append(None) # Place holder
                     err_count += 1
                     if err_count > 3:

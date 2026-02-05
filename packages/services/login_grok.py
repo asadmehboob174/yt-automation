@@ -18,28 +18,44 @@ async def main():
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
+    # CLEAN STALE LOCKS FIRST
+    if os.name == 'nt':
+        try:
+            os.system('taskkill /F /IM chrome.exe /T 2>nul')
+            os.system('taskkill /F /IM chromium.exe /T 2>nul')
+            print("🔪 Force killed dangling browser processes.")
+            await asyncio.sleep(1)
+        except: pass
+
     async with async_playwright() as p:
         print("🚀 Launching browser...")
-        context = await p.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_PATH),
-            channel="chrome",  # Connect to installed Chrome
-            headless=False,
-            # CRITICAL: Remove "Chrome is being controlled" banner and flags
-            ignore_default_args=["--enable-automation"],
-            args=[
-                '--disable-blink-features=AutomationControlled', 
-                '--no-sandbox',
-                '--disable-infobars',
-            ],
-            # viewport={"width": 1280, "height": 720}
-        )
+        try:
+            # MATCHING GROK AGENT CONFIG EXACTLY
+            context = await p.chromium.launch_persistent_context(
+                user_data_dir=str(PROFILE_PATH),
+                # channel="chrome" REMOVED to match grok_agent
+                headless=False,
+                ignore_default_args=["--enable-automation"],
+                args=[
+                    '--disable-blink-features=AutomationControlled', 
+                    '--no-sandbox',
+                    '--disable-infobars',
+                ],
+            )
+        except Exception as e:
+            print(f"❌ Failed to launch browser: {e}")
+            print("💡 Tip: Close ALL Chrome windows and run this again.")
+            return
         
         page = await context.new_page()
         # NOTE: We DO NOT use Stealth() here intentionally. 
         # For manual login, "less is more". Stealth JS sometimes triggers Cloudflare.
         
         print("🌐 Navigating to Grok...")
-        await page.goto("https://grok.com/imagine")
+        try:
+            await page.goto("https://grok.com/imagine")
+        except Exception as e:
+            print(f"⚠️ Navigation warning (safe to ignore if page loads): {e}")
         
         print("\n" + "="*50)
         print("✅ BROWSER OPENED!")
@@ -47,7 +63,7 @@ async def main():
         print("👉 When you are done, press CTRL+C in this terminal to save and exit.")
         print("="*50 + "\n")
         
-        # input() blocks the async loop! Use a keep-alive loop instead.
+        # Keep alive
         try:
             while True:
                 await asyncio.sleep(1)

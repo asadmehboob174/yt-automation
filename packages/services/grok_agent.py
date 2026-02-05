@@ -19,10 +19,15 @@ from datetime import timedelta
 from typing import Optional
 
 from playwright.async_api import async_playwright, Page, BrowserContext
-from playwright_stealth import Stealth
+from playwright_stealth import stealth_async
 
 logger = logging.getLogger(__name__)
 
+# Global Lock to prevent concurrent Grok launches
+_grok_lock = asyncio.Lock()
+
+# Use the same profile root as Grok to potentially share Google Auth if possible,
+# or keep them separate but managed similarly.
 PROFILE_PATH = Path.home() / ".grok-profile"
 
 
@@ -59,21 +64,44 @@ class PromptBuilder:
         emotion: str = "neutrally"
     ) -> str:
         """
-        Example output:
-        "Medium shot of Boy A and Boy B near a dying fire. Pixar 3D style.
-         The fire flickers weakly. Boy A says in a worried voice: 'The fire is dying.'"
+        Builds the prompt in the optimal 'Motion First' format.
+        
+        Format:
+        [Motion Description]
+        
+        Dialogue ([Character]): "[Text]"
+        Shot: [Camera Angle]
+        [Style Suffix]
         """
-        layers = [
-            f"{camera_angle} of {character_pose}",  # Scene + Camera
-            f"{style_suffix}.",                      # Style
-            f"{motion_description}.",                # Motion
-        ]
+        # 1. Motion is King (First for strongest adherence)
+        # If motion_description is "clean", use it. If it looks like it already has headers, use it as is?
+        # Assuming we will clean up the input source, so we trust motion_description here.
         
-        # Add dialogue if present
-        if dialogue:
-            layers.append(f"{character_name} says {emotion}: '{dialogue}'")
+        prompt_parts = []
         
-        return " ".join(layers)
+        # Part A: Motion
+        if motion_description:
+            prompt_parts.append(motion_description.strip())
+            
+        # Part B: Dialogue
+        if dialogue and dialogue.strip():
+            # Format: Dialogue (Character): "Line"
+            # If dialogue string already contains "Dialogue (X):", just add it.
+            # Otherwise format it.
+            if "Dialogue" in dialogue:
+                prompt_parts.append("\n" + dialogue.strip())
+            else:
+                 prompt_parts.append(f'\nDialogue ({character_name}): "{dialogue.strip()}"')
+
+        # Part C: Camera Angle
+        if camera_angle:
+            prompt_parts.append(f"\nShot: {camera_angle}")
+            
+        # Part D: Style (Optional, sometimes better to keep hidden or append at end)
+        if style_suffix:
+            prompt_parts.append(f"\nStyle: {style_suffix}")
+            
+        return "\n".join(prompt_parts)
 
 
 # ============================================
@@ -204,25 +232,72 @@ class StealthUploader:
         logger.info(f"✅ Uploaded file with stealth: {file_path.name}")
 
 
+async def _clean_grok_locks():
+    """Removes Singleton lock files and kills dangling chrome processes."""
+    if os.name == 'nt':
+        try:
+            os.system('taskkill /F /IM chrome.exe /T 2>nul')
+            os.system('taskkill /F /IM chromium.exe /T 2>nul')
+            logger.info("🔪 Force killed dangling browser processes for Grok.")
+            await asyncio.sleep(1)
+        except: pass
+
+    locks = ["SingletonLock", "SingletonCookie", "SingletonSocket"]
+    for lock in locks:
+        lock_path = PROFILE_PATH / lock
+        if lock_path.exists():
+            try:
+                lock_path.unlink()
+                logger.info(f"🧹 Removed stale Grok lock: {lock}")
+            except: pass
+
+
 # ============================================
 # Browser Management
 # ============================================
 async def get_browser_context() -> tuple[BrowserContext, any]:
     """Create browser context with persistent profile."""
-    playwright = await async_playwright().start()
-    browser = await playwright.chromium.launch_persistent_context(
-        user_data_dir=str(PROFILE_PATH),
-        channel="chrome",
-        headless=False, # Force headful for now to debug/verify login
-        # CRITICAL: Match login_grok.py settings to keep session valid
-        ignore_default_args=["--enable-automation"],
-        args=[
+    async with _grok_lock:
+        playwright = await async_playwright().start()
+        args = [
             '--disable-blink-features=AutomationControlled', 
             '--no-sandbox', 
             '--disable-infobars'
         ]
-    )
-    return browser, playwright
+        
+        ext_path_str = os.getenv("GROK_EXTENSION_PATH")
+        if ext_path_str:
+            # Support multiple paths separated by comma
+            ext_paths = [p.strip() for p in ext_path_str.split(',') if os.path.isdir(p.strip())]
+            if ext_paths:
+                logger.info(f"🧩 Loading {len(ext_paths)} Grok Extensions...")
+                load_arg = ",".join(ext_paths)
+                args.append(f"--disable-extensions-except={load_arg}")
+                args.append(f"--load-extension={load_arg}")
+
+        MAX_RETRIES = 5
+        for attempt in range(MAX_RETRIES):
+            try:
+                browser = await playwright.chromium.launch_persistent_context(
+                    user_data_dir=str(PROFILE_PATH),
+                    headless=False, # Force headful for now to debug/verify login
+                    # CRITICAL: Match login_grok.py settings to keep session valid
+                    ignore_default_args=["--enable-automation"],
+                    args=args
+                )
+                return browser, playwright
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "target page, context or browser has been closed" in error_msg or "existing browser session" in error_msg or "in use" in error_msg:
+                    logger.warning(f"⚠️ Grok Browser Lock detected (Attempt {attempt+1}/{MAX_RETRIES}). Cleaning...")
+                    await _clean_grok_locks()
+                    await asyncio.sleep(2 * (attempt + 1))
+                else:
+                    await playwright.stop()
+                    raise e
+        
+        await playwright.stop()
+        raise RuntimeError("Failed to launch Grok browser after multiple attempts.")
 
 
 async def check_rate_limit(page: Page) -> bool:
@@ -245,14 +320,27 @@ async def generate_single_clip(
     character_name: str = "Character",
     emotion: str = "neutrally",
     duration: str = "10s",
-    aspect: str = "9:16"
+    aspect: str = "9:16",
+    external_page: Optional[Page] = None
 ) -> Path:
     """Core generation logic with all stealth features."""
-    browser, pw = await get_browser_context()
+    browser = None
+    pw = None
+    page = external_page
+    
+    if not page:
+        browser, pw = await get_browser_context()
+        # REUSE FIRST PAGE TO AVOID EMPTY TABS
+        if len(browser.pages) > 0:
+            page = browser.pages[0]
+            logger.info("📄 Reusing existing Grok tab")
+        else:
+            page = await browser.new_page()
+            logger.info("📄 Opened new Grok tab")
+    
     try:
-        page = await browser.new_page()
         # await Stealth().apply_stealth_async(page)  <-- DISABLED to match login script
-        await page.goto("https://grok.com/imagine")
+        await page.goto("https://grok.com/imagine", wait_until="networkidle", timeout=60000)
         
         # Wait for page to fully load
         await asyncio.sleep(3)
@@ -260,6 +348,16 @@ async def generate_single_clip(
         # Check rate limit FIRST
         if await check_rate_limit(page):
             raise RateLimitError("Rate limit detected")
+
+        # SAFETY CHECK (Pre-generation)
+        # Sometimes Grok shows a persisting safety warning
+        try:
+             safety_warn = page.locator("text=/safety|policy|violation/i")
+             if await safety_warn.count() > 0 and await safety_warn.first.is_visible():
+                  logger.warning("🚫 Found existing safety warning. Refreshing...")
+                  await page.reload()
+                  await asyncio.sleep(3)
+        except: pass
         
         # Build 5-layer prompt
         prompt = PromptBuilder.build(
@@ -428,12 +526,34 @@ async def generate_single_clip(
         # Step 5: Wait for generation and download
         logger.info("⏳ Waiting for video generation...")
         
+        # PREFERENCE HANDLING (User Request)
+        # Check if Grok asks for a preference A/B test
+        async def check_and_handle_preference():
+             try:
+                 # Look for "Prefer" buttons or side-by-side selection
+                 # Usually detected by multiple video elements appearing but no single main download
+                 pref_btns = page.locator("button").filter(has_text=re.compile(r"Prefer|Vote|Option 1|Left", re.I))
+                 if await pref_btns.count() > 0:
+                     logger.info("⚠️ Preference Selection UI detected! Auto-selecting first option...")
+                     try:
+                        await pref_btns.first.click()
+                        await asyncio.sleep(2)
+                     except: pass
+             except: pass
+
+        # Start a background task to check for preferences occasionally
+        # We can't do this easily in parallel with the race below without complex task management
+        # So we'll inject a check into the wait loop
+        
         # Smart Wait: Race between URL change AND Video element appearance
         # We don't want to wait 180s if the video is already there!
         try:
             async def wait_for_video_element():
                 # Check for video tag or the "Download" button
                 for _ in range(60): # Check every 2s for 2 minutes
+                    # Inject Preference Check
+                    await check_and_handle_preference()
+                    
                     if await page.locator("video").count() > 0:
                         return "video_found"
                     if await page.locator("button[aria-label='Download']").count() > 0:
@@ -534,8 +654,22 @@ async def generate_single_clip(
                 logger.info(f"🎥 Found video source: {src[:50]}...")
                 
                 if src.startswith("blob:"):
-                    logger.warning("⚠️ Blob URL detected from Python side. Cannot download safely.")
-                    raise ValueError("Blob URL")
+                    logger.info("⬇️ Fallback: Downloading via IMG SRC (Blob Support)...")
+                    # Use browser-side fetch to get blob contents as base64
+                    b64_data = await page.evaluate("""async (url) => {
+                        const response = await fetch(url);
+                        const blob = await response.blob();
+                        return new Promise((resolve) => {
+                            const reader = new FileReader();
+                            reader.onloadend = () => resolve(reader.result.split(',')[1]);
+                            reader.readAsDataURL(blob);
+                        });
+                    }""", src)
+                    import base64
+                    with open(output, "wb") as f:
+                        f.write(base64.b64decode(b64_data))
+                    logger.info(f"✅ Downloaded blob video via JS: {output}")
+                    return output
 
                 # Get cookies from browser context
                 cookies = await page.context.cookies()
@@ -585,8 +719,11 @@ async def generate_single_clip(
         
         return output
     finally:
-        await browser.close()
-        await pw.stop()
+        # ONLY CLOSE IF WE OPENED IT
+        if not external_page and browser:
+            await browser.close()
+            await pw.stop()
+            logger.info("🛑 Grok cleanup complete.")
 
 
 # ============================================
@@ -603,7 +740,11 @@ class BrowserProfileManager:
     """
     
     def __init__(self, profile_name: str = "default"):
-        self.profile_path = Path.home() / ".grok-profiles" / profile_name
+        # Unify with global PROFILE_PATH if default, else handle named profiles in same root
+        if profile_name == "default":
+            self.profile_path = PROFILE_PATH
+        else:
+            self.profile_path = PROFILE_PATH.parent / ".grok-profiles" / profile_name
         self.ensure_profile_dir()
     
     def ensure_profile_dir(self):
@@ -638,17 +779,32 @@ class BrowserProfileManager:
     async def get_context(self) -> tuple[BrowserContext, any]:
         """Get browser context with this profile."""
         playwright = await async_playwright().start()
+        args = [
+            '--disable-blink-features=AutomationControlled',
+            '--disable-features=IsolateOrigins,site-per-process',
+            '--disable-dev-shm-usage',
+            '--js-flags="--max-old-space-size=2048"', # Memory limit
+            '--process-per-site'
+        ]
+        
+        extension_path = os.getenv("GROK_EXTENSION_PATH")
+        if extension_path and os.path.isdir(extension_path):
+            logger.info(f"🧩 Loading Grok Extension (ProfileManager) from: {extension_path}")
+            args.append(f"--disable-extensions-except={extension_path}")
+            args.append(f"--load-extension={extension_path}")
+
         browser = await playwright.chromium.launch_persistent_context(
             user_data_dir=str(self.profile_path),
             headless=os.getenv("GROK_HEADLESS", "false").lower() == "true",
-            args=[
-                '--disable-blink-features=AutomationControlled',
-                '--disable-features=IsolateOrigins,site-per-process',
-                '--disable-dev-shm-usage',
-            ],
+            args=args,
             viewport={'width': 1920, 'height': 1080},
             user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
         )
+        
+        # Avoid empty tabs by reusing the default page
+        if len(browser.pages) == 0:
+            await browser.new_page()
+            
         return browser, playwright
 
 
@@ -671,7 +827,22 @@ class GrokAnimator:
     def __init__(self, profile_name: str = "default"):
         self.profile_manager = BrowserProfileManager(profile_name)
         self.generation_count = 0
+        self.refresh_threshold = 5
         self.rate_limit_cooldown = 7200  # 2 hours in seconds
+
+    async def _handle_session_refresh(self, page: Page):
+        """Restarts the session to clear memory leaks."""
+        if self.generation_count > 0 and self.generation_count % self.refresh_threshold == 0:
+            logger.info(f"♻️ Grok Refresh Threshold ({self.refresh_threshold}) reached. Cleaning session...")
+            try:
+                # 1. Clear IndexedDB and LocalStorage 
+                await page.evaluate("() => { localStorage.clear(); sessionStorage.clear(); }")
+                
+                # 2. Hard Reload
+                await page.goto("https://grok.com/imagine", wait_until="networkidle", timeout=60000)
+                logger.info("🚀 Grok Session refreshed. Memory cleared.")
+            except Exception as e:
+                logger.warning(f"Session refresh failed: {e}")
     
     async def animate(
         self,
@@ -680,6 +851,7 @@ class GrokAnimator:
         style_suffix: str = "Cinematic, dramatic lighting",
         duration: int = 10,
         aspect_ratio: str = "9:16",
+        camera_angle: str = "Medium shot",
         dialogue: Optional[str] = None
     ) -> Path:
         """
@@ -691,30 +863,68 @@ class GrokAnimator:
             style_suffix: Visual style to apply
             duration: 6 or 10 seconds
             aspect_ratio: "9:16" or "16:9"
+            camera_angle: Shot type (e.g. "Wide Shot")
             
         Returns:
             Path to the generated video file
         """
         duration_str = f"{duration}s"
         
-        try:
-            result = await generate_single_clip(
-                image_path=image_path,
-                character_pose="the character in the image",
-                camera_angle="Medium shot",
-                style_suffix=style_suffix,
-                motion_description=motion_prompt,
-                duration=duration_str,
-                aspect=aspect_ratio,
-                dialogue=dialogue
-            )
-            self.generation_count += 1
-            logger.info(f"🎥 Generated clip #{self.generation_count}: {result}")
-            return result
+        MAX_RETRIES = 3
+        for attempt in range(MAX_RETRIES):
+            # Each attempt starts its own browser context to ensure a clean slate
+            # (Reverting the persistent session reuse per user request)
+            browser, pw = await self.profile_manager.get_context()
+            page = browser.pages[0] if len(browser.pages) > 0 else await browser.new_page()
             
-        except RateLimitError:
-            logger.warning(f"⏳ Rate limit hit after {self.generation_count} generations")
-            raise
+            try:
+                logger.info(f"🔄 Animation Attempt {attempt+1}/{MAX_RETRIES} for {image_path.name}")
+                
+                # Handle session refresh if threshold reached (within this context)
+                await self._handle_session_refresh(page)
+
+                result = await generate_single_clip(
+                    image_path=image_path,
+                    character_pose="the character in the image",
+                    camera_angle=camera_angle,
+                    style_suffix=style_suffix,
+                    motion_description=motion_prompt,
+                    duration=duration_str,
+                    aspect=aspect_ratio,
+                    dialogue=dialogue,
+                    external_page=page # Pass the active page
+                )
+                
+                # Validation: Check if file actually exists and has size
+                if result and result.exists() and result.stat().st_size > 1000:
+                   self.generation_count += 1
+                   logger.info(f"🎥 Generated clip #{self.generation_count}: {result}")
+                   return result
+                else:
+                    raise RuntimeError("Generated file missing or empty")
+
+            except RateLimitError:
+                logger.warning(f"⏳ Rate limit hit after {self.generation_count} generations")
+                raise
+            except Exception as e:
+                logger.error(f"❌ Grok Generation failed: {e}")
+                # Take screenshot if headful (debugging)
+                try:
+                    timestamp = int(asyncio.get_event_loop().time())
+                    await page.screenshot(path=f"grok_error_{timestamp}.png")
+                except:
+                    pass
+                if attempt < MAX_RETRIES - 1:
+                    wait_time = (attempt + 1) * 5
+                    logger.info(f"♻️ Retrying in {wait_time} seconds...")
+                    await asyncio.sleep(wait_time)
+                else:
+                    logger.error("🛑 All retries failed.")
+                    raise e
+            finally:
+                # Close browser after EACH clip (Reverting speed boost per user request)
+                await browser.close()
+                await pw.stop()
     
     async def animate_batch(
         self,
@@ -750,14 +960,13 @@ class GrokAnimator:
                 
                 # Add delay between generations to avoid rate limiting
                 if i < len(scenes) - 1:
-                    delay = random.uniform(5, 15)
+                    delay = random.uniform(5, 10)
                     logger.info(f"⏱️ Waiting {delay:.1f}s before next generation...")
                     await asyncio.sleep(delay)
                     
             except RateLimitError:
-                # Return partial results and raise for retry handling
                 logger.error(f"Rate limited at scene {i+1}/{len(scenes)}")
-                return results, i  # Return results and checkpoint index
+                return results
         
         return results
     

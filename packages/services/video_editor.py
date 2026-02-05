@@ -54,11 +54,11 @@ class FFmpegVideoEditor:
         clip_paths: list[Path],
         output_path: Optional[Path] = None,
         fade_duration: float = 0.4,
-        target_resolution: tuple[int, int] = (1080, 1920)
+        target_resolution: tuple[int, int] = (1920, 1080)
     ) -> Path:
         """
-        Stitch clips with black fade transitions between each clip.
-        Forces all clips to target_resolution to prevent concat errors.
+        Stitch clips with smooth cross-dissolve (Mix) transitions and optional SFX.
+        Uses FFmpeg 'xfade' filter for true blending overlap.
         """
         import subprocess
         
@@ -66,97 +66,180 @@ class FFmpegVideoEditor:
             raise ValueError("No clips provided")
         
         target_w, target_h = target_resolution
-        output_path = output_path or self.output_dir / "stitched_fade.mp4"
+        output_path = output_path or self.output_dir / "stitched_mix.mp4"
         
+        # Check for SFX
+        sfx_path = Path(__file__).parent / "assets" / "sfx" / "whoosh.mp3"
+        has_sfx = sfx_path.exists()
+        
+        # If single clip, just scale
         if len(clip_paths) == 1:
-            # Single clip, just copy it (or scale it?)
-            # Let's scale it to be safe
             self._scale_single(clip_paths[0], output_path, target_w, target_h)
             return output_path
         
-        # Get durations for each clip
+        # 1. Validate inputs and get durations
+        valid_clips = []
         durations = []
         for clip in clip_paths:
-            probe = ffmpeg.probe(str(clip))
-            duration = float(probe['streams'][0]['duration'])
-            durations.append(duration)
+            try:
+                probe = ffmpeg.probe(str(clip))
+                dur = float(probe['format']['duration'])
+                valid_clips.append(clip)
+                durations.append(dur)
+            except Exception as e:
+                logger.warning(f"⚠️ Skipping invalid clip {clip.name}: {e}")
         
-        # Build inputs
+        if not valid_clips:
+            raise ValueError("No valid clips found")
+            
+        count = len(valid_clips)
+        
+        # 2. Build Inputs & Scale Each Clip First
+        # Xfade requires consistent timebases/resos, so we scale inputs in the chain before xfading.
         inputs = []
-        for clip in clip_paths:
-            inputs.extend(['-i', str(clip)])
-        
-        # Build filter complex
         filter_parts = []
         
-        # 1. Scale all inputs to target resolution first
-        # Format: [0:v]scale=w:h:force_original_aspect_ratio=decrease,pad=w:h:(ow-iw)/2:(oh-ih)/2,setsar=1[s0]
-        for i in range(len(clip_paths)):
-            scale_filter = (
-                f"[{i}:v]scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
-                f"crop={target_w}:{target_h},"
-                f"setsar=1[s{i}]"
-            )
-            filter_parts.append(scale_filter)
+        # Map SFX input if exists
+        sfx_input_idx = count
+        if has_sfx:
+             # We add SFX as the last input
+             pass 
 
-        # 2. Apply fades to scaled streams [s0], [s1]...
-        for i in range(len(clip_paths)):
-            fade_in = f"fade=t=in:st=0:d={fade_duration}" if i > 0 else ""
-            fade_out = f"fade=t=out:st={durations[i] - fade_duration}:d={fade_duration}" if i < len(clip_paths) - 1 else ""
-            
-            # Chain fade filters
-            filters = []
-            if fade_in: filters.append(fade_in)
-            if fade_out: filters.append(fade_out)
-            
-            fade_chain = ",".join(filters) if filters else "copy"
-            filter_parts.append(f"[s{i}]{fade_chain}[v{i}]")
-            
-            # Also handle audio fades
-            afade_in = f"afade=t=in:st=0:d={fade_duration}" if i > 0 else ""
-            afade_out = f"afade=t=out:st={durations[i] - fade_duration}:d={fade_duration}" if i < len(clip_paths) - 1 else ""
-            
-            if afade_in and afade_out:
-                filter_parts.append(f"[{i}:a]{afade_in},{afade_out}[a{i}]")
-            elif afade_in:
-                filter_parts.append(f"[{i}:a]{afade_in}[a{i}]")
-            elif afade_out:
-                filter_parts.append(f"[{i}:a]{afade_out}[a{i}]")
+        for i, clip in enumerate(valid_clips):
+            inputs.extend(['-i', str(clip)])
+            # Scale each input [i:v] -> [v{i}]
+            filter_parts.append(
+                f"[{i}:v]scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
+                f"crop={target_w}:{target_h},setsar=1[v{i}]"
+            )
+            # Audio: assume exists, map [i:a] -> [a{i}]
+            # We must handle missing audio or mixed formats? 
+            # For simplicity, we assume inputs have audio. If not, 'anullsrc' is needed.
+            inputs_probe = ffmpeg.probe(str(clip))
+            has_audio = any(s['codec_type'] == 'audio' for s in inputs_probe['streams'])
+            if has_audio:
+                filter_parts.append(f"[{i}:a]aresample=44100[a{i}]")
             else:
-                filter_parts.append(f"[{i}:a]acopy[a{i}]")
+                filter_parts.append(f"anullsrc=r=44100:cl=stereo[a{i}]")
+
+        # 3. Chain XFades
+        # Loop: [v0][v1]xfade=...[v01]; [v01][v2]xfade...
+        # We need to track the cumulative offset.
+        # Offset for transition i (between clip i and i+1) = Sum(durations 0..i) - (i * overlap)
         
-        # Concat all faded clips
-        video_concat = "".join([f"[v{i}]" for i in range(len(clip_paths))])
-        audio_concat = "".join([f"[a{i}]" for i in range(len(clip_paths))])
-        filter_parts.append(f"{video_concat}concat=n={len(clip_paths)}:v=1:a=0[outv]")
-        filter_parts.append(f"{audio_concat}concat=n={len(clip_paths)}:v=0:a=1[outa]")
+        current_v_label = "[v0]"
+        current_a_label = "[a0]"
         
-        filter_complex = ";".join(filter_parts)
+        current_offset = 0.0
         
-        # Build and run FFmpeg command
+        # Transition Timestamps (for SFX)
+        transition_times = []
+        
+        for i in range(count - 1):
+            # Duration of the 'current' clip (which might be a result of previous xfades)
+            # But simpler logic: Xfade offset is relative to the START of the VIDEO.
+            # Offset = (Duration(0) + Duration(1) + ... + Duration(i)) - (i+1)*Overlap ?
+            # Wait.
+            # Clip 0 starts at 0. Ends at D0.
+            # Clip 1 starts at D0 - Overlap.
+            # Clip 2 starts at (D0 + D1 - Overlap) - Overlap = D0 + D1 - 2*Overlap.
+            
+            # So, transition starts at:
+            # T_offset = CurrentCumulativeDuration - Overlap?
+            # No.
+            # Let's track precise end time.
+            
+            clip_dur = durations[i]
+            
+            # The offset for xfade is relative to the first input of the pair? No, global timeline?
+            # FFmpeg xfade `offset` is "timestamp of the start of transition".
+            # For the first transition (v0 -> v1), offset = D0 - Fade.
+            # For the second (v01 -> v2), offset = (D0 + D1 - Fade) - Fade?
+            
+            # Math:
+            # Start time of Clip i in timeline = Sum(D_k for k<i) - i * Fade
+            # Transition i (joining i and i+1) happens at: StartTime(i+1)
+            # StartTime(i+1) = StartTime(i) + D_i - Fade
+            
+            if i == 0:
+                current_offset = durations[0] - fade_duration
+            else:
+                current_offset += durations[i] - fade_duration
+            
+            transition_times.append(current_offset)
+            
+            next_v_label = f"[v{i+1}]"
+            next_a_label = f"[a{i+1}]"
+            
+            out_v = f"[vm{i+1}]"
+            out_a = f"[am{i+1}]"
+            
+            # Video XFade (Method: fade -> simple cross dissolve)
+            filter_parts.append(
+                f"{current_v_label}{next_v_label}xfade=transition=fade:duration={fade_duration}:offset={current_offset}{out_v}"
+            )
+            
+            # Audio Crossfade (acrossfade)
+            # doesn't use offset, it just overlaps end of A and start of B.
+            # "c0 c1 acrossfade=d=0.5:c1=tri:c2=tri"
+            filter_parts.append(
+                f"{current_a_label}{next_a_label}acrossfade=d={fade_duration}:c1=tri:c2=tri{out_a}"
+            )
+            
+            current_v_label = out_v
+            current_a_label = out_a
+        
+        # 4. Inject SFX (Mix Effect)
+        final_v_label = current_v_label
+        final_a_label = current_a_label
+        
+        if has_sfx and transition_times:
+            # Add SFX input
+            inputs.extend(['-i', str(sfx_path)])
+            sfx_idx = count # After all clip inputs
+            
+            # Split SFX
+             # Reduce volume of WHOOSH sound to 8%
+            sfx_copies = "".join([f"[sfx{k}]" for k in range(len(transition_times))])
+            filter_parts.append(f"[{sfx_idx}:a]volume=0.08,asplit={len(transition_times)}{sfx_copies}")
+            
+            delayed_sfx = []
+            for k, time in enumerate(transition_times):
+                # Start SFX slightly before transition center?
+                # Transition starts at 'time', lasts 'fade_duration'.
+                # Center = time + fade/2.
+                # SFX usually peak at center. 
+                # Let's start it at time.
+                delay_ms = int(time * 1000)
+                filter_parts.append(f"[sfx{k}]adelay={delay_ms}|{delay_ms}[dsfx{k}]")
+                delayed_sfx.append(f"[dsfx{k}]")
+            
+            # Mix
+            all_audios = final_a_label + "".join(delayed_sfx)
+            # Inputs = 1 (main) + N (sfx). normalize=0.
+            filter_parts.append(f"{all_audios}amix=inputs={1 + len(delayed_sfx)}:duration=first:normalize=0[final_a_out]")
+            final_a_label = "[final_a_out]"
+            
+        
+        # COMMAND
         cmd = ['ffmpeg', '-y'] + inputs + [
-            '-filter_complex', filter_complex,
-            '-map', '[outv]',
-            '-map', '[outa]',
-            '-c:v', 'libx264',
-            '-preset', 'fast',
-            '-crf', '23',
-            '-c:a', 'aac',
-            '-b:a', '192k',
+            '-filter_complex', ";".join(filter_parts),
+            '-map', final_v_label,
+            '-map', final_a_label,
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+            '-c:a', 'aac', '-b:a', '192k',
             str(output_path)
         ]
         
-        logger.info(f"🎬 Stitching {len(clip_paths)} clips with {fade_duration}s black fade...")
-        
+        logger.info(f"🎬 Stitching {count} clips with XFADE (Mix) transition (d={fade_duration}s)...")
         try:
             subprocess.run(cmd, check=True, capture_output=True)
-            logger.info(f"✅ Stitched with fades -> {output_path.name}")
+            logger.info(f"✅ Stitched (Mix) -> {output_path.name}")
             return output_path
         except subprocess.CalledProcessError as e:
-            logger.error(f"FFmpeg error: {e.stderr.decode()}")
-            # Fallback to simple concat if complex filter fails
-            logger.warning("⚠️ Falling back to simple concat without fades")
-            return self.stitch_clips(clip_paths, output_path)
+            logger.error(f"FFmpeg Error: {e.stderr.decode('utf-8')}")
+            # Fallback to simple stitch if xfade fails
+            return self.stitch_clips(valid_clips, output_path)
     
     def apply_ken_burns(
         self,
@@ -211,29 +294,41 @@ class FFmpegVideoEditor:
         input_path: Path,
         srt_path: Path,
         output_path: Optional[Path] = None,
-        style: str = "yellow"
+        style: str = "pop"
     ) -> Path:
         """Burn SRT subtitles into video."""
         output_path = output_path or self.output_dir / "subtitled.mp4"
         
-        # Subtitle styles
+        # Subtitle styles - optimized for retention (Poppins)
+        # Fontname=Poppins implies it must be installed or mapped. 
+        # Fallback to Arial if Poppins isn't available, but standardizing on a clean font.
         styles = {
             "yellow": "FontSize=24,Fontname=Arial,PrimaryColour=&H00FFFF,OutlineColour=&H000000,Outline=2",
             "white": "FontSize=24,Fontname=Arial,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=1,Shadow=1",
+            # Fallback to Verdana (clean Sans Serif) if Poppins is missing, to ensure visibility
+            "pop": "FontSize=28,Fontname=Verdana,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,BackColour=&H80000000,Outline=3,Shadow=2,Bold=1,Alignment=2,MarginV=50",
         }
         
-        force_style = styles.get(style, styles["yellow"])
+        force_style = styles.get(style, styles["pop"])
+        
+        # Windows path escaping for filter_complex
+        # https://ffmpeg.org/ffmpeg-filters.html#subtitles
+        # On Windows, we need to escape backslashes and colon in drive letter
+        # e.g C:\foo\bar.srt -> C\:/foo/bar.srt
+        # However, filter complex string quoting is tricky. Best approach is forward slashes and escaped colon.
+        srt_path_str = str(srt_path.absolute()).replace("\\", "/")
+        srt_path_str = srt_path_str.replace(":", "\\:")
         
         (
             ffmpeg
             .input(str(input_path))
-            .filter("subtitles", str(srt_path), force_style=force_style)
+            .filter("subtitles", srt_path_str, force_style=force_style)
             .output(str(output_path))
             .overwrite_output()
             .run(quiet=True)
         )
         
-        logger.info(f"✅ Burned subtitles -> {output_path.name}")
+        logger.info(f"✅ Burned subtitles (Style: {style}) -> {output_path.name}")
         return output_path
     
     def add_transition(
@@ -299,7 +394,8 @@ class FFmpegVideoEditor:
             filter_complex = (
                 f"[1:a]aresample=44100,aformat=channel_layouts=stereo,volume={music_volume}[music];"
                 f"[0:a]aresample=44100,aformat=channel_layouts=stereo[vid_a];"
-                f"[vid_a][music]amix=inputs=2:duration=first[aout]"
+                # CRITICAL: normalize=0 prevents main audio from being dropped to 50%
+                f"[vid_a][music]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[aout]"
             )
             cmd.extend([
                 '-filter_complex', filter_complex,
@@ -340,12 +436,17 @@ class FFmpegVideoEditor:
         self,
         clip_paths: list[Path],
         output_path: Optional[Path] = None,
-        transition_duration: float = 0.5
+        transition_duration: float = 0.5,
+        target_resolution: tuple[int, int] = (1920, 1080)
     ) -> Path:
         """Stitch clips with crossfade transitions (alias for workflow)."""
-        # For simplicity, just use basic concat
-        # A full implementation would add transitions between each pair
-        return self.stitch_clips(clip_paths, output_path)
+        # Call the sophisticated stitcher with fades and resolution forcing
+        return self.stitch_clips_with_fade(
+            clip_paths, 
+            output_path, 
+            fade_duration=transition_duration,
+            target_resolution=target_resolution
+        )
     
     def mix_audio(
         self,

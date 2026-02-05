@@ -389,11 +389,29 @@ async def render_final_video(
     for i, clip_key in enumerate(clip_keys):
         local_clips.append(storage.download(clip_key, f"/tmp/clip_{i}.mp4"))
     
+    # Determine Output Resolution
+    is_shorts = "shorts" in channel_config.get("nicheId", "").lower() or "shorts" in channel_config.get("styleSuffix", "").lower()
+    target_res = (1080, 1920) if is_shorts else (1920, 1080)
+    logger.info(f"📐 Stitching Resolution: {target_res} (Shorts={is_shorts})")
+
+    # Stitch clips with transitions
     # Stitch clips with transitions
     stitched_path = editor.stitch_clips_with_transitions(
         local_clips, 
-        "/tmp/stitched.mp4"
+        "/tmp/stitched.mp4",
+        target_resolution=target_res,
+        transition_duration=0.4 # User requested 0.4s
     )
+    
+    # Calculate total duration for music generation
+    # Estimate from clips count * 5s if unknown, or rely on actual video length later?
+    # Better to probe the stitched video.
+    try:
+        import ffmpeg
+        probe = ffmpeg.probe(str(stitched_path))
+        total_duration = float(probe['format']['duration'])
+    except:
+        total_duration = len(local_clips) * 10.0 # Fallback
     
     if video_type == "documentary" and audio_keys:
         # DOCUMENTARY MODE: Mix voiceover with video
@@ -409,10 +427,23 @@ async def render_final_video(
         
         # Mix audio with background music
         bg_music = channel_config.get("bgMusic")
+        bg_music_local = None
+        
         if bg_music:
-            bg_music_local = storage.download(bg_music, "/tmp/bg_music.mp3")
+             # Manual Override
+             try:
+                bg_music_local = storage.download(bg_music, "/tmp/bg_music.mp3")
+             except: None
         else:
-            bg_music_local = None
+             # Intelligent Selection
+             from .music_generator import generate_background_music
+             mood = script.get("music_mood", "calm") # Fallback to calm
+             logger.info(f"🎶 Auto-selecting music for mood: {mood}")
+             try:
+                 bg_music_local = generate_background_music(total_duration, mood)
+             except Exception as e:
+                 logger.error(f"⚠️ Music generation failed: {e}. Skipping BGM.")
+                 bg_music_local = None
         
         final_audio = editor.mix_audio(local_audio, bg_music_local, "/tmp/final_audio.mp3")
         
@@ -433,16 +464,53 @@ async def render_final_video(
         
         # Optionally add background music (ducked under Grok audio)
         bg_music = channel_config.get("bgMusic")
+        bg_music_local = None
+        
         if bg_music:
-            bg_music_local = storage.download(bg_music, "/tmp/bg_music.mp3")
-            final_path = editor.add_background_music(
+             try:
+                bg_music_local = storage.download(bg_music, "/tmp/bg_music.mp3")
+             except: None
+        else:
+             from .music_generator import generate_background_music
+             mood = script.get("music_mood", "calm")
+             logger.info(f"🎶 Auto-selecting music for mood: {mood}")
+             try:
+                 bg_music_local = generate_background_music(total_duration, mood)
+             except Exception as e:
+                 logger.error(f"⚠️ Music generation failed: {e}. Skipping BGM.")
+                 bg_music_local = None
+
+        if bg_music_local:
+            final_audio_path = editor.add_background_music(
                 stitched_path,
                 bg_music_local,
-                "/tmp/final_video.mp4",
+                "/tmp/final_video_music.mp4",
                 music_volume=0.15  # Keep low so dialogue is clear
             )
         else:
-            final_path = stitched_path
+            final_audio_path = stitched_path
+
+        # Generate Subtitles (Even for Story Mode)
+        # Use dialogue if present, otherwise voiceover_text
+        logger.info("📝 Generating subtitles for Story Mode...")
+        # Note: generate_from_script expects 'voiceover_text' usually. 
+        # We need to map 'dialogue' to 'voiceover_text' if missing.
+        subtitle_scenes = []
+        for s in script.get("scenes", []):
+            scene_copy = s.copy()
+            if not scene_copy.get("voiceover_text") and scene_copy.get("dialogue"):
+                 scene_copy["voiceover_text"] = scene_copy["dialogue"]
+            subtitle_scenes.append(scene_copy)
+
+        srt_path = subtitle_engine.generate_from_script(subtitle_scenes, "/tmp/subtitles.srt")
+        
+        # Burn Subtitles
+        final_path = editor.finalize(
+            video_path=final_audio_path,
+            audio_path=final_audio_path, # Audio is already in the video file
+            subtitle_path=srt_path,
+            output_path="/tmp/final_video.mp4"
+        )
     
     # Upload final video to R2
     final_key = f"videos/{script['niche_id']}/{script['title'].replace(' ', '_')}.mp4"

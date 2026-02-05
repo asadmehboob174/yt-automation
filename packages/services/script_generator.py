@@ -144,178 +144,60 @@ Return ONLY valid JSON in this exact format:
 Generate exactly {scene_count} scenes adhering to the structure above.
 """
 
-    async def _call_gemini(self, prompt: str, model: str = "gemini-flash-latest", retries: int = 3) -> str:
-        """Call Gemini API via HTTP with retry logic for 429 errors."""
-        # Log key debug (masked)
-        masked_key = f"{self.gemini_key[:4]}...{self.gemini_key[-4:]}" if self.gemini_key else "None"
-        print(f"🔑 Using Gemini API Key: {masked_key} | Model: {model}")
-        
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.gemini_key}"
-        
-        payload = {
-            "contents": [{
-                "parts": [{"text": prompt}]
-            }],
-            "generationConfig": {
-                "temperature": 0.8,
-                "maxOutputTokens": 8192
-            }
-        }
-        
-        import random
-        
-        async with httpx.AsyncClient() as client:
-            for attempt in range(retries + 1):
-                try:
-                    response = await client.post(url, json=payload, timeout=60.0)
-                    
-                    if response.status_code == 429:
-                        if attempt < retries:
-                            # Faster backoff for fewer retries: 3, 6, 12...
-                            wait_time = (3 * (2 ** (attempt))) + random.uniform(1, 3)
-                            print(f"⚠️ Gemini Rate Limit (429). Waiting {wait_time:.1f}s (Attempt {attempt+1}/{retries+1})...")
-                            await asyncio.sleep(wait_time)
-                            continue
-                        else:
-                            print(f"🛑 Gemini Rate Limit reached max attempts ({retries+1}).")
-                            raise httpx.HTTPStatusError("Max retries exceeded for 429", request=response.request, response=response)
-                            
-                    response.raise_for_status()
-                    result = response.json()
-                    
-                    if "candidates" in result and result["candidates"]:
-                        candidate = result["candidates"][0]
-                        if "content" in candidate and "parts" in candidate["content"]:
-                            content = candidate["content"]["parts"][0]["text"]
-                            print(f"DEBUG: Gemini raw content length: {len(content)}")
-                            return content
-                        else:
-                            print(f"⚠️ Gemini candidate missing content: {candidate}")
-                            # Check for safety ratings
-                            if "finishReason" in candidate:
-                                print(f"⚠️ Finish Reason: {candidate['finishReason']}")
-                    else:
-                        print(f"⚠️ Unexpected Gemini response: {result}")
-                        raise ValueError(f"Unexpected Gemini response: {result}")
-                        
-                except httpx.HTTPStatusError as e:
-                    if e.response.status_code == 429 and attempt < retries:
-                        continue
-                    print(f"❌ Gemini API Error: {e}")
-                    raise
-                except Exception as e:
-                    if attempt < retries:
-                        print(f"⚠️ Gemini request failed: {e}. Retrying...")
-                        await asyncio.sleep(2)
-                        continue
-                    print(f"❌ Gemini API Failed after {retries+1} attempts: {e}")
-                    raise
-        return ""
+    async def _call_llm(self, prompt: str, gemini_model: str = "gemini-flash-latest", json_mode: bool = False) -> str:
+        """LLM CALLS DISABLED BY USER REQUEST"""
+        print("\n LLM INTEGRATION IS CURRENTLY DISABLED (COMMENTED OUT)")
+        raise ValueError("AI generation is disabled. Please use 'Manual Script' mode.")
 
-    async def _call_llm(self, prompt: str, gemini_model: str = "gemini-flash-latest") -> str:
-        """Centralized LLM caller with Gemini -> Hugging Face fallback."""
-        print(f"\n✨ Content Engine: Attempting 'Best' model (Gemini {gemini_model})...")
-        try:
-            # Try Gemini first with reduced retries (4 total attempts)
-            result = await self._call_gemini(prompt, model=gemini_model, retries=3)
-            print("✅ Success with Gemini!")
-            return result
-        except Exception as e:
-            print(f"⚠️ Gemini fallback triggered: {e}")
-            print(f"🚀 Switching to 'Reliable' model ({self.HF_MODEL})...")
-            # Clear fallback
-            return await self._call_huggingface(prompt)
-
-    async def _call_huggingface(self, prompt: str, max_tokens: int = 4096, timeout: float = 120.0, retries: int = 5) -> str:
-        """Call HuggingFace Inference API (OpenAI-compatible) with retry logic."""
-        import random
-        import time
-        
-        headers = {
-            "Authorization": f"Bearer {self.hf_token}",
-            "Content-Type": "application/json"
-        }
-        
-        # Use OpenAI-compatible chat completion format
-        payload = {
-            "model": self.HF_MODEL,
-            "messages": [
-                {"role": "user", "content": prompt}
-            ],
-            "max_tokens": max_tokens,
-            "temperature": 0.8,
-            "top_p": 0.95
-        }
-        
-        print(f"🚀 Calling HF API with model: {self.HF_MODEL}...")
-        
+    # [COMMENTED OUT] async def _call_gemini(self, prompt: str, ...
+    async def _call_huggingface(self, prompt: str, max_tokens: int = 16384, timeout: float = 120.0, retries: int = 3) -> str:
+        """Call HuggingFace Inference API."""
         async with self._call_semaphore:
-            # Enforce minimum interval between calls
-            now = time.time()
-            elapsed = now - self._last_call_time
-            if elapsed < self._min_interval:
-                wait = self._min_interval - elapsed
-                print(f"⏱️ Rate limiting: waiting {wait:.1f}s...")
-                await asyncio.sleep(wait)
+            now = asyncio.get_event_loop().time()
+            time_since_last = now - self._last_call_time
+            if time_since_last < self._min_interval:
+                await asyncio.sleep(self._min_interval - time_since_last)
             
-            last_exception = None
-            for attempt in range(retries):
-                try:
-                    async with httpx.AsyncClient() as client:
-                        response = await client.post(
-                            self.HF_API, 
-                            headers=headers,
-                            json=payload, 
-                            timeout=timeout
-                        )
-                        self._last_call_time = time.time()
+            headers = {
+                "Authorization": f"Bearer {self.hf_token}",
+                "Content-Type": "application/json"
+            }
+            
+            payload = {
+                "model": self.HF_MODEL,
+                "messages": [
+                    {"role": "system", "content": "You are a helpful assistant that outputs only valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                "max_tokens": max_tokens,
+                "temperature": 0.7,
+                "stream": False
+            }
+            
+            print(f"🤖 Calling HuggingFace ({self.HF_MODEL})...")
+            
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                for attempt in range(retries):
+                    try:
+                        resp = await client.post(self.HF_API, json=payload, headers=headers)
                         
-                        # Handle model loading (503)
-                        if response.status_code == 503:
-                            data = response.json()
-                            wait_time = data.get("estimated_time", 20)
-                            print(f"⏳ Model loading... waiting {wait_time:.0f}s")
+                        if resp.status_code == 429:
+                            wait_time = 5 * (attempt + 1)
+                            print(f"⚠️ Rate limited. Waiting {wait_time}s...")
                             await asyncio.sleep(wait_time)
                             continue
-                        
-                        if response.status_code == 429:
-                            base_wait = 2 ** attempt
-                            jitter = random.uniform(0, 2)
-                            wait = base_wait + jitter
-                            print(f"⚠️ Rate limit hit. Waiting {wait:.1f}s (attempt {attempt+1}/{retries})...")
-                            await asyncio.sleep(wait)
-                            continue
-                        
-                        # Log error details
-                        if response.status_code >= 400:
-                            print(f"⚠️ HuggingFace API Error {response.status_code}:")
-                            print(f"   Response: {response.text[:300]}")
                             
-                        response.raise_for_status()
-                        result = response.json()
+                        resp.raise_for_status()
+                        result = resp.json()
+                        self._last_call_time = asyncio.get_event_loop().time()
+                        return result['choices'][0]['message']['content']
                         
-                        # Parse OpenAI-compatible response format
-                        if "choices" in result and len(result["choices"]) > 0:
-                            return result["choices"][0]["message"]["content"]
-                        # Fallback for other formats
-                        elif isinstance(result, list) and len(result) > 0:
-                            return result[0].get("generated_text", "")
-                        elif isinstance(result, dict):
-                            return result.get("generated_text", str(result))
-                        return str(result)
-                        
-                except httpx.HTTPStatusError as e:
-                    if e.response.status_code in [429, 503]:
-                        last_exception = e
-                        continue
-                    raise
-                except Exception as e:
-                    print(f"⚠️ Error (Attempt {attempt+1}/{retries}): {e}")
-                    last_exception = e
-                    if attempt < retries - 1:
+                    except Exception as e:
+                        print(f"⚠️ HF Call failed (Attempt {attempt+1}/{retries}): {e}")
+                        if attempt == retries - 1:
+                            raise e
                         await asyncio.sleep(2)
-            
-            raise last_exception or Exception("HuggingFace API failed after all retries")
+            return ""
 
     async def generate(
         self,
@@ -326,7 +208,8 @@ Generate exactly {scene_count} scenes adhering to the structure above.
         """Generate a video script for the given topic."""
         prompt = self._build_prompt(topic, niche_style, scene_count)
         
-        text = await self._call_llm(prompt)
+        # text = await self._call_llm(prompt)
+        raise ValueError("AI generation is disabled. Please use 'Manual Script' mode.")
         
         if "```json" in text:
             text = text.split("```json")[1].split("```")[0]
@@ -370,8 +253,60 @@ TONE:
 
 Output ONLY the story narrative, no headers or metadata."""
 
-        text = await self._call_llm(prompt)
-        return text.strip()
+        # text = await self._call_llm(prompt)
+        # return text.strip()
+        raise ValueError("AI generation is disabled. Please use 'Manual Script' mode.")
+
+    def _repair_truncated_json(self, text: str) -> str:
+        """Force-closes truncated JSON by finding the last bracket/brace and adding the remainder."""
+        text = text.strip()
+        
+        # If it already ends with }, we assume it's possibly complete
+        if text.endswith("}"):
+            return text
+            
+        print("⚠️ Detected truncated JSON. Attempting surgery...")
+        
+        # 1. If it ends for sure inside the 'scenes' array, try to find the last complete scene object
+        if '"scenes": [' in text:
+            scenes_start = text.find('"scenes": [')
+            # Find the last closing brace after the scenes start
+            last_brace = text.rfind("}")
+            
+            if last_brace != -1 and last_brace > scenes_start:
+                # If there's an opening brace after the last closing, we have a partial object
+                last_opening = text.rfind("{")
+                if last_opening > last_brace:
+                    text = text[:last_brace+1]
+                else:
+                    # Current object is likely partial because it doesn't end with } (handled by early return)
+                    # or it might be a nested object. Let's be safe and cut at last brace.
+                    text = text[:last_brace+1]
+            else:
+                # No complete scenes. Cut back to start of array.
+                text = text[:scenes_start + len('"scenes": [')]
+            
+            # Strip trailing comma if we cut right after a scene
+            text = text.strip()
+            if text.endswith(","):
+                text = text[:-1]
+
+            # Close the structure
+            if not text.endswith("]"):
+                 text += "\n  ]\n}"
+            if not text.endswith("}"):
+                 text += "\n}"
+        
+        # General bracket balancer as a catch-all
+        brace_count = text.count("{") - text.count("}")
+        bracket_count = text.count("[") - text.count("]")
+        
+        for _ in range(bracket_count):
+            text += "\n  ]"
+        for _ in range(brace_count):
+            text += "\n}"
+            
+        return text
 
     def _clean_json_text(self, text: str) -> str:
         """
@@ -403,6 +338,9 @@ Output ONLY the story narrative, no headers or metadata."""
         
         if json_end_index != -1:
             text = text[:json_end_index]
+        else:
+            # If not found, it's truncated. Repair it.
+            text = self._repair_truncated_json(text)
         
         # Step 3: Replace curly/smart quotes with straight quotes
         quote_chars = [
@@ -446,21 +384,39 @@ Output ONLY the story narrative, no headers or metadata."""
         if before_count > 0:
             print(f"🔧 Cleaned duplicate quotes: {before_count} → {after_count}")
         
-        # Step 5: Fix literal newlines inside JSON strings
-        def escape_newlines(match):
-            content = match.group(2)
-            fixed = content.replace('\n', '\\n').replace('\r', '\\n').replace('\t', '\\t')
-            return f'{match.group(1)}{fixed}{match.group(3)}'
+        # Step 5: Fix internal unescaped quotes and literal newlines.
+        # This is a complex multi-pass repair.
+        fields = ["name", "prompt", "text_to_image_prompt", "image_to_video_prompt", 
+                  "dialogue", "scene_title", "voiceover_text", "character_pose_prompt",
+                  "background_description", "motion_description", "duration_in_seconds", "camera_angle"]
         
-        for field in ["name", "prompt", "text_to_image_prompt", "image_to_video_prompt", 
-                      "dialogue", "scene_title", "voiceover_text", "character_pose_prompt",
-                      "background_description", "motion_description", "duration_in_seconds", "camera_angle"]:
-            text = re.sub(
-                rf'("{field}":\s*")(.+?)("(?=\s*[,}}\n]))',
-                escape_newlines,
-                text,
-                flags=re.DOTALL
-            )
+        # We search for "field": "VALUE" where VALUE might contain " that should be escaped.
+        # We look ahead for the next field name to know where the current value ends.
+        next_field_pattern = r'|'.join([rf'"{f}":' for f in fields]) + r'|},|\]|}$'
+        
+        def repair_field_value(match):
+            prefix = match.group(1)   # e.g., '"field": "' or '"field": \''
+            raw_value = match.group(2) # the content including potential unescaped quotes
+            
+            # Normalize the prefix to ALWAYS end with a double quote
+            # e.g. "field": ' -> "field": "
+            field_part = prefix.split(':')[0]
+            prefix = f'{field_part}: "'
+            
+            # First, normalize newlines
+            val = raw_value.replace('\n', '\\n').replace('\r', '\\n').replace('\t', '\\t')
+            
+            # Escape all double quotes that aren't already escaped.
+            val = val.replace('"', '\\"')
+            
+            return f'{prefix}{val}"'
+
+        for field in fields:
+            # Match "field": ["'] (content) (lookahead for next field or object end)
+            # We use a greedy match for the content until we hit the next known field header.
+            # This handles values starting with either " or '
+            pattern = rf'("{field}":\s*["\'])(.+?)(?=["\']?\s*(?:{next_field_pattern}))'
+            text = re.sub(pattern, repair_field_value, text, flags=re.DOTALL)
         
         return text
 
@@ -474,83 +430,55 @@ Output ONLY the story narrative, no headers or metadata."""
         Stage 2: Extract characters and create scene breakdown from narrative.
         Returns master character prompts and scene-by-scene breakdown.
         """
-        prompt = f"""You are an expert storyboard artist and 3D animation director. Analyze this story and create a complete production package:
-
+        prompt = f"""You are an expert storyboard artist and 3D animation director.
 STORY:
 {story_narrative}
 
 STYLE: {style}
 TARGET SCENES: {scene_count}
-(FOR TESTING: Generate exactly {scene_count} scenes and exactly 2 master characters)
+
+Analyze the story and create EXACTLY {scene_count} scenes and establish 2 main characters.
 
 Create a structured breakdown with:
-
-1. MASTER CHARACTER PROMPTS: For EXACTLY 2 main characters, write a detailed Text-to-Image prompt that establishes their visual appearance. Include:
-   - Physical features (age, hair, eyes, build)
-   - Clothing and accessories
-   - Expression and personality cues
-   - Art style consistency notes
-
+1. MASTER CHARACTER PROMPTS: Define 2 main characters with detailed Text-to-Image prompts.
 2. SCENE BREAKDOWN: For each of the {scene_count} scenes, provide:
-   - scene_title: Brief title (e.g., "The Discovery")
-   - voiceover_text: Narration/Script for this scene (2-3 sentences max).
+   - scene_title: Brief title.
+   - voiceover_text: Narration/Script (2 sentences max).
+   - character_pose_prompt: [Style], [Lighting]. ([Character Name]: Brief Appearance). ACTION: [Action & Camera]. MUST REPEAT STYLE every time. Keep character appearance brief (e.g. "Boy: red hoodie").
    - text_to_image_prompt: FULL detailed description for image generation.
-   - character_pose_prompt: STRICT 'GOLDEN FORMULA': [Style], [Lighting/Setting]. ([Char 1 Desc]). ([Char 2 Desc]). ACTION: [Specific Action & Camera]. MUST REPEAT STYLE & CHAR DEFS EVERY TIME.
-   - background_description: Setting details.
-   - image_to_video_prompt: Dynamic movement description.
-   - motion_description: Concise motion instruction (e.g. "Pan right", "Character waves").
-   - duration_in_seconds: 5-10
-   - camera_angle: "wide shot", "close up", etc.
-   - dialogue: Character speech with emotion cues, format: '[CHARACTER_NAME]: (emotion) "Speech"'. Use null if no dialogue.
-
-CRITICAL RULES FOR 'character_pose_prompt':
-1. ZERO MEMORY: Treat every scene as a standalone job. The AI forgets previous lines.
-2. REPEAT EVERYTHING: You MUST repeat the full Style and full Character Visual Definitions in every single scene.
-3. FORMAT: [STYLE] + [CHARACTER DEFS] + [ACTION]
-   Example: "High-quality Pixar 3D style, cinematic lighting. (Boy: 10yo, slim, red hoodie, jeans). (Cat: orange tabby, fluffy). ACTION: Medium Shot of boy hugging cat."
+   - image_to_video_prompt: Dynamic movement for Grok (1-2 sentences).
+   - motion_description: Concise instruction (e.g. "Pan right").
+   - duration_in_seconds: 5-10.
+   - camera_angle: "wide", "medium", "close-up", etc.
+   - dialogue: '[CHARACTER]: (emotion) "Speech"'. Use null if no dialogue.
 
 Return ONLY valid JSON in this exact format:
 {{
   "characters": [
     {{
-      "name": "THE BOY",
-      "prompt": "A high-quality Pixar-style 3D render of [THE BOY], a 10-year-old..."
+      "name": "CHARACTER NAME",
+      "prompt": "Full detailed 3D render prompt..."
     }}
   ],
   "scenes": [
     {{
       "scene_number": 1,
-      "scene_title": "The Discovery",
-      "voiceover_text": "In the heart of the ancient forest, a boy stumbled upon a secret...",
-      "text_to_image_prompt": "A wide, low-angle landscape shot at twilight. [THE BOY] is crouched...",
-      "character_pose_prompt": "High-quality Pixar 3D style, twilight forest. ([THE BOY]: 10yo, slim, red hoodie, jeans). ACTION: Wide Shot of boy crouching near glowing plant.",
-      "background_description": "Ancient forest with bioluminescent plants at twilight...",
-      "image_to_video_prompt": "[THE BOY] hesitates, looking around nervously. He slowly reaches out...",
-      "motion_description": "[THE BOY] reaches out slowly...",
+      "scene_title": "...",
+      "voiceover_text": "...",
+      "text_to_image_prompt": "...",
+      "character_pose_prompt": "...",
+      "background_description": "...",
+      "image_to_video_prompt": "...",
+      "motion_description": "...",
       "duration_in_seconds": 10,
-      "camera_angle": "wide shot",
-      "dialogue": "[THE BOY]: (whispering) What is this?"
-    }},
-    {{
-      "scene_number": 2,
-      "scene_title": "The Approach",
-      "voiceover_text": "He moved closer, his breath held tight...",
-      "text_to_image_prompt": "A close-up of [THE BOY]'s face illuminated by the glow...",
-      "character_pose_prompt": "High-quality Pixar 3D style, twilight forest. ([THE BOY]: 10yo, slim, red hoodie, jeans). ACTION: Close-up of boy's face, eyes wide with wonder.",
-      "background_description": "Ancient forest with bioluminescent plants at twilight...",
-      "image_to_video_prompt": "[THE BOY] leans in closer, eyes widening...",
-      "motion_description": "[THE BOY] leans in...",
-      "duration_in_seconds": 5,
-      "camera_angle": "close up",
+      "camera_angle": "medium",
       "dialogue": null
     }}
   ]
 }}
-IMPORTANT: 
-- Use SINGLE QUOTES (') for dialogue or internal quotes. DO NOT use unescaped double quotes (") inside JSON string values.
-- Ensure the JSON is valid and strictly follows the schema.
-- The output must be ONLY the JSON object.
-- Each JSON string value must have EXACTLY ONE opening " and EXACTLY ONE closing "
+Return ONLY valid JSON.
+- For character_pose_prompt, keep it extremely brief: [Style]. ([Name]: visual). ACTION: [Action].
+- DO NOT use unescaped double quotes inside strings.
 """
 
         # text = await self._call_huggingface(
@@ -559,7 +487,8 @@ IMPORTANT:
         #     timeout=120.0,
         #     retries=5
         # )
-        text = await self._call_llm(prompt)
+        # text = await self._call_llm(prompt, json_mode=True)
+        raise ValueError("AI generation is disabled. Please use 'Manual Script' mode.")
         
         print(f"DEBUG: Raw technical breakdown text length: {len(text)}")
         
@@ -632,3 +561,329 @@ IMPORTANT:
                 print(f"❌ Final repair failed: {e2}")
                 print(f"\n📝 CLEANED TEXT (first 1000 chars):\n{clean_text[:1000]}\n")
                 raise e
+
+    async def parse_manual_script_llm(self, raw_text: str) -> TechnicalBreakdownOutput:
+        """
+        Extract structured data from a manual script using LLM.
+        """
+        print("📝 Manual Extraction: Using Hugging Face LLM (Qwen-2.5-7B)...")
+        
+        prompt = f"""You are a master template-agnostic data extraction expert.
+        
+TASK:
+Analyze the provided unstructured MOVIE SCRIPT/STORYBOARD and extract structured data.
+The input format is variable. It often contains a **"Master Character Prompts"** section with headers like `[NAME]`, but sometimes character details are embedded in scenes.
+
+INPUT SCRIPT:
+{raw_text}
+
+REQUIREMENTS:
+1. **CHARACTERS**: Extract TWO (2) Main Characters.
+   - **Strong Priority**: Look for headers like `[THE BOY]`, `[NAME]`, `1. Name`, `Character 1:`, or `Name — Master Text-to-Image Prompt`.
+   - Use the text following these headers as their `prompt`.
+   - If NO such headers exist, INFER them from the scenes.
+
+2. **MUSIC MOOD**: Select ONE mood for the entire video from this list:
+   [dramatic, cinematic, calm, horror, adventurous, cute, travel, beauty, suspense, hiphop, rock, piano, sorrow, epic, jazz]
+   - Base selection on the overall tone of the script.
+
+3. **SCENES**: Extract ALL Scenes containing:
+   - **text_to_image_prompt**: Combine "Visual", "Text-to-Image", "What is happening", "Setting", and "Style".
+   - **image_to_video_prompt**: Combine "Animation", "Video Prompt", "Motion", or "Action".
+   - **voiceover_text**: Extract from "Dialogue", "Voiceover" or "Audio". 
+   - **dialogue**: SAME as voiceover_text.
+   - **scene_title**: Extract from "Scene 1 — Title" or similar.
+
+OUTPUT FORMAT (JSON ONLY):
+{{
+  "characters": [
+    {{ "name": "Name", "prompt": "Visual Description" }}
+  ],
+  "music_mood": "epic",
+  "scenes": [
+    {{
+      "scene_number": 1,
+      "scene_title": "Title",
+      "voiceover_text": "Narration...",
+      "character_pose_prompt": "Visual...", 
+      "text_to_image_prompt": "Combined Visual Description...",
+      "image_to_video_prompt": "Combined Motion Description...",
+      "motion_description": "Motion...",
+      "duration_in_seconds": 5,
+      "camera_angle": "Medium Shot",
+      "dialogue": "Speech..."
+    }}
+  ]
+}}
+
+IMPORTANT:
+- Return ONLY valid JSON.
+- If a field is missing, use empty string or null.
+- **text_to_image_prompt** MUST be detailed.
+"""
+        try:
+            text = await self._call_huggingface(prompt, max_tokens=16384)
+            print(f"DEBUG: LLM Response (First 500 chars):\n{text[:500]}...") # Added debug
+            clean_text = self._clean_json_text(text)
+            data = json.loads(clean_text)
+            print(f"✅ LLM Extraction Successful! Found {len(data.get('scenes', []))} scenes.")
+            return TechnicalBreakdownOutput(**data)
+        except Exception as e:
+            print(f"❌ LLM Extraction Failed: {e}")
+            print("⚠️ Falling back to Regex Parser...")
+            return self.parse_manual_script(raw_text)
+
+    def parse_manual_script(self, raw_text: str) -> TechnicalBreakdownOutput:
+        """
+        Parse a manual script following the user's specific storyboard format.
+        Supports 'PART 1', 'PART 2', 'PART 3' structure.
+        """
+        import re
+        characters = []
+        scenes = []
+        
+        print("📝 Parsing manual storyboard (Sequence Flow v6.0 - Robust)...")
+        
+        # 1. Normalize
+        text = raw_text.replace('\r\n', '\n').strip()
+        
+        # --- 2. Extract Style Wrapper ---
+        style_wrapper = ""
+        # Look for PART 2 header or just "STYLE WRAPPER"
+        # We capture everything until the next PART or SCENE start
+        style_section_match = re.search(r'(?:PART 2:?\s*)?THE GLOBAL STYLE WRAPPER.*?(?=(?:PART 3|SCENE 1|MATCH END))', text + "MATCH END", re.DOTALL | re.IGNORECASE)
+        
+        if style_section_match:
+            style_block = style_section_match.group(0)
+            # functionality: Aggregating known style keys into one string
+            style_components = []
+            keys_to_extract = ["Artistic Influence", "Medium/Texture", "Color Palette", "Lighting/Environment", "Technical Keywords", "Base Style"]
+            
+            for line in style_block.split('\n'):
+                for key in keys_to_extract:
+                    if re.search(rf'{key}:', line, re.IGNORECASE):
+                        # Extract value: "Key: Value" -> "Value"
+                        val = line.split(':', 1)[1].strip()
+                        if val:
+                             style_components.append(val)
+            
+            # If we found specific components, join them. Otherwise try to grab the whole block content if simple.
+            if style_components:
+                style_wrapper = ", ".join(style_components)
+            else:
+                # Fallback: exact simplistic match
+                m = re.search(r'Style Wrapper:\s*(.+)', style_block)
+                if m: style_wrapper = m.group(1).strip()
+            
+            print(f"   🎨 Extracted Style Wrapper ({len(style_wrapper)} chars)")
+
+        # --- 3. Extract Characters ---
+        # Strategy: Try multiple known headers
+        # 1. "THE CHARACTER BIOS" (Format 1)
+        # 2. "CHARACTER MASTER PROMPTS" (Format 2)
+        
+        # Make regex extremely permissive for the header
+        # Added: "Master Character Prompts" (without "Step 1" assumption, using loose match)
+        char_section_match = re.search(r'(?:PART 1:?|Step \d+:?)?\s*(?:THE CHARACTER BIOS|CHARACTER MASTER PROMPTS?|MASTER CHARACTERS?).*?(?=(?:PART 2|Step \d+|THE GLOBAL STYLE WRAPPER|MATCH END|🎞️|SCENE))', text + "MATCH END", re.DOTALL | re.IGNORECASE)
+        
+        bio_text = ""
+        if char_section_match:
+            bio_text = char_section_match.group(0)
+            print(f"DEBUG: Found Character Section via Header ({len(bio_text)} chars)")
+        else:
+             # Fallback: Everything before the first SCENE is potential character data
+             print("DEBUG: Header regex failed. Using Fallback (Pre-Scene text).")
+             # Find index of first scene
+             scene_match = re.search(r'(?:🎞️)?\s*SCENE\s+\d+', text, re.IGNORECASE)
+             if scene_match:
+                 bio_text = text[:scene_match.start()]
+                 print(f"DEBUG: Fallback Bio Text ({len(bio_text)} chars)")
+             else:
+                 # No scenes found? Use whole text
+                 bio_text = text
+        
+        if bio_text:
+             # Remove lines that might be headers to avoid false positives in names? 
+             
+            print(f"DEBUG: Processing Bio Text:\n{bio_text[:200]}...")
+            
+            # Format 3 (User Specific): [THE BOY] — Master Text-to-Image Prompt
+            # Regex: explicit square brackets at start of line
+            if "[" in bio_text and "]" in bio_text:
+                print("DEBUG: Detecting Format 3 ([NAME])")
+                # Pattern: [NAME] optional dash/text ... content ... until next [
+                bracket_iter = re.finditer(r'(?:^|\n)\s*\[([A-Z0-9\s_\-]+)\](?:[^\n]*)(.*?)(?=(?:\n\s*\[|MATCH END|SCENE|$))', bio_text, re.DOTALL)
+                
+                found_any = False
+                for m in bracket_iter:
+                    name_raw = m.group(1).strip()
+                    content = m.group(2).strip()
+                    print(f"DEBUG: Found Bracket Char: {name_raw}")
+                    
+                    if name_raw and content:
+                        characters.append(MasterCharacter(name=name_raw, prompt=content))
+                        found_any = True
+                
+                if found_any:
+                    # If we found characters this way, we might want to skip other formats to avoid duplicates?
+                    # But sticking to append mode is safer for mixed formats unless it causes dupes.
+                    # Given the input, this is likely the only format.
+                    pass
+
+            # Format 1: "Character 1: Name"
+            if "Character 1:" in bio_text or "Character 1 :" in bio_text:
+                print("DEBUG: Detecting Format 1 (Character X:)")
+                char_iter = re.finditer(r'Character\s+\d+\s*:\s*([^\n]+)(.*?)(?=(?:Character\s+\d+:|$))', bio_text, re.DOTALL | re.IGNORECASE)
+                for m in char_iter:
+                    name_raw = m.group(1).strip()
+                    content = m.group(2).strip()
+                    simple_name = re.sub(r'\s*\(.*?\)', '', name_raw).strip()
+                    
+                    prompt_val = ""
+                    bp_match = re.search(r'Base Prompt:\s*(.+)', content, re.IGNORECASE)
+                    if bp_match:
+                        prompt_val = bp_match.group(1).strip()
+                    else:
+                        phys = re.search(r'Physical Description:\s*(.+)', content, re.IGNORECASE)
+                        ward = re.search(r'Wardrobe:\s*(.+)', content, re.IGNORECASE)
+                        parts = []
+                        if phys: parts.append(phys.group(1).strip())
+                        if ward: parts.append(ward.group(1).strip())
+                        prompt_val = ", ".join(parts)
+                    
+                    if simple_name and prompt_val:
+                        characters.append(MasterCharacter(name=simple_name, prompt=prompt_val))
+
+            # Format 2: "1. Name" with "Text-to-Image Prompt:"
+            # Only try this if we haven't found much yet, or just try in parallel? 
+            # "1." can false positive on "Step 1".
+            if len(characters) == 0:
+                print("DEBUG: Detecting Format 2 (Numbered List 1. Name)")
+                # Regex: Number dot Name matches
+                # Look for "1. Name" followed by content until next number or end
+                fmt2_iter = re.finditer(r'(?:^|\n)\s*(\d+)\.\s+([^\n]+)(.*?)(?=(?:\n\s*\d+\.\s+|MATCH END|$))', bio_text, re.DOTALL)
+                for m in fmt2_iter:
+                    name = m.group(2).strip()
+                    content = m.group(3).strip()
+                    print(f"DEBUG: Potential Char Match: {name}")
+                    
+                    # Extract Prompt
+                    t2i_match = re.search(r'(?:Text-to-Image Prompt|Text to Image Prompt|Prompt):\s*(.*?)(?=\n(?:Style|Style:|2\.|3\.|$))', content, re.DOTALL | re.IGNORECASE)
+                    style_match = re.search(r'Style:\s*(.*?)(?=\n|$)', content, re.IGNORECASE)
+                    
+                    prompt_val = ""
+                    if t2i_match:
+                        prompt_val = t2i_match.group(1).strip()
+                        # Append style if present
+                        if style_match:
+                            prompt_val += f", {style_match.group(1).strip()}"
+                    else:
+                        print(f"DEBUG: No Text-to-Image Prompt found for {name}")
+                        # Fallback: take whole content if simple
+                        if len(content) < 500 and "PROMPT" not in content.upper():
+                             prompt_val = content.strip()
+                    
+                    if name and prompt_val:
+                        characters.append(MasterCharacter(name=name, prompt=prompt_val))
+                        print(f"   👤 Found Character (fmt2): {name}")
+            
+            # Format 4 (User Specific): "Name — Master Text-to-Image Prompt"
+            if len(characters) == 0:
+                print("DEBUG: Detecting Format 4 (Name — Master Text-to-Image Prompt)")
+                # Pattern: Name followed by dash and "Master Text-to-Image Prompt"
+                # Regex looks for line start, name, dash, specific phrase
+                fmt4_iter = re.finditer(r'(?:^|\n)\s*(.+?)\s+[—–-]\s*Master Text-to-Image Prompt\s*\n(.*?)(?=(?:\n\s*.+?\s+[—–-]\s*Master Text-to-Image Prompt|MATCH END|SCENE|Step \d+|$))', bio_text, re.DOTALL | re.IGNORECASE)
+                for m in fmt4_iter:
+                    name = m.group(1).strip()
+                    content = m.group(2).strip()
+                    
+                    # Clean up name if it contains "Step 1:" prefix
+                    if ":" in name and "Step" in name:
+                        name = name.split(":")[-1].strip()
+                        
+                    print(f"DEBUG: Found Character (fmt4): {name}")
+                    if name and content:
+                        characters.append(MasterCharacter(name=name, prompt=content))
+
+        else:
+            print("DEBUG: NO CHARACTER SECTION MATCHED")
+
+        # --- 4. Extract Scenes ---
+        # Split by "SCENE X" or "🎞️ SCENE X"
+        # We replace the emoji to standard "SCENE" first for easier splitting
+        clean_text_for_scenes = re.sub(r'🎞️\s*', '', text)
+        
+        # Split by "SCENE X"
+        scene_blocks = re.split(r'(?i)\n+SCENE\s+(\d+)', clean_text_for_scenes)
+        
+        found_scenes = 0
+        
+        if len(scene_blocks) > 1:
+            for i in range(1, len(scene_blocks), 2):
+                try:
+                    s_num = int(scene_blocks[i])
+                    block = scene_blocks[i+1]
+                    
+                    lines = block.strip().split('\n')
+                    raw_title = lines[0].strip()
+                    scene_title = re.sub(r'^[:\–\-\.]\s*', '', raw_title)
+                    
+                    def extract(keys: list, text_block: str) -> str:
+                        for k in keys:
+                            # Robust Match: Key: Value ... (until next key or double newline)
+                            pattern = rf'(?i){k}\s*[:]\s*(.*?)(?=\n+(?:Shot|Text-to-Image|Image-to-Video|Dialogue|Audio|Style)|$)'
+                            m = re.search(pattern, text_block, re.DOTALL)
+                            if m: return m.group(1).strip()
+                        return ""
+
+                    # Mapping
+                    shot = extract(["Shot Type", "Shot"], block)
+                    img_prompt = extract(["Text-to-Image Prompt", "Image Prompt", "Visual"], block)
+                    vid_prompt = extract(["Image-to-Video Prompt", "Video Prompt", "Animation"], block)
+                    
+                    # Audio / Dialogue
+                    audio_raw = extract(["Dialogue", "Dialogue \\(Narrator\\)", "Dialogue \\(.*\\)", "Audio \\(VO\\)", "Audio \\(SFX\\)", "Audio", "VO", "Voiceover"], block)
+                    
+                    # Per-Scene Style
+                    style_local = extract(["Style"], block)
+                    
+                    # Merge Style into Prompt
+                    if style_local:
+                        img_prompt = f"{img_prompt}, {style_local}"
+                    elif style_wrapper:
+                         if "[Style Wrapper]" in img_prompt:
+                            img_prompt = img_prompt.replace("[Style Wrapper]", style_wrapper)
+                         else:
+                            # If no local style and no placeholder, maybe append global?
+                            # For now, let's just respect local style overrides.
+                            pass
+
+                    # Dialogue Cleanup
+                    clean_audio = audio_raw.strip('"').strip('“').strip('”')
+                    
+                    # Construct Pose
+                    final_pose = f"{shot}, {img_prompt}" 
+                    
+                    scenes.append(SceneBreakdown(
+                        scene_number=s_num,
+                        scene_title=scene_title,
+                        voiceover_text=clean_audio if "(SFX" not in audio_raw else "",
+                        character_pose_prompt=final_pose[:1000], 
+                        text_to_image_prompt=img_prompt,
+                        image_to_video_prompt=vid_prompt,
+                        motion_description=vid_prompt,
+                        background_description=img_prompt,
+                        camera_angle=shot,
+                        dialogue=clean_audio if "(SFX" not in audio_raw else None,
+                        duration_in_seconds=5
+                    ))
+                    found_scenes += 1
+                except Exception as ex:
+                    print(f"   ⚠️ Error parsing scene {i}: {ex}")
+
+        if found_scenes == 0:
+             print("❌ Failed to parse any scenes manually. Check format.")
+        else:
+             print(f"✅ Extracted {found_scenes} scenes.")
+
+        return TechnicalBreakdownOutput(characters=characters, scenes=scenes)
