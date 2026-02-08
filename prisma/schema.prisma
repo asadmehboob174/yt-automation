@@ -4,7 +4,6 @@ generator client {
 
 generator client_py {
   provider = "prisma-client-py"
-  output   = "../.venv/Lib/site-packages/prisma"
   interface = "asyncio"
 }
 

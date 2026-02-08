@@ -17,8 +17,8 @@
     },
     "packageManager": "npm@10.9.1",
     "dependencies": {
-        "@prisma/client": "^5.17.0",
+        "@prisma/client": "^5.22.0",
         "dotenv": "^17.2.3",
-        "prisma": "^5.17.0"
+        "prisma": "^5.22.0"
     }
 }

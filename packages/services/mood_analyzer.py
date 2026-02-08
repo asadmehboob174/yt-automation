@@ -17,7 +17,8 @@ class MoodAnalyzer:
         "travel", "beauty", "suspense", "dramatic", 
         "calm", "cinematic", "epic", "rock", 
         "hiphop", "jazz", "classical", "edm", 
-        "piano", "sorrow"
+        "piano", "sorrow",
+        "funny", "happy", "upbeat", "inspiring", "motivational"
     ]
     
     def __init__(self):

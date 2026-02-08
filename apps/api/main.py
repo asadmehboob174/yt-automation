@@ -6,7 +6,7 @@ job status, and Inngest webhook handling.
 """
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
 import os
@@ -29,6 +29,7 @@ from contextlib import asynccontextmanager
 from prisma import Prisma
 from services.cloud_storage import R2Storage
 from services.script_generator import ScriptGenerator
+from services.email_service import email_service
 
 # Global Prisma client
 db = Prisma()
@@ -197,6 +198,53 @@ async def trigger_storage_cleanup(
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Cleanup failed: {str(e)}")
+
+
+# --- Notifications ---
+
+class EmailNotification(BaseModel):
+    type: str  # 'success' or 'error'
+    project_name: str
+    video_url: Optional[str] = None
+    error_message: Optional[str] = None
+    step: Optional[str] = None
+
+
+@app.post("/notifications/email")
+async def send_email_notification(notification: EmailNotification):
+    """
+    Send email notification for video completion or error.
+    
+    Used by frontend 1-click automation to notify user when done.
+    """
+    if not email_service.is_configured():
+        return {"success": False, "message": "Email not configured - check SMTP env vars"}
+    
+    if notification.type == "success":
+        success = email_service.send_video_complete(
+            project_name=notification.project_name,
+            video_url=notification.video_url or "N/A"
+        )
+    elif notification.type == "error":
+        success = email_service.send_video_error(
+            project_name=notification.project_name,
+            error_message=notification.error_message or "Unknown error",
+            step=notification.step
+        )
+    else:
+        raise HTTPException(status_code=400, detail="Invalid notification type")
+    
+    return {"success": success}
+
+
+@app.get("/notifications/status")
+async def get_notification_status():
+    """Check if email notifications are configured."""
+    return {
+        "configured": email_service.is_configured(),
+        "smtp_server": email_service.smtp_server,
+        "notification_email": email_service.notification_email or "Not set"
+    }
 
 
 @app.get("/channels")
@@ -410,6 +458,11 @@ class GenerateBreakdownRequest(BaseModel):
     video_type: str
     niche_id: str
 
+class AnalyzeMoodRequest(BaseModel):
+    script: str
+    title: str = ""
+    niche: str = ""
+
 class GenerateImageRequest(BaseModel):
     character_name: str
     prompt: str
@@ -421,6 +474,7 @@ class GenerateSceneImageRequest(BaseModel):
     prompt: str
     niche_id: str
     character_images: list[dict]  # list of {name, imageUrl}
+    is_shorts: bool = False
 
 class GenerateVideoRequest(BaseModel):
     scene_index: int
@@ -511,44 +565,83 @@ async def generate_breakdown(request: GenerateBreakdownRequest):
     if not channel:
         raise HTTPException(status_code=404, detail="Channel not found")
 
-    # scene_count = 12 if request.video_length == "short" else 45
     # Dynamic scene count based on format
     scene_count = 12 if request.video_length == "short" else 40
     
     try:
         generator = ScriptGenerator()
         
-        # Check for Manual Script Template Markers (Case-insensitive & Emoji-tolerant)
+        # Check for ANY structured script markers (very flexible detection)
         narrative_upper = request.story_narrative.upper()
-        is_manual = (
-            "CHARACTER MASTER PROMPTS" in narrative_upper or 
-            "PART 1" in narrative_upper or 
-            "CHARACTER BIOS" in narrative_upper or 
-            "STORYBOARD" in narrative_upper
-        )
         
+        # Extended list of markers that indicate a structured storyboard/script
+        structure_markers = [
+            "CHARACTER MASTER PROMPTS", "MASTER CHARACTER", "CHARACTER BIOS",
+            "PART 1", "PART 2", "PART 3",
+            "STEP 1", "STEP 2", "STORYBOARD",
+            "SCENE 1", "SCENE 2", "SCENE:", 
+            "TEXT-TO-IMAGE PROMPT", "IMAGE-TO-VIDEO PROMPT",
+            "MASTER TEXT-TO-IMAGE", "TEXT TO IMAGE",
+            "DIALOGUE:", "SHOT:", "SHOT TYPE:",
+            "— MASTER", "- MASTER", "– MASTER",
+        ]
+        
+        is_manual = any(marker in narrative_upper for marker in structure_markers)
+        
+        # USER REQUEST: Directly use Hugging Face LLM to parse the script (Skip Regex)
         if is_manual:
-            print("ℹ️ Manual Script Template Detected! Parsing via Regex Extraction...")
+            print(f"ℹ️ Structured Script Detected! Directly using LLM extraction...")
             breakdown = await generator.parse_manual_script_llm(request.story_narrative)
         else:
-            # Secondary check for known script markers even if headers are missing
-            markers = ["SCENE 1", "SCENE:", "SHOT:", "TEXT-TO-IMAGE PROMPT", "IMAGE-TO-VIDEO PROMPT", "DIALOGUE:"]
-            if any(m in narrative_upper for m in markers):
-                print("ℹ️ Manual Script Content Detected (Secondary Check). Parsing manually...")
+            print(f"⚠️ No known structure markers found. Attempting LLM extraction as fallback...")
+            try:
                 breakdown = await generator.parse_manual_script_llm(request.story_narrative)
-            else:
-                print(f"⚠️ Input not recognized as Manual Script. Start: {narrative_upper[:100]}")
+            except Exception as llm_error:
+                print(f"⚠️ LLM extraction failed: {llm_error}. Falling back to AI generation...")
                 breakdown = await generator.generate_technical_breakdown(
                     story_narrative=request.story_narrative,
                     scene_count=scene_count,
                     style=channel.styleSuffix or "High-quality Pixar/Disney 3D Render"
                 )
-        return breakdown.model_dump()
+        
+        # DEBUG: Log what we're returning
+        result = breakdown.model_dump()
+        print(f"📊 Returning breakdown with {len(result.get('scenes', []))} scenes and {len(result.get('characters', []))} characters")
+        if result.get('characters'):
+            print(f"   👥 Characters: {', '.join([c['name'] for c in result['characters']])}")
+        for i, scene in enumerate(result.get('scenes', [])):
+            cpp = scene.get('character_pose_prompt', '')[:50] or 'EMPTY'
+            img = scene.get('text_to_image_prompt', '')[:50] or 'EMPTY'
+            print(f"   Scene {i+1}: character_pose_prompt={cpp}... | text_to_image_prompt={img}...")
+        return result
+
     except Exception as e:
         import traceback
         traceback.print_exc()
         print(f"ERROR in generate-breakdown: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/scripts/analyze-mood")
+async def analyze_mood(request: AnalyzeMoodRequest):
+    """Stage 3: Analyze script mood to recommend background music."""
+    try:
+        from services.mood_analyzer import MoodAnalyzer
+        print(f"🧠 AI Mood Analysis requested for script: '{request.title}'")
+        analyzer = MoodAnalyzer()
+        
+        # Analyze Based on script content
+        mood = analyzer.analyze_mood(
+            title=request.title or "Untitled",
+            niche=request.niche or "general",
+            description=request.script
+        )
+        
+        print(f"   💡 Recommendation: {mood}")
+        return {"mood": mood}
+    except Exception as e:
+        print(f"⚠️ Mood analysis failed: {e}")
+        return {"mood": "auto"}
 
 
 class GenerateBatchRequest(BaseModel):
@@ -670,7 +763,7 @@ async def generate_character_image(request: GenerateImageRequest):
         
         print(f"✅ Character image uploaded: {image_url}")
         
-        return {"imageUrl": image_url}
+        return {"image_url": image_url}
         
     except Exception as e:
         import traceback
@@ -680,7 +773,6 @@ async def generate_character_image(request: GenerateImageRequest):
         if agent:
             await agent.close()
 
-@app.post("/scenes/generate-image")
 async def generate_scene_image(request: GenerateSceneImageRequest):
     """Generate scene image using WhiskAgent (Single Mode)."""
     agent = None
@@ -723,7 +815,7 @@ async def generate_scene_image(request: GenerateSceneImageRequest):
         # Generate
         image_bytes = await agent.generate_image(
             prompt=request.prompt,
-            is_shorts=False, # Default to landscape for scene logic usually
+            is_shorts=request.is_shorts, # Use passed value
             style_suffix=style_suffix,
             character_paths=char_local_paths
         )
@@ -755,6 +847,367 @@ async def generate_scene_image(request: GenerateSceneImageRequest):
                 except: pass
 
 
+
+class GenerateBatchSceneImagesRequest(BaseModel):
+    niche_id: str
+    scenes: list[dict] # {index: int, prompt: str}
+    character_images: list[dict] = [] # {name: str, imageUrl: string}
+    video_type: str = "story" # "story" (default/landscape) or "shorts" (9:16)
+
+class GenerateCharacterBatchRequest(BaseModel):
+    niche_id: str
+    characters: list[dict] # {index: int, name: str, prompt: str}
+    video_type: str = "story"
+
+@app.post("/scenes/generate-images-batch")
+async def generate_images_batch(request: GenerateBatchSceneImagesRequest):
+    """Generate multiple scene images in one browser session."""
+    agent = None
+    results = []
+    
+    try:
+        from services.whisk_agent import WhiskAgent
+        from services.cloud_storage import R2Storage
+        import uuid
+        import httpx
+        import tempfile
+        from pathlib import Path
+
+        print(f"🎨 Starting Batch Generation for {len(request.scenes)} scenes...")
+
+        # Determine Style Suffix
+        channel = await db.channel.find_unique(where={"nicheId": request.niche_id})
+        style_suffix = channel.styleSuffix if (channel and channel.styleSuffix) else ""
+        
+        # Determine format
+        is_shorts = request.video_type and "short" in request.video_type.lower()
+        print(f"   📐 Batch Format: {'Shorts (9:16)' if is_shorts else 'Landscape (16:9)'}")
+
+        # Download Character References (Once for all scenes)
+        char_local_paths = []
+        if request.character_images:
+            print(f"📥 Downloading {len(request.character_images)} character references...")
+            async with httpx.AsyncClient() as client:
+                for char in request.character_images:
+                    url = char.get("imageUrl")
+                    if not url: continue
+                    try:
+                        resp = await client.get(url, follow_redirects=True)
+                        resp.raise_for_status()
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+                            tmp.write(resp.content)
+                            char_local_paths.append(Path(tmp.name))
+                    except Exception as e:
+                        print(f"⚠️ Failed to download character ref {url}: {e}")
+
+        # Initialize Agent (Single Session)
+        agent = WhiskAgent(headless=False)
+        storage = R2Storage()
+
+        # Track if setup (login, upload, etc) has been done successfully
+        setup_done = False
+
+        for i, scene in enumerate(request.scenes):
+            idx = scene.get("index")
+            prompt = scene.get("prompt")
+            # DEBUG: Log what we're receiving to diagnose empty prompts
+            print(f"   > Generating Scene {idx+1} (Batch {i+1}/{len(request.scenes)})...")
+            print(f"     DEBUG: Scene keys: {list(scene.keys())}")
+            print(f"     DEBUG: Prompt value: '{prompt}' (type: {type(prompt).__name__}, len: {len(prompt) if prompt else 0})")
+            
+            # Retry loop for robust generation
+            MAX_RETRIES = 3
+            
+            for attempt in range(MAX_RETRIES):
+                try:
+                    if attempt > 0:
+                        print(f"     🔄 Retry Attempt {attempt+1}/{MAX_RETRIES} for Scene {idx+1}...")
+                        import asyncio
+                        await asyncio.sleep(2) # Wait a bit before retry
+
+                    # Reuse agent for each scene. 
+                    # Skip setup (refresh + uploads) if we have already done it once in this batch.
+                    # BUT if we are retrying, maybe forcing setup (skip_setup=False) is safer?
+                    # For now, let's trust the page state unless it crashes hard.
+                    should_skip_setup = setup_done
+                    
+                    image_bytes = await agent.generate_image(
+                        prompt=prompt,
+                        is_shorts=is_shorts, # Pass correct ratio
+                        style_suffix=style_suffix,
+                        character_paths=char_local_paths,
+                        skip_setup=should_skip_setup
+                    )
+                    
+                    if image_bytes:
+                        image_key = f"scenes/{request.niche_id}/{uuid.uuid4().hex[:8]}_scene_{idx}.png"
+                        storage.upload_asset(image_bytes, image_key, content_type="image/png")
+                        image_url = storage.get_url(image_key)
+                        results.append({"index": idx, "imageUrl": image_url})
+                        print(f"     ✅ Scene {idx+1} done: {image_url}")
+                        
+                        # Mark setup as done since we successfully generated an image (implies setup worked)
+                        setup_done = True
+                        break # Success, exit retry loop
+                    
+                    else:
+                        print(f"     ⚠️ Scene {idx+1} returned no bytes (Attempt {attempt+1})")
+                        if attempt == MAX_RETRIES - 1:
+                            results.append({"index": idx, "error": "No image generated after retries"})
+                        
+                        # If failed, we might keep setup_done as True if we believe session is okay,
+                        # or set to False to force refresh? 
+                        # Let's keep it True to avoid re-uploading characters needlessly.
+                        
+                except Exception as e:
+                    print(f"     ❌ Scene {idx+1} failed (Attempt {attempt+1}): {e}")
+                    if attempt == MAX_RETRIES - 1:
+                        results.append({"index": idx, "error": str(e)})
+                    # Wait before next attempt
+            
+            # End of retry loop
+
+        return {"results": results}
+
+            # End of retry loop
+
+        return {"results": results}
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Batch generation failed: {e}")
+    finally:
+        if agent:
+            await agent.close()
+        # Clean up character temp files
+        for p in char_local_paths:
+            if p.is_file():
+                try: os.unlink(str(p))
+                except: pass
+
+
+@app.post("/characters/generate-images-stream")
+async def generate_character_images_stream(request: GenerateCharacterBatchRequest):
+    """Generate all master cast images in one chrome session and stream results."""
+    from services.whisk_agent import WhiskAgent
+    from services.cloud_storage import R2Storage
+    import json
+    import asyncio
+    import uuid
+    import httpx
+    import tempfile
+    from pathlib import Path
+
+    async def generate_generator():
+        agent = None
+        try:
+            print(f"🚀 [Streaming] Starting Character Batch Generation for {len(request.characters)} characters...")
+
+            # Determine Style Suffix
+            channel = await db.channel.find_unique(where={"nicheId": request.niche_id})
+            style_suffix = channel.styleSuffix if (channel and channel.styleSuffix) else ""
+            
+            # Determine format
+            is_shorts = request.video_type and "short" in request.video_type.lower()
+
+            # Initialize Agent
+            agent = WhiskAgent(headless=False)
+            storage = R2Storage()
+            setup_done = False
+
+            for i, char_req in enumerate(request.characters):
+                idx = char_req.get("index") # Character index
+                char_name = char_req.get("name", f"Character_{idx}")
+                prompt = char_req.get("prompt")
+                
+                # Retry loop
+                MAX_RETRIES = 3
+                success = False
+                
+                for attempt in range(MAX_RETRIES):
+                    try:
+                        if attempt > 0:
+                            await asyncio.sleep(2)
+
+                        image_bytes = await agent.generate_image(
+                            prompt=prompt,
+                            is_shorts=is_shorts,
+                            style_suffix=style_suffix,
+                            skip_setup=setup_done
+                        )
+                        
+                        if image_bytes:
+                            # Use character-specific key
+                            image_key = f"characters/{request.niche_id}/{char_name.lower().replace(' ', '_')}_{uuid.uuid4().hex[:8]}.png"
+                            storage.upload_asset(image_bytes, image_key, content_type="image/png")
+                            image_url = storage.get_url(image_key)
+                            
+                            # Yield result
+                            yield json.dumps({"index": idx, "imageUrl": image_url}) + "\n"
+                            
+                            setup_done = True
+                            success = True
+                            break
+                    except Exception as e:
+                        print(f"❌ Character {char_name} failed (Attempt {attempt+1}): {e}")
+
+                if not success:
+                    yield json.dumps({"index": idx, "error": "Failed after retries"}) + "\n"
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            yield json.dumps({"error": str(e)}) + "\n"
+        finally:
+            if agent:
+                await agent.close()
+
+    return StreamingResponse(generate_generator(), media_type="application/x-ndjson")
+
+
+@app.post("/scenes/generate-images-stream")
+async def generate_images_stream(request: GenerateBatchSceneImagesRequest):
+    """Generate multiple scene images in one browser session and stream results."""
+    from services.whisk_agent import WhiskAgent
+    from services.cloud_storage import R2Storage
+    import json
+    import asyncio
+    import uuid
+    import httpx
+    import tempfile
+    from pathlib import Path
+
+    async def generate_generator():
+        agent = None
+        char_local_paths = []
+        try:
+            print(f"🚀 [Streaming] Starting Batch Generation for {len(request.scenes)} scenes...")
+
+            # Determine Style Suffix
+            channel = await db.channel.find_unique(where={"nicheId": request.niche_id})
+            style_suffix = channel.styleSuffix if (channel and channel.styleSuffix) else ""
+            
+            # Determine format
+            is_shorts = request.video_type and "short" in request.video_type.lower()
+
+            # Download Character References
+            if request.character_images:
+                async with httpx.AsyncClient() as client:
+                    for char in request.character_images:
+                        url = char.get("imageUrl")
+                        if not url: continue
+                        try:
+                            resp = await client.get(url, follow_redirects=True)
+                            resp.raise_for_status()
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+                                tmp.write(resp.content)
+                                char_local_paths.append(Path(tmp.name))
+                        except Exception as e:
+                            print(f"⚠️ Failed to download character ref {url}: {e}")
+
+            # Initialize Agent
+            agent = WhiskAgent(headless=False)
+            storage = R2Storage()
+            setup_done = False
+
+            for i, scene in enumerate(request.scenes):
+                idx = scene.get("index")
+                prompt = scene.get("prompt")
+                
+                # Retry loop
+                MAX_RETRIES = 3
+                success = False
+                
+                for attempt in range(MAX_RETRIES):
+                    try:
+                        if attempt > 0:
+                            await asyncio.sleep(2)
+
+                        image_bytes = await agent.generate_image(
+                            prompt=prompt,
+                            is_shorts=is_shorts,
+                            style_suffix=style_suffix,
+                            character_paths=char_local_paths,
+                            skip_setup=setup_done
+                        )
+                        
+                        if image_bytes:
+                            image_key = f"scenes/{request.niche_id}/{uuid.uuid4().hex[:8]}_scene_{idx}.png"
+                            storage.upload_asset(image_bytes, image_key, content_type="image/png")
+                            image_url = storage.get_url(image_key)
+                            
+                            # Yield result as individual JSON object per line
+                            yield json.dumps({"index": idx, "imageUrl": image_url}) + "\n"
+                            
+                            setup_done = True
+                            success = True
+                            break
+                    except Exception as e:
+                        print(f"❌ Scene {idx+1} failed (Attempt {attempt+1}): {e}")
+
+                if not success:
+                    yield json.dumps({"index": idx, "error": "Failed after retries"}) + "\n"
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            yield json.dumps({"error": str(e)}) + "\n"
+        finally:
+            if agent:
+                await agent.close()
+            for p in char_local_paths:
+                if p.is_file():
+                    try: os.unlink(str(p))
+                    except: pass
+
+    return StreamingResponse(generate_generator(), media_type="application/x-ndjson")
+
+
+class VerifyVideoRequest(BaseModel):
+    video_url: str
+
+@app.post("/videos/verify")
+async def verify_video(request: VerifyVideoRequest):
+    """Check if a video file on R2 exists and is valid (size > 10KB)."""
+    try:
+        from services.cloud_storage import R2Storage
+        storage = R2Storage()
+        
+        # Parse key from URL
+        if "videos/" not in request.video_url:
+            return {"valid": False, "error": "Invalid video URL format"}
+            
+        key_part = request.video_url.split("/videos/", 1)[1].split("?")[0]
+        full_key = f"videos/{key_part}"
+        
+        # Check existence and size using head_object
+        try:
+            response = storage.client.head_object(Bucket=storage.bucket, Key=full_key)
+            size = response.get('ContentLength', 0)
+            
+            if size < 10000: # 10KB
+                return {"valid": False, "error": f"Video too small ({size} bytes)"}
+                
+            return {"valid": True, "size": size}
+        except Exception:
+            return {"valid": False, "error": "File not found on R2"}
+            
+    except Exception as e:
+        return {"valid": False, "error": str(e)}
+
+
+# Request model for video generation
+class GenerateVideoRequest(BaseModel):
+    scene_index: int
+    image_url: str  # Updated to match frontend (snake_case)
+    prompt: str
+    niche_id: str
+    dialogue: Optional[str] = None
+    camera_angle: Optional[str] = None
+    is_shorts: Optional[bool] = False
+
+
 @app.post("/scenes/generate-video")
 async def generate_video(request: GenerateVideoRequest):
     """Generate video from image using Grok Playwright automation."""
@@ -767,12 +1220,12 @@ async def generate_video(request: GenerateVideoRequest):
         from pathlib import Path
         
         print(f"🎥 Generating video for scene {request.scene_index}")
-        print(f"   Image: {request.imageUrl[:60]}...")
+        print(f"   Image: {request.image_url[:60]}...")
         print(f"   Motion: {request.prompt[:80]}...")
         
         # Download the scene image to a temp file
         async with httpx.AsyncClient() as client:
-            target_url = request.imageUrl
+            target_url = request.image_url
             # Fix placehold.co URLs to ensure PNG (Grok detects SVG as invalid)
             if "placehold.co" in target_url and ".png" not in target_url:
                 target_url = target_url.replace("?", ".png?") if "?" in target_url else f"{target_url}.png"
@@ -793,6 +1246,10 @@ async def generate_video(request: GenerateVideoRequest):
         
         try:
             # Use GrokAnimator to generate video
+            # Determine aspect ratio based on video type
+            aspect_ratio = "9:16" if request.is_shorts else "16:9"
+            print(f"   📐 Aspect Ratio: {aspect_ratio} (shorts={request.is_shorts})")
+            
             animator = GrokAnimator()
             video_path = await animator.animate(
                 image_path=image_path,
@@ -800,7 +1257,7 @@ async def generate_video(request: GenerateVideoRequest):
                 style_suffix="Cinematic, Pixar-style 3D animation",
                 duration=10,
                 camera_angle=request.camera_angle or "Medium Shot",
-                aspect_ratio="9:16",
+                aspect_ratio=aspect_ratio,
                 dialogue=request.dialogue
             )
             
@@ -808,6 +1265,14 @@ async def generate_video(request: GenerateVideoRequest):
             storage = R2Storage()
             video_key = f"videos/{request.niche_id}/scene_{request.scene_index}_{uuid.uuid4().hex[:8]}.mp4"
             
+            # Validate Video Size before upload
+            file_size = os.path.getsize(video_path)
+            if file_size < 10000: # < 10KB is definitely suspicious for a video
+                # Read head to see if it's an error message
+                with open(video_path, "rb") as f:
+                    head = f.read(100)
+                raise ValueError(f"Generated video is too small ({file_size} bytes). Head: {head}")
+
             with open(video_path, "rb") as f:
                 video_bytes = f.read()
             
@@ -849,7 +1314,10 @@ class StitchVideosRequest(BaseModel):
     niche_id: str
     title: str = "Stitched Video"
     niche_type: str = "general"
-    music_mood: Optional[str] = None # New field for manual selection
+    music: Optional[str] = None  # Frontend sends this field
+    music_mood: Optional[str] = None  # Legacy/alternative field
+    is_shorts: bool = False # Explicit aspect ratio control
+    script: Optional[str] = None # Full script for AI context
 
 @app.post("/videos/stitch")
 async def stitch_videos(request: StitchVideosRequest):
@@ -934,7 +1402,17 @@ async def stitch_videos(request: StitchVideosRequest):
                     ffprobe_lib.probe(str(clip_path))
                     is_valid = True
             except Exception as e:
+                # Get detailed info about the corrupt file
+                size = -1
+                head = b""
+                try:
+                    size = clip_path.stat().st_size
+                    with open(clip_path, "rb") as f:
+                        head = f.read(100)
+                except: pass
+                
                 print(f"   ❌ Clip {i} {clip_path.name} is invalid/corrupt: {e}")
+                print(f"      Size: {size} bytes. Head: {head}")
             
             if not is_valid:
                 corrupt_indices.append(i)
@@ -968,21 +1446,28 @@ async def stitch_videos(request: StitchVideosRequest):
              # Actually, 'db' is available in global scope.
              channel = await db.channel.find_unique(where={"nicheId": request.niche_id})
              if channel:
+                 channel_config = channel # Assign for later use
                  print(f"🔧 System Config: Name='{channel.name}', Niche='{channel.nicheId}', Style='{channel.styleSuffix}'")
                  
-                 is_shorts = (
+                 # Logic: Use request.is_shorts (Frontend) > Channel Config > Default
+                 is_shorts_channel = (
                      "shorts" in channel.nicheId.lower() or 
                      "shorts" in (channel.styleSuffix or "").lower()
                  )
                  
-                 if is_shorts:
+                 if request.is_shorts or is_shorts_channel:
                      target_res = (1080, 1920)
-                     print(f"📐 Aspect Ratio: 9:16 Vertical (Shorts detected)")
+                     print(f"📐 Aspect Ratio: 9:16 Vertical ({'Explicit' if request.is_shorts else 'Channel Config'})")
                  else:
                      target_res = (1920, 1080) 
                      print(f"📐 Aspect Ratio: 16:9 Landscape (Standard)")
              else:
-                 print(f"⚠️ Channel config not found for {request.niche_id}, falling back to request.niche_type")
+                 # Fallback if channel not found but request specifies shorts
+                 if request.is_shorts:
+                     target_res = (1080, 1920)
+                     print(f"📐 Aspect Ratio: 9:16 Vertical (Explicit)")
+                 else:
+                     print(f"⚠️ Channel config not found for {request.niche_id}, falling back to default Landscape")
                  # Fallback logic
                  if "shorts" in request.niche_type.lower() or "vertical" in request.niche_type.lower():
                       target_res = (1080, 1920)
@@ -1020,35 +1505,34 @@ async def stitch_videos(request: StitchVideosRequest):
         # Determine music mood using LLM (smart matching)
         # Check for Manual Music Override from Channel Config
         music_path = None
-        music_mood = request.music_mood or "auto" # Initialize scope
+        # Use either 'music' (frontend) or 'music_mood' (legacy) field
+        music_selection = request.music or request.music_mood or "auto"
+        music_mood = "auto" # Default
         
+        # 0. Check if Music is Disabled
+        if music_selection.lower() == "none":
+            print("🚫 Music explicitly disabled by user.")
+            music_path = None
+            music_mood = "none"
+
         # 1. Check for Explicit User Selection (Render UI)
-        if request.music_mood and request.music_mood.lower() != "auto":
-            print(f"🎵 Manual selection detected: '{request.music_mood}'")
+        elif music_selection.lower() != "auto":
+            print(f"🎵 Manual selection detected: '{music_selection}'")
+            music_mood = music_selection
             try:
-                music_path = generate_background_music(video_duration, mood=request.music_mood)
+                music_path = generate_background_music(video_duration, mood=music_selection)
             except Exception as e:
                 print(f"   ⚠️ Failed to generate manual music: {e}. Falling back to config/auto.")
                 music_path = None
 
-        # 2. Check for Channel Config Override
-        if not music_path and channel_config and channel_config.bgMusic:
-             print(f"🎵 Found manual background music override for channel.")
-             try:
-                 storage_downloader = R2Storage()
-                 music_path = temp_dir / "manual_bgm.mp3"
-                 storage_downloader.download(channel_config.bgMusic, music_path)
-                 print(f"   ✅ Downloaded manual BGM: {music_path.name}")
-             except Exception as e:
-                 print(f"   ⚠️ Failed to download manual BGM: {e}. Falling back to AI selection.")
-                 music_path = None
-
-        # 3. Auto-Analyze Mood (Fallback)
-        if not music_path:
+        # 2. Auto-Analyze Mood (High Priority for 'auto')
+        if not music_path and music_mood == "auto":
             print(f"🧠 Analyzing video context for music selection...")
             analyzer = MoodAnalyzer()
-            music_mood = analyzer.analyze_mood(title=request.title, niche=request.niche_type)
-            print(f"   📎 Context: '{request.title}' ({request.niche_type}) -> Music mood: {music_mood}")
+            # Use script if available, otherwise title
+            context_text = request.script if request.script else request.title
+            music_mood = analyzer.analyze_mood(title=request.title, niche=request.niche_type, description=context_text)
+            print(f"   📎 Context: '{request.title}' -> Music mood: {music_mood}")
             
             # If niche is 'pets', force 'happy' instead of 'cute' which maps to Carefree (Toon style)
             if "pet" in request.niche_type.lower() and music_mood == "cute":
@@ -1057,16 +1541,38 @@ async def stitch_videos(request: StitchVideosRequest):
             try:
                 music_path = generate_background_music(video_duration, mood=music_mood)
             except Exception as e:
-                print(f"   ❌ Music generation failed: {e}")
+                print(f"   ❌ AI Music generation failed: {e}")
                 music_path = None
-        music_size = music_path.stat().st_size / 1024
-        print(f"   ✅ Generated {video_duration:.1f}s of '{music_mood}' ambient music ({music_size:.1f} KB)")
+
+        # 3. Check for Channel Config Override (Fallback if AI failed or skipped)
+        if not music_path and channel_config and channel_config.bgMusic:
+             print(f"🎵 Found manual background music override for channel (Using as fallback).")
+             try:
+                 storage_downloader = R2Storage()
+                 music_path = temp_dir / "manual_bgm.mp3"
+                 storage_downloader.download(channel_config.bgMusic, music_path)
+                 print(f"   ✅ Downloaded manual BGM: {music_path.name}")
+                 music_mood = "channel_config"
+             except Exception as e:
+                 print(f"   ⚠️ Failed to download manual BGM: {e}")
+        
+        if music_path:
+            music_size = music_path.stat().st_size / 1024
+            print(f"   ✅ Generated {video_duration:.1f}s of '{music_mood}' ambient music ({music_size:.1f} KB)")
+        else:
+            print(f"   🚫 No background music generated/selected.")
         
         # 4. Mix background music with video (low volume: 30%)
-        print(f"🔊 Mixing background music at 30% volume...")
         final_path = temp_dir / "final_with_music.mp4"
-        editor.add_background_music(stitched_path, music_path, final_path, music_volume=0.30)
-        print(f"   ✅ Background music mixed")
+        
+        if music_path:
+            print(f"🔊 Mixing background music at 30% volume...")
+            editor.add_background_music(stitched_path, music_path, final_path, music_volume=0.30)
+            print(f"   ✅ Background music mixed")
+        else:
+            print(f"   ℹ️ No background music to mix. Using original video.")
+            import shutil
+            shutil.copy(stitched_path, final_path)
         
         # 5. Upload to R2
         storage = R2Storage()
@@ -1082,12 +1588,14 @@ async def stitch_videos(request: StitchVideosRequest):
         print(f"✅ Final video uploaded: {final_url}")
 
         # Upload separate music track for debugging
-        music_key = f"music/{request.niche_id}/{safe_title}_bgm_{uuid.uuid4().hex[:8]}.wav"
-        with open(music_path, "rb") as f:
-            music_bytes = f.read()
-        storage.upload_asset(music_bytes, music_key, content_type="audio/wav")
-        music_url = storage.get_url(music_key)
-        print(f"✅ Music track uploaded: {music_url}")
+        music_url = None
+        if music_path:
+            music_key = f"music/{request.niche_id}/{safe_title}_bgm_{uuid.uuid4().hex[:8]}.wav"
+            with open(music_path, "rb") as f:
+                music_bytes = f.read()
+            storage.upload_asset(music_bytes, music_key, content_type="audio/wav")
+            music_url = storage.get_url(music_key)
+            print(f"✅ Music track uploaded: {music_url}")
         
         return {
             "status": "success",

@@ -227,6 +227,7 @@ class FFmpegVideoEditor:
             '-map', final_v_label,
             '-map', final_a_label,
             '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+            '-pix_fmt', 'yuv420p', # Ensure WMP/QuickTime compatibility
             '-c:a', 'aac', '-b:a', '192k',
             str(output_path)
         ]
@@ -284,7 +285,7 @@ class FFmpegVideoEditor:
             .filter('scale', width, height, force_original_aspect_ratio='increase')
             .filter('crop', width, height)
             .filter('setsar', 1)
-            .output(str(output_path), c='libx264', preset='fast', crf=23, ac='aac', audio_bitrate='192k')
+            .output(str(output_path), c='libx264', preset='fast', crf=23, pix_fmt='yuv420p', ac='aac', audio_bitrate='192k')
             .overwrite_output()
             .run(quiet=True)
         )

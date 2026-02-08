@@ -164,7 +164,8 @@ class MusicLibrary:
             "epic": "epic",
             "heroic": "epic",
             "jazz": "jazz",
-            "comedy": "jazz",
+            "comedy": "happy", # Wallpaper is quirky/funny
+            "funny": "happy",
             "hiphop": "hiphop",
             "rap": "hiphop",
             "urban": "hiphop",
@@ -179,7 +180,10 @@ class MusicLibrary:
             "reggaeton": "travel", # Map to upbeat travel for now
             "afrobeats": "travel",
             "classical": "classical",
-            "history": "epic"
+            "classical": "classical",
+            "history": "epic",
+            "motivational": "epic",
+            "inspiring": "cinematic"
         }
         
         # Normalize mood

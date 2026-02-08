@@ -140,6 +140,7 @@ Return ONLY valid JSON in this exact format:
 }}
 
 (Note: 'scenes' maps to 'script_segments'. 'character_pose_prompt' + 'background_description' + 'motion_description' combined act as 'visual_cue'.)
+(CRITICAL: Look for "Shot Type", "Camera", "Angle" in manual scripts and map to 'camera_angle')
 
 Generate exactly {scene_count} scenes adhering to the structure above.
 """
@@ -565,73 +566,211 @@ Return ONLY valid JSON.
     async def parse_manual_script_llm(self, raw_text: str) -> TechnicalBreakdownOutput:
         """
         Extract structured data from a manual script using LLM.
+        The LLM is designed to be FULLY FORMAT-AGNOSTIC - it should understand
+        ANY reasonable script format without requiring specific labels.
         """
-        print("📝 Manual Extraction: Using Hugging Face LLM (Qwen-2.5-7B)...")
+        print("📝 Manual Extraction: Using Hugging Face LLM (Intelligent Parser)...")
         
-        prompt = f"""You are a master template-agnostic data extraction expert.
-        
-TASK:
-Analyze the provided unstructured MOVIE SCRIPT/STORYBOARD and extract structured data.
-The input format is variable. It often contains a **"Master Character Prompts"** section with headers like `[NAME]`, but sometimes character details are embedded in scenes.
+        prompt = f"""You are an expert script analyst and AI video production assistant. Your job is to intelligently extract structured data from ANY movie/video script format, regardless of how it's formatted.
 
-INPUT SCRIPT:
+SCRIPT TO ANALYZE:
+---
 {raw_text}
+---
 
-REQUIREMENTS:
-1. **CHARACTERS**: Extract TWO (2) Main Characters.
-   - **Strong Priority**: Look for headers like `[THE BOY]`, `[NAME]`, `1. Name`, `Character 1:`, or `Name — Master Text-to-Image Prompt`.
-   - Use the text following these headers as their `prompt`.
-   - If NO such headers exist, INFER them from the scenes.
+## YOUR EXTRACTION TASKS:
 
-2. **MUSIC MOOD**: Select ONE mood for the entire video from this list:
-   [dramatic, cinematic, calm, horror, adventurous, cute, travel, beauty, suspense, hiphop, rock, piano, sorrow, epic, jazz]
-   - Base selection on the overall tone of the script.
+### TASK 1: EXTRACT ALL CHARACTERS
+Find EVERY character defined in the script. Characters can appear in many formats:
+- "CHARACTER NAME: description..." 
+- "CHARACTER NAME (Role): description..."
+- "[CHARACTER NAME] - description..."
+- "Character 1: NAME - description..."
+- "1. NAME - description..."
+- Names in ALL CAPS followed by description
+- Any section labeled "Characters", "Cast", "Character Prompts", etc.
 
-3. **SCENES**: Extract ALL Scenes containing:
-   - **text_to_image_prompt**: Combine "Visual", "Text-to-Image", "What is happening", "Setting", and "Style".
-   - **image_to_video_prompt**: Combine "Animation", "Video Prompt", "Motion", or "Action".
-   - **voiceover_text**: Extract from "Dialogue", "Voiceover" or "Audio". 
-   - **dialogue**: SAME as voiceover_text.
-   - **scene_title**: Extract from "Scene 1 — Title" or similar.
+For EACH character extract:
+- **name**: The character's name (clean, no roles like "The Cat")
+- **prompt**: Their FULL visual description (appearance, clothing, style, rendering details)
 
-OUTPUT FORMAT (JSON ONLY):
+IMPORTANT: Extract ALL characters, not just the first 2. Look for 3, 4, or more characters.
+
+### TASK 2: EXTRACT ALL SCENES
+Find EVERY scene in the script. Scenes can be labeled as:
+- "Scene 1", "SCENE 1:", "Scene 1:", etc.
+- "Shot 1", "Panel 1", "Frame 1"
+- Or just numbered sections
+
+For EACH scene, you MUST extract these fields SEPARATELY:
+
+| Field | What to Look For | Examples |
+|-------|------------------|----------|
+| **text_to_image_prompt** | Visual/image description | "Text to Image Prompt:", "Visual:", "Image:", "Setting:", "Description:" |
+| **image_to_video_prompt** | Motion/animation description | "Text to Video Prompt:", "Motion:", "Animation:", "Action:", "Movement:" |
+| **dialogue** | Speech, audio, sound effects | "Dialog:", "Dialogue:", "Audio:", "Voiceover:", "VO:", "SFX:", "(spoken)" |
+| **camera_angle** | Shot type/camera info | "Shot Type:", "Short Type:", "Shot:", "Camera:", "Angle:", or embedded like "Medium shot of..." |
+
+CRITICAL RULES FOR SCENE EXTRACTION:
+1. **SEPARATE the fields** - Do NOT combine text_to_image_prompt with image_to_video_prompt
+2. If you see "Text to Image Prompt:" - extract ONLY that content for text_to_image_prompt
+3. If you see "Text to Video Prompt:" - extract ONLY that content for image_to_video_prompt  
+4. Look for shot type at START of visual descriptions (e.g., "Wide shot of...", "Close-up of...")
+5. Extract EVERY scene, even if there are 10, 12, or more scenes
+6. Copy text EXACTLY as written (preserve the original wording)
+
+### OUTPUT FORMAT (STRICT JSON):
+Return ONLY this JSON structure, nothing else:
+
 {{
   "characters": [
-    {{ "name": "Name", "prompt": "Visual Description" }}
+    {{
+      "name": "CHARACTER_NAME",
+      "prompt": "Full visual description..."
+    }}
   ],
-  "music_mood": "epic",
   "scenes": [
     {{
       "scene_number": 1,
-      "scene_title": "Title",
-      "voiceover_text": "Narration...",
-      "character_pose_prompt": "Visual...", 
-      "text_to_image_prompt": "Combined Visual Description...",
-      "image_to_video_prompt": "Combined Motion Description...",
-      "motion_description": "Motion...",
-      "duration_in_seconds": 5,
-      "camera_angle": "Medium Shot",
-      "dialogue": "Speech..."
+      "scene_title": "Scene title if any",
+      "text_to_image_prompt": "ONLY the visual/image description",
+      "image_to_video_prompt": "ONLY the motion/animation description", 
+      "dialogue": "Speech, voiceover, or audio cues",
+      "camera_angle": "Wide Shot, Medium Shot, Close-up, etc.",
+      "voiceover_text": "Same as dialogue",
+      "motion_description": "Same as image_to_video_prompt",
+      "character_pose_prompt": "Same as text_to_image_prompt",
+      "duration_in_seconds": 5
     }}
   ]
 }}
 
-IMPORTANT:
-- Return ONLY valid JSON.
-- If a field is missing, use empty string or null.
-- **text_to_image_prompt** MUST be detailed.
+### FINAL REMINDERS:
+- Return PURE JSON only (no markdown, no code blocks, no explanations)
+- Extract ALL characters (look for 3+)
+- Extract ALL scenes (look for 10+)
+- Keep fields SEPARATE (don't mix image and video prompts)
+- If a field is not found, use empty string ""
+- Preserve original text exactly as written
 """
         try:
             text = await self._call_huggingface(prompt, max_tokens=16384)
-            print(f"DEBUG: LLM Response (First 500 chars):\n{text[:500]}...") # Added debug
-            clean_text = self._clean_json_text(text)
-            data = json.loads(clean_text)
-            print(f"✅ LLM Extraction Successful! Found {len(data.get('scenes', []))} scenes.")
+            print(f"DEBUG: LLM Response (First 4000 chars):\n{text[:4000]}...")
+            
+            # Robust JSON extraction and cleaning
+            import re
+            
+            # Step 1: Extract JSON from markdown code blocks if present
+            json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
+            if json_match:
+                clean_text = json_match.group(1)
+            else:
+                # Look for first { and last } to extract JSON object
+                first_brace = text.find('{')
+                last_brace = text.rfind('}')
+                if first_brace != -1 and last_brace > first_brace:
+                    clean_text = text[first_brace:last_brace + 1]
+                else:
+                    clean_text = text
+            
+            # Step 2: Try direct parsing first
+            try:
+                data = json.loads(clean_text)
+            except json.JSONDecodeError:
+                # Step 3: Fix common issues using robust token strategy
+                repaired = clean_text
+                
+                try:
+                    # Strategy: Identify structural quotes, replace them with tokens, 
+                    # escape remaining (internal) quotes, then restore tokens.
+                    
+                    # 1. Protect Key Ends: "key": -> __KEY_END__:
+                    repaired = re.sub(r'"\s*:', '__KEY_END__:', repaired)
+                    
+                    # 2. Protect Key Starts: {"key" or ,"key" -> {__KEY_START__key
+                    repaired = re.sub(r'(?<=[{,])\s*"', '__KEY_START__', repaired)
+                    
+                    # 3. Protect Value Starts: : "value" -> : __VAL_START__value
+                    repaired = re.sub(r':\s*"', ':__VAL_START__', repaired)
+                    
+                    # 4. Protect Value Ends: "value", or "value"} or "value"] -> "value__VAL_END__,
+                    # We capture the following delimiter to ensure we don't eat it
+                    repaired = re.sub(r'"\s*([,}\]])', r'__VAL_END__\1', repaired)
+                    
+                    # 5. Now ALL remaining double quotes are internal/content quotes. Escape them!
+                    repaired = repaired.replace('"', '\\"')
+                    
+                    # 6. Restore Tokens
+                    repaired = repaired.replace('__KEY_END__', '"')
+                    repaired = repaired.replace('__KEY_START__', '"')
+                    repaired = repaired.replace('__VAL_START__', '"')
+                    repaired = repaired.replace('__VAL_END__', '"')
+                    
+                    # 7. Additional cleanup: remove trailing commas
+                    repaired = re.sub(r',\s*([}\]])', r'\1', repaired)
+                    
+                    data = json.loads(repaired)
+                    print("✅ JSON Repair successful with token strategy!")
+                    
+                except json.JSONDecodeError as e2:
+                    print(f"DEBUG: JSON repair failed: {e2}")
+                    print(f"DEBUG: Cleaned text: {repaired[:500]}...")
+                    # Fallback: Try the simple regex method as a Hail Mary
+                    try:
+                        simple_repair = clean_text
+                        for field in ["dialogue", "prompt", "text_to_image_prompt", "image_to_video_prompt", "scene_title", "name"]:
+                            simple_repair = re.sub(
+                                rf'("{field}":\s*")(.+?)("(?=\s*[,}}\n]))',
+                                lambda m: f'{m.group(1)}{m.group(2).replace('"', '\\"')}{m.group(3)}',
+                                simple_repair,
+                                flags=re.DOTALL
+                            )
+                        data = json.loads(simple_repair)
+                        print("✅ JSON Repair successful with simple fallback!")
+                    except:
+                        raise e2
+            
+            char_count = len(data.get('characters', []))
+            scene_count = len(data.get('scenes', []))
+            print(f"✅ LLM Extraction Successful! Found {char_count} characters and {scene_count} scenes.")
+            
+            if char_count == 0:
+                print("⚠️ Warning: LLM found 0 characters. The script may need clearer character definitions.")
+            if scene_count == 0:
+                print("⚠️ Warning: LLM found 0 scenes. The script may need clearer scene markers.")
+            
+            # Clean up scene data - fix empty strings and set defaults
+            for scene in data.get('scenes', []):
+                # Fix duration_in_seconds: convert empty string or invalid to default 5
+                duration = scene.get('duration_in_seconds', '')
+                if isinstance(duration, str):
+                    try:
+                        scene['duration_in_seconds'] = int(duration) if duration else 5
+                    except ValueError:
+                        scene['duration_in_seconds'] = 5
+                elif not isinstance(duration, int):
+                    scene['duration_in_seconds'] = 5
+                
+                # Fix scene_number: ensure it's an int
+                scene_num = scene.get('scene_number', 1)
+                if isinstance(scene_num, str):
+                    try:
+                        scene['scene_number'] = int(scene_num) if scene_num else 1
+                    except ValueError:
+                        scene['scene_number'] = 1
+                
+                # Set any missing string fields to empty string
+                for field in ['scene_title', 'text_to_image_prompt', 'image_to_video_prompt', 
+                              'dialogue', 'camera_angle', 'voiceover_text', 'motion_description',
+                              'background_description', 'character_pose_prompt']:
+                    if field not in scene or scene[field] is None:
+                        scene[field] = ''
+                
             return TechnicalBreakdownOutput(**data)
         except Exception as e:
             print(f"❌ LLM Extraction Failed: {e}")
-            print("⚠️ Falling back to Regex Parser...")
-            return self.parse_manual_script(raw_text)
+            # Return empty structure instead of brittle regex fallback
+            raise ValueError(f"Failed to parse script with LLM: {e}. Please check your script format.")
 
     def parse_manual_script(self, raw_text: str) -> TechnicalBreakdownOutput:
         """
@@ -684,7 +823,7 @@ IMPORTANT:
         
         # Make regex extremely permissive for the header
         # Added: "Master Character Prompts" (without "Step 1" assumption, using loose match)
-        char_section_match = re.search(r'(?:PART 1:?|Step \d+:?)?\s*(?:THE CHARACTER BIOS|CHARACTER MASTER PROMPTS?|MASTER CHARACTERS?).*?(?=(?:PART 2|Step \d+|THE GLOBAL STYLE WRAPPER|MATCH END|🎞️|SCENE))', text + "MATCH END", re.DOTALL | re.IGNORECASE)
+        char_section_match = re.search(r'(?:PART 1:?|Step \d+:?)?\s*(?:THE CHARACTER BIOS|CHARACTER MASTER PROMPTS?|MASTER CHARACTERS?|CHARACTER PROMPTS?).*?(?=(?:PART 2|Step \d+|THE GLOBAL STYLE WRAPPER|MATCH END|🎞️|SCENE))', text + "MATCH END", re.DOTALL | re.IGNORECASE)
         
         bio_text = ""
         if char_section_match:
@@ -805,6 +944,148 @@ IMPORTANT:
                     if name and content:
                         characters.append(MasterCharacter(name=name, prompt=content))
 
+            # Format 5 (User Specific): "NAME (Role) — Master Text-to-Image Prompt: Description"
+            # This matches: OLIVER (The Cat) — Master Text-to-Image Prompt: Oliver is a sturdy...
+            if len(characters) == 0:
+                print("DEBUG: Detecting Format 5 (NAME (Role) — Master Text-to-Image Prompt:)")
+                # Pattern matches: NAME (optional role) — Master Text-to-Image Prompt: content until next similar line or Scene
+                fmt5_iter = re.finditer(
+                    r'(?:^|\n)\s*([A-Z][A-Z0-9\s]+?)(?:\s*\([^)]+\))?\s*[—–-]\s*Master Text-to-Image Prompt:\s*(.*?)(?=(?:\n\s*[A-Z][A-Z0-9\s]+\s*(?:\([^)]+\))?\s*[—–-]\s*Master|Step\s+\d+|Scene\s+\d+|$))',
+                    bio_text + "\n",
+                    re.DOTALL | re.IGNORECASE
+                )
+                for m in fmt5_iter:
+                    name = m.group(1).strip()
+                    content = m.group(2).strip()
+                    # Clean multi-line content into single para
+                    content = re.sub(r'\n+', ' ', content).strip()
+                    
+                    print(f"DEBUG: Found Character (fmt5): {name}")
+                    if name and content:
+                        characters.append(MasterCharacter(name=name, prompt=content))
+            
+            # Format 7 (User's Simplified): "NAME (Role): Description"
+            # Example: OLIVER (The Cat): A "Semi-Cobby" British Shorthair...
+            if len(characters) == 0:
+                print("DEBUG: Detecting Format 7 (NAME (Role): Description)")
+                # Pattern matches: NAME (anything in parens): rest of content until next NAME ( or newline pattern
+                fmt7_iter = re.finditer(
+                    r'(?:^|\n)\s*([A-Z][A-Z\s]+?)\s*\(([^)]+)\)\s*:\s*(.*?)(?=\n\s*[A-Z][A-Z\s]+\s*\([^)]+\)\s*:|Step\s+\d+|Scene\s+\d+|\Z)',
+                    bio_text + "\n",
+                    re.DOTALL
+                )
+                for m in fmt7_iter:
+                    name = m.group(1).strip()
+                    role = m.group(2).strip()
+                    content = m.group(3).strip()
+                    # Clean multi-line content into single para
+                    content = re.sub(r'\n+', ' ', content).strip()
+                    
+                    print(f"DEBUG: Found Character (fmt7): {name} ({role})")
+                    if name and content:
+                        characters.append(MasterCharacter(name=name, prompt=content))
+                
+                if characters:
+                    print(f"✅ Format 7 found {len(characters)} characters")
+            
+            # Format 7b: "UPPERCASE NAME:" without parentheses (e.g., "THE WHISPERING GHOST:")
+            # Only try if Format 7 didn't find all characters
+            if len(characters) < 3:  # User typically has 2-3 characters
+                print("DEBUG: Detecting Format 7b (UPPERCASE NAME: without role)")
+                # Pattern: UPPERCASE NAME followed by colon, content until next uppercase name or section
+                fmt7b_iter = re.finditer(
+                    r'(?:^|\n)\s*([A-Z][A-Z\s]+?)\s*:\s*(?!\s*$)\n+(.*?)(?=\n\s*[A-Z][A-Z\s]+\s*[:(]|Step\s+\d+|Scene\s+\d+|\Z)',
+                    bio_text + "\n",
+                    re.DOTALL
+                )
+                existing_names = {c.name.upper() for c in characters}
+                for m in fmt7b_iter:
+                    name = m.group(1).strip()
+                    content = m.group(2).strip()
+                    # Skip if already found or if it's a section header (like "Step 1")
+                    if name.upper() in existing_names:
+                        continue
+                    if re.match(r'^(STEP|SCENE|PART)\s*\d*$', name, re.IGNORECASE):
+                        continue
+                    # Clean multi-line content into single para
+                    content = re.sub(r'\n+', ' ', content).strip()
+                    
+                    print(f"DEBUG: Found Character (fmt7b): {name}")
+                    if name and content and len(content) > 20:  # Must have substantial content
+                        characters.append(MasterCharacter(name=name, prompt=content))
+                
+                if len(characters) > 2:
+                    print(f"✅ Format 7b added more characters, total: {len(characters)}")
+
+            # Format 8 (Same-line simplified): "UPPERCASE NAME: Description on same line"
+            # Example: MOCHI CAT: A small, perfectly round, ultra-white cat...
+            if len(characters) == 0:
+                print("DEBUG: Detecting Format 8 (UPPERCASE NAME: Same line description)")
+                # Pattern: Starts with uppercase name + colon, takes everything until next uppercase name+colon or section
+                fmt8_iter = re.finditer(
+                    r'(?:^|\n)\s*([A-Z][A-Z\s]+?)\s*:\s*([^\n]+)(.*?)(?=\n\s*[A-Z][A-Z\s]+\s*:|Step\s+\d+|Scene\s+\d+|\Z)',
+                    bio_text + "\n",
+                    re.DOTALL
+                )
+                for m in fmt8_iter:
+                    name = m.group(1).strip()
+                    first_line = m.group(2).strip()
+                    rest = m.group(3).strip()
+                    content = (first_line + " " + rest).strip()
+                    # Clean multi-line content into single para
+                    content = re.sub(r'\n+', ' ', content).strip()
+                    
+                    # Skip noise
+                    if name.upper() in ["SCENE", "STEP", "PART", "NOTE"]: continue
+                    
+                    print(f"DEBUG: Found Character (fmt8): {name}")
+                    if name and content and len(content) > 15:
+                        characters.append(MasterCharacter(name=name, prompt=content))
+                
+                if characters:
+                    print(f"✅ Format 8 found {len(characters)} characters")
+            
+            # Format 6: Simpler detection - look for lines containing "Master Text-to-Image Prompt:" anywhere
+            if len(characters) == 0:
+                print("DEBUG: Detecting Format 6 (Fallback - any 'Master' pattern)")
+                lines = bio_text.split('\n')
+                current_name = None
+                current_content = []
+                
+                for line in lines:
+                    # Check if line starts a new character definition
+                    if '—' in line or '–' in line or '-' in line:
+                        if 'Master' in line and 'Prompt' in line:
+                            # Save previous if exists
+                            if current_name and current_content:
+                                characters.append(MasterCharacter(name=current_name, prompt=' '.join(current_content)))
+                            
+                            # Extract name (everything before the dash)
+                            parts = re.split(r'[—–-]', line, 1)
+                            if len(parts) >= 2:
+                                name_part = parts[0].strip()
+                                # Remove (Role) suffix
+                                name_part = re.sub(r'\s*\([^)]+\)\s*$', '', name_part).strip()
+                                current_name = name_part.upper() if name_part else None
+                                
+                                # Content after "Prompt:"
+                                content_part = parts[1]
+                                if ':' in content_part:
+                                    content_part = content_part.split(':', 1)[1].strip()
+                                current_content = [content_part] if content_part else []
+                        continue
+                    
+                    # If we have a current name, append content lines
+                    if current_name and line.strip() and not line.strip().startswith('Step') and not line.strip().startswith('Scene'):
+                        current_content.append(line.strip())
+                
+                # Don't forget the last character
+                if current_name and current_content:
+                    characters.append(MasterCharacter(name=current_name, prompt=' '.join(current_content)))
+                
+                if characters:
+                    print(f"DEBUG: Format 6 found {len(characters)} characters")
+
         else:
             print("DEBUG: NO CHARACTER SECTION MATCHED")
 
@@ -824,57 +1105,71 @@ IMPORTANT:
                     s_num = int(scene_blocks[i])
                     block = scene_blocks[i+1]
                     
+                    # Scene title is the first line (could be empty or just whitespace after Scene X)
                     lines = block.strip().split('\n')
-                    raw_title = lines[0].strip()
-                    scene_title = re.sub(r'^[:\–\-\.]\s*', '', raw_title)
+                    raw_title = lines[0].strip() if lines else ""
+                    scene_title = f"Scene {s_num}"  # Default title
+                    if raw_title and not raw_title.lower().startswith("text to"):
+                        scene_title = re.sub(r'^[:\–\-\.]\s*', '', raw_title).strip() or scene_title
                     
-                    def extract(keys: list, text_block: str) -> str:
+                    def extract_labeled(keys: list, text_block: str) -> str:
+                        """Extract labeled fields like 'Text to Image Prompt: ...'"""
                         for k in keys:
-                            # Robust Match: Key: Value ... (until next key or double newline)
-                            pattern = rf'(?i){k}\s*[:]\s*(.*?)(?=\n+(?:Shot|Text-to-Image|Image-to-Video|Dialogue|Audio|Style)|$)'
+                            # FIXED: Use more flexible lookahead that handles both newlines and same-line labels
+                            # Match: Key: Value ... (until next labeled field on new line OR end)
+                            # The lookahead now handles: 1+ newlines OR whitespace before next label
+                            pattern = rf'(?i){k}\s*:\s*(.*?)(?=(?:\n|\r\n)+\s*(?:Text to Image|Text to Video|Image-to-Video|Dialog|Dialogue|Short Type|Shot Type|Audio|Style)\s*:|$)'
                             m = re.search(pattern, text_block, re.DOTALL)
-                            if m: return m.group(1).strip()
+                            if m: 
+                                result = m.group(1).strip()
+                                # SAFETY: Ensure we don't include the next label in the result
+                                # Remove any trailing "Text to Video..." if present
+                                for stop_phrase in ['Text to Video Prompt', 'Text-to-Video Prompt', 'Dialog:', 'Dialogue:', 'Short Type:', 'Shot Type:']:
+                                    if stop_phrase in result:
+                                        result = result.split(stop_phrase)[0].strip()
+                                return result
                         return ""
-
-                    # Mapping
-                    shot = extract(["Shot Type", "Shot"], block)
-                    img_prompt = extract(["Text-to-Image Prompt", "Image Prompt", "Visual"], block)
-                    vid_prompt = extract(["Image-to-Video Prompt", "Video Prompt", "Animation"], block)
                     
-                    # Audio / Dialogue
-                    audio_raw = extract(["Dialogue", "Dialogue \\(Narrator\\)", "Dialogue \\(.*\\)", "Audio \\(VO\\)", "Audio \\(SFX\\)", "Audio", "VO", "Voiceover"], block)
+                    # User's STANDARDIZED format:
+                    # Scene X
+                    # Text to Image Prompt: [visual description]
+                    # Text to Video Prompt: [motion description]
+                    # Dialog: [audio cues]
+                    # Short Type: [shot type]
                     
-                    # Per-Scene Style
-                    style_local = extract(["Style"], block)
+                    # Extract all labeled fields
+                    img_prompt = extract_labeled(["Text to Image Prompt", "Text-to-Image Prompt", "Image Prompt"], block)
+                    vid_prompt = extract_labeled(["Text to Video Prompt", "Text-to-Video Prompt", "Image-to-Video Prompt", "Video Prompt"], block)
+                    dialogue_raw = extract_labeled(["Dialog", "Dialogue", "Audio", "Voiceover"], block)
+                    shot_type = extract_labeled(["Short Type", "Shot Type", "Shot"], block)
                     
-                    # Merge Style into Prompt
-                    if style_local:
-                        img_prompt = f"{img_prompt}, {style_local}"
-                    elif style_wrapper:
-                         if "[Style Wrapper]" in img_prompt:
-                            img_prompt = img_prompt.replace("[Style Wrapper]", style_wrapper)
-                         else:
-                            # If no local style and no placeholder, maybe append global?
-                            # For now, let's just respect local style overrides.
-                            pass
-
-                    # Dialogue Cleanup
-                    clean_audio = audio_raw.strip('"').strip('“').strip('”')
+                    # Clean dialogue
+                    clean_audio = dialogue_raw.strip('"').strip('"').strip('"')
                     
-                    # Construct Pose
-                    final_pose = f"{shot}, {img_prompt}" 
+                    # Default shot type if not found
+                    if not shot_type:
+                        shot_type = "Medium Shot"
+                        for st in ["Close-up", "Close up", "Extreme Close-up", "Wide Shot", "Medium Shot"]:
+                            if st.lower() in img_prompt.lower():
+                                shot_type = st
+                                break
+                    
+                    print(f"   📦 Scene {s_num}: {scene_title[:30]}...")
+                    print(f"      📷 Text-to-Image: {img_prompt[:60]}...")
+                    print(f"      🎬 Text-to-Video: {vid_prompt[:60]}...")
+                    print(f"      🎤 Dialog: {clean_audio[:40]}...")
                     
                     scenes.append(SceneBreakdown(
                         scene_number=s_num,
                         scene_title=scene_title,
-                        voiceover_text=clean_audio if "(SFX" not in audio_raw else "",
-                        character_pose_prompt=final_pose[:1000], 
+                        voiceover_text=clean_audio if "(SFX" not in dialogue_raw else "",
+                        character_pose_prompt=img_prompt[:1000], 
                         text_to_image_prompt=img_prompt,
                         image_to_video_prompt=vid_prompt,
                         motion_description=vid_prompt,
                         background_description=img_prompt,
-                        camera_angle=shot,
-                        dialogue=clean_audio if "(SFX" not in audio_raw else None,
+                        camera_angle=shot_type,
+                        dialogue=clean_audio if "(SFX" not in dialogue_raw else None,
                         duration_in_seconds=5
                     ))
                     found_scenes += 1
