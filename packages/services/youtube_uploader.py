@@ -218,3 +218,17 @@ class YouTubeUploader:
             status=promote_to,
             message=f"Successfully uploaded and promoted to {promote_to}"
         )
+
+    def set_thumbnail(self, video_id: str, thumbnail_path: Path):
+        """Upload a custom thumbnail for a video."""
+        try:
+            logger.info(f"🖼️ Uploading thumbnail for {video_id} from {thumbnail_path}")
+            self.youtube.thumbnails().set(
+                videoId=video_id,
+                media_body=MediaFileUpload(str(thumbnail_path), mimetype='image/png')
+            ).execute()
+            logger.info("✅ Thumbnail set successfully")
+        except Exception as e:
+            logger.error(f"❌ Failed to set thumbnail: {e}")
+            # Don't fail the whole process if thumbnail fails
+

@@ -226,6 +226,7 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
                     scenes: scenesToGenerate,
                     character_images: characterImages,
                     video_type: format === 'short' ? 'shorts' : 'story',
+                    thumbnail_prompt: (breakdown as any).thumbnail_prompt || null
                 }),
             });
 
@@ -256,7 +257,15 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
                             continue;
                         }
 
-                        const { index, imageUrl } = result;
+                        const { index, imageUrl, type } = result;
+
+                        if (type === 'thumbnail' && imageUrl) {
+                            console.log('Thumbnail received:', imageUrl);
+                            useProjectStore.getState().setThumbnailUrl(imageUrl);
+                            updateProgress('YouTube thumbnail generated successfully.');
+                            continue;
+                        }
+
                         if (imageUrl) {
                             updateProgress(`Image received for scene ${index + 1}. Starting video...`);
                             useProjectStore.getState().updateScene(index, { imageUrl });

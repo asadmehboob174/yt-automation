@@ -26,6 +26,8 @@ interface ProjectState {
 
     // Final video
     finalVideoUrl: string | null;
+    thumbnailUrl: string | null;
+    thumbnailPrompt: string | null;
 
     // Actions
     setStep: (step: ProjectStep) => void;
@@ -36,6 +38,8 @@ interface ProjectState {
     updateCharacter: (index: number, updates: Partial<Character>) => void;
     updateScene: (index: number, updates: Partial<Scene>) => void;
     setFinalVideoUrl: (url: string) => void;
+    setThumbnailUrl: (url: string) => void;
+    setThumbnailPrompt: (prompt: string) => void;
     reset: () => void;
     canProceed: () => boolean;
 }
@@ -51,6 +55,8 @@ const initialState = {
     characters: [],
     scenes: [],
     finalVideoUrl: null,
+    thumbnailUrl: null,
+    thumbnailPrompt: null,
 };
 
 export const useProjectStore = create<ProjectState>()(
@@ -101,6 +107,8 @@ export const useProjectStore = create<ProjectState>()(
                     breakdown,
                     characters: mappedCharacters,
                     scenes: mappedScenes,
+                    // Also set thumbnail prompt if available in breakdown (it might not be, but good practice)
+                    thumbnailPrompt: apiBreakdown.thumbnail_prompt || null
                 });
             },
 
@@ -117,6 +125,8 @@ export const useProjectStore = create<ProjectState>()(
             })),
 
             setFinalVideoUrl: (url) => set({ finalVideoUrl: url }),
+            setThumbnailUrl: (url) => set({ thumbnailUrl: url }),
+            setThumbnailPrompt: (prompt) => set({ thumbnailPrompt: prompt }),
 
             reset: () => set(initialState),
 
@@ -132,7 +142,7 @@ export const useProjectStore = create<ProjectState>()(
                     case 4:
                         return state.scenes.every((s) => s.videoUrl);
                     case 5:
-                        return !!state.finalVideoUrl;
+                        return !!state.finalVideoUrl && !!state.thumbnailUrl;
                     default:
                         return false;
                 }

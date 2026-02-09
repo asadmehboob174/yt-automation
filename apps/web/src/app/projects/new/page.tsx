@@ -27,7 +27,8 @@ import {
     XCircle,
     Clock,
     ImagePlus,
-    Video
+    Video,
+    Youtube
 } from 'lucide-react';
 import { useProjectStore } from '@/lib/stores/project-store';
 import { useAutomationStore } from '@/lib/stores/automation-store';
@@ -465,7 +466,10 @@ function Step2Characters() {
 
 // ============ STEP 3: Scene Images ============
 function Step3SceneImages() {
-    const { scenes, characters, updateScene, setStep, channelId, format } = useProjectStore();
+    const { 
+        scenes, characters, updateScene, setStep, 
+        channelId, format, thumbnailUrl, thumbnailPrompt, setThumbnailUrl 
+    } = useProjectStore();
     const { isRunning } = useAutomationStore();
     const [generatingIndex, setGeneratingIndex] = useState<number | null>(null);
     const [generatingAll, setGeneratingAll] = useState(false);
@@ -493,44 +497,89 @@ function Step3SceneImages() {
     };
 
     const handleGenerateAll = async () => {
-        // ... (rest of handleGenerateAll logic remains same)
         setGeneratingAll(true);
         try {
             const scenesToGenerate = scenes
                 .filter(s => !s.imageUrl)
                 .map(s => ({ index: s.index, prompt: s.textToImage }));
 
-            if (scenesToGenerate.length === 0) {
+            const state = useProjectStore.getState();
+            const threadThumbPrompt = state.thumbnailPrompt;
+            const hasThumbnail = !!state.thumbnailUrl;
+
+            // If nothing to generate, but we have a thumbnail prompt and no thumbnail, we should just generate the thumbnail
+            const shouldGenerateThumbnail = !!threadThumbPrompt && !hasThumbnail;
+
+            if (scenesToGenerate.length === 0 && !shouldGenerateThumbnail) {
                 toast.info("All scenes already have images!");
                 setGeneratingAll(false);
                 return;
             }
 
-            toast.loading(`Generating ${scenesToGenerate.length} images in batch... this may take a while!`);
+            toast.loading(`Starting batch generation...`);
 
-            const response = await api.post<{ results: { index: number, imageUrl?: string, error?: string }[] }>('/scenes/generate-images-batch', {
-                niche_id: channelId,
-                scenes: scenesToGenerate,
-                character_images: characters.map((c) => ({ name: c.name, imageUrl: c.imageUrl })),
-                video_type: format === 'short' ? 'shorts' : 'story',
+            // Use fetch for streaming response
+            const response = await fetch('http://localhost:8000/scenes/generate-images-stream', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    niche_id: channelId,
+                    scenes: scenesToGenerate,
+                    character_images: characters.map((c) => ({ name: c.name, imageUrl: c.imageUrl })),
+                    video_type: format === 'short' ? 'shorts' : 'story',
+                    thumbnail_prompt: shouldGenerateThumbnail ? threadThumbPrompt : undefined
+                })
             });
 
-            let successCount = 0;
-            response.results.forEach(res => {
-                if (res.imageUrl) {
-                    updateScene(res.index, { imageUrl: res.imageUrl });
-                    successCount++;
-                } else if (res.error) {
-                    console.error(`Scene ${res.index + 1} failed: ${res.error}`);
-                }
-            });
-
-            if (successCount > 0) {
-                toast.dismiss();
-                toast.success(`Successfully generated ${successCount} images!`);
-            } else {
-                toast.error("Batch generation failed for all selected scenes.");
+            if (!response.ok || !response.body) {
+                throw new Error('Failed to start stream');
             }
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            let successCount = 0;
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                
+                // Process all complete lines
+                buffer = lines.pop() || ''; 
+
+                for (const line of lines) {
+                    if (!line.trim()) continue;
+                    try {
+                        const data = JSON.parse(line);
+                        
+                        if (data.type === 'thumbnail') {
+                            if (data.imageUrl) {
+                                setThumbnailUrl(data.imageUrl);
+                                toast.success("Thumbnail generated!");
+                            } else if (data.error) {
+                                console.error("Thumbnail failed:", data.error);
+                            }
+                        } else {
+                            // Scene update
+                            if (data.imageUrl) {
+                                updateScene(data.index, { imageUrl: data.imageUrl });
+                                successCount++;
+                            } else if (data.error) {
+                                console.error(`Scene ${data.index + 1} failed: ${data.error}`);
+                            }
+                        }
+                    } catch (e) {
+                        console.error('Error parsing JSON line:', e);
+                    }
+                }
+            }
+
+            toast.dismiss();
+            toast.success(`Batch generation complete!`);
+
         } catch (error) {
             toast.error(`Batch generation failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
         } finally {
@@ -675,6 +724,48 @@ function Step3SceneImages() {
                         </CardContent>
                     </Card>
                 ))}
+            </div>
+
+            {/* YouTube Thumbnail Card */}
+            <div className="mt-8">
+                <Card className="border-dashed border-2 bg-card/30">
+                    <CardHeader className="pb-2">
+                        <div className="flex items-center gap-2">
+                            <span className="p-1.5 bg-red-500/10 text-red-500 rounded">
+                                <Youtube className="h-4 w-4" />
+                            </span>
+                            <CardTitle className="text-sm font-bold uppercase tracking-wider">YouTube Viral Thumbnail</CardTitle>
+                            <Badge variant="secondary" className="ml-auto text-[10px]">THUMBNAIL PHASE</Badge>
+                        </div>
+                    </CardHeader>
+                    <CardContent>
+                        <div className="flex gap-4">
+                            <div className="w-40 h-40 rounded-lg border bg-muted flex items-center justify-center overflow-hidden flex-shrink-0 relative group">
+                                {thumbnailUrl ? (
+                                    <img src={thumbnailUrl} alt="Viral Thumbnail" className="w-full h-full object-cover" />
+                                ) : (
+                                    <div className="flex flex-col items-center gap-2">
+                                        <ImageIcon className="h-10 w-10 text-muted-foreground" />
+                                        <span className="text-[10px] text-muted-foreground uppercase font-bold">
+                                            {generatingAll ? 'Generating...' : 'Waiting for Batch'}
+                                        </span>
+                                    </div>
+                                )}
+                            </div>
+                            <div className="flex-1 space-y-2 py-2">
+                                <div className="space-y-1">
+                                    <p className="text-[10px] uppercase font-bold text-muted-foreground/70">Viral Thumbnail Prompt</p>
+                                    <p className="text-sm border rounded-md p-3 bg-background/50 italic leading-relaxed">
+                                        {thumbnailPrompt || "Generating viral prompt from script context..."}
+                                    </p>
+                                </div>
+                                <p className="text-[10px] text-muted-foreground italic">
+                                    * This thumbnail is generated once the batch generation starts.
+                                </p>
+                            </div>
+                        </div>
+                    </CardContent>
+                </Card>
             </div>
 
             <div className="flex justify-between">
@@ -874,11 +965,16 @@ function Step4SceneVideos() {
 }
 
 // ============ STEP 5: Final Render ============
+// ============ STEP 5: Final Render ============
 function Step5Final() {
-    const { scenes, channelId, finalVideoUrl, setFinalVideoUrl, setStep, reset, format, breakdown } = useProjectStore();
+    const { 
+        scenes, channelId, finalVideoUrl, setFinalVideoUrl, 
+        thumbnailUrl, thumbnailPrompt, setStep, reset, format, breakdown 
+    } = useProjectStore();
     const [isStitching, setIsStitching] = useState(false);
     const [isUploading, setIsUploading] = useState(false);
     const [musicOption, setMusicOption] = useState('upbeat');
+    const [generateMetadata, setGenerateMetadata] = useState(true);
 
     const handleStitch = async () => {
         setIsStitching(true);
@@ -902,10 +998,19 @@ function Step5Final() {
     const handleUpload = async () => {
         setIsUploading(true);
         try {
+            // Prepare script context for metadata generation
+            const scriptContext = breakdown?.description 
+                ? `${breakdown.title}\n\n${breakdown.description}` 
+                : breakdown?.scenes.map(s => s.dialogue).join("\n") || "";
+
             await api.post('/upload/youtube', {
                 video_url: finalVideoUrl,
-                title: 'AI Generated Video',
-                description: 'Created with AI Video Factory',
+                niche_id: channelId,
+                title: breakdown?.title || 'AI Generated Video',
+                description: breakdown?.description || 'Created with AI Video Factory',
+                thumbnail_url: thumbnailUrl,
+                generate_metadata: generateMetadata,
+                script_context: scriptContext
             });
             toast.success('Video uploaded to YouTube!');
         } catch (error) {
@@ -961,12 +1066,53 @@ function Step5Final() {
 
             {/* Video Preview */}
             {finalVideoUrl && (
-                <div className="space-y-4">
-                    <Card>
-                        <CardContent className="p-4">
-                            <video src={finalVideoUrl} controls className="w-full rounded-lg" />
-                        </CardContent>
-                    </Card>
+                <div className="space-y-6">
+                    <div className="grid gap-6 md:grid-cols-2">
+                        {/* Video */}
+                        <Card>
+                            <CardHeader>
+                                <CardTitle className="text-sm">Final Video</CardTitle>
+                            </CardHeader>
+                            <CardContent className="p-4">
+                                <video src={finalVideoUrl} controls className="w-full rounded-lg" />
+                            </CardContent>
+                        </Card>
+
+                        {/* Thumbnail */}
+                        <Card>
+                            <CardHeader>
+                                <CardTitle className="text-sm">YouTube Thumbnail</CardTitle>
+                            </CardHeader>
+                            <CardContent className="p-4 flex flex-col gap-4">
+                                <div className="aspect-video w-full bg-muted rounded-lg overflow-hidden flex items-center justify-center relative">
+                                    {thumbnailUrl ? (
+                                        <img src={thumbnailUrl} alt="Thumbnail" className="w-full h-full object-cover" />
+                                    ) : (
+                                        <div className="text-center p-4">
+                                            <ImageIcon className="h-8 w-8 mx-auto text-muted-foreground mb-2" />
+                                            <p className="text-sm text-muted-foreground">
+                                                {thumbnailPrompt ? "Thumbnail generating..." : "No thumbnail available"}
+                                            </p>
+                                        </div>
+                                    )}
+                                </div>
+                                {thumbnailUrl && (
+                                    <div className="flex items-center space-x-2">
+                                        <input 
+                                            type="checkbox" 
+                                            id="genMeta" 
+                                            checked={generateMetadata}
+                                            onChange={(e) => setGenerateMetadata(e.target.checked)}
+                                            className="h-4 w-4 rounded border-gray-300"
+                                        />
+                                        <Label htmlFor="genMeta" className="text-sm cursor-pointer">
+                                            Auto-generate Viral Title/Desc/Tags
+                                        </Label>
+                                    </div>
+                                )}
+                            </CardContent>
+                        </Card>
+                    </div>
 
                     {/* Upload Buttons */}
                     <div className="flex gap-4">

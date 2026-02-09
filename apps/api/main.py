@@ -604,9 +604,16 @@ async def generate_breakdown(request: GenerateBreakdownRequest):
                     style=channel.styleSuffix or "High-quality Pixar/Disney 3D Render"
                 )
         
+        # Implement Thumbnail Prompt Generation
+        thumbnail_prompt = await generator.generate_viral_thumbnail_prompt(request.story_narrative)
+        
         # DEBUG: Log what we're returning
         result = breakdown.model_dump()
+        result["thumbnail_prompt"] = thumbnail_prompt
+        
         print(f"📊 Returning breakdown with {len(result.get('scenes', []))} scenes and {len(result.get('characters', []))} characters")
+        print(f"   🖼️ Thumbnail Prompt: {thumbnail_prompt[:50]}...")
+        
         if result.get('characters'):
             print(f"   👥 Characters: {', '.join([c['name'] for c in result['characters']])}")
         for i, scene in enumerate(result.get('scenes', [])):
@@ -853,6 +860,7 @@ class GenerateBatchSceneImagesRequest(BaseModel):
     scenes: list[dict] # {index: int, prompt: str}
     character_images: list[dict] = [] # {name: str, imageUrl: string}
     video_type: str = "story" # "story" (default/landscape) or "shorts" (9:16)
+    thumbnail_prompt: Optional[str] = None # Optional viral thumbnail prompt
 
 class GenerateCharacterBatchRequest(BaseModel):
     niche_id: str
@@ -967,9 +975,27 @@ async def generate_images_batch(request: GenerateBatchSceneImagesRequest):
             
             # End of retry loop
 
-        return {"results": results}
 
-            # End of retry loop
+
+        # --- THUMBNAIL GENERATION ---
+        if request.thumbnail_prompt:
+            print(f"🖼️ Transitioning to Thumbnail Generation for Batch. (setup_done={setup_done})")
+            try:
+                thumb_bytes = await agent.generate_image(
+                    prompt=request.thumbnail_prompt,
+                    is_shorts=is_shorts,
+                    style_suffix=style_suffix,
+                    character_paths=char_local_paths,
+                    skip_setup=setup_done
+                )
+                if thumb_bytes:
+                    thumb_key = f"thumbnails/{request.niche_id}/{uuid.uuid4().hex[:8]}_thumb.png"
+                    storage.upload_asset(thumb_bytes, thumb_key, content_type="image/png")
+                    thumb_url = storage.get_url(thumb_key)
+                    results.append({"index": -1, "type": "thumbnail", "imageUrl": thumb_url})
+                    print(f"✅ Batch Thumbnail done: {thumb_url}")
+            except Exception as e:
+                print(f"⚠️ Batch Thumbnail failed: {e}")
 
         return {"results": results}
 
@@ -979,6 +1005,9 @@ async def generate_images_batch(request: GenerateBatchSceneImagesRequest):
         raise HTTPException(status_code=500, detail=f"Batch generation failed: {e}")
     finally:
         if agent:
+            # Add a tiny delay before closing to ensure any pending network activity is settled
+            import asyncio
+            await asyncio.sleep(1)
             await agent.close()
         # Clean up character temp files
         for p in char_local_paths:
@@ -1061,6 +1090,7 @@ async def generate_character_images_stream(request: GenerateCharacterBatchReques
             yield json.dumps({"error": str(e)}) + "\n"
         finally:
             if agent:
+                await asyncio.sleep(1)
                 await agent.close()
 
     return StreamingResponse(generate_generator(), media_type="application/x-ndjson")
@@ -1083,6 +1113,7 @@ async def generate_images_stream(request: GenerateBatchSceneImagesRequest):
         char_local_paths = []
         try:
             print(f"🚀 [Streaming] Starting Batch Generation for {len(request.scenes)} scenes...")
+            print(f"   🖼️ Thumbnail Prompt Status: {'PRESET' if request.thumbnail_prompt else 'EMPTY'}")
 
             # Determine Style Suffix
             channel = await db.channel.find_unique(where={"nicheId": request.niche_id})
@@ -1114,6 +1145,7 @@ async def generate_images_stream(request: GenerateBatchSceneImagesRequest):
             for i, scene in enumerate(request.scenes):
                 idx = scene.get("index")
                 prompt = scene.get("prompt")
+                print(f"[STREAM] Generating Scene {i+1}/{len(request.scenes)} (Index {idx})...")
                 
                 # Retry loop
                 MAX_RETRIES = 3
@@ -1139,27 +1171,68 @@ async def generate_images_stream(request: GenerateBatchSceneImagesRequest):
                             
                             # Yield result as individual JSON object per line
                             yield json.dumps({"index": idx, "imageUrl": image_url}) + "\n"
+                            print(f"[SUCCESS] Scene {idx} generated: {image_url}")
                             
                             setup_done = True
                             success = True
                             break
+                        else:
+                            print(f"⚠️ Scene {idx} attempt {attempt+1} returned no bytes")
                     except Exception as e:
                         print(f"❌ Scene {idx+1} failed (Attempt {attempt+1}): {e}")
 
                 if not success:
+                    print(f"[ERROR] Scene {idx} failed after all retries")
                     yield json.dumps({"index": idx, "error": "Failed after retries"}) + "\n"
 
+            # --- THUMBNAIL GENERATION ---
+            if request.thumbnail_prompt:
+                print(f"[STREAM] Transitioning to Thumbnail Generation. (setup_done={setup_done})")
+                try:
+                    # YouTube thumbnails are always 16:9 (1280x720)
+                    thumb_bytes = await agent.generate_image(
+                        prompt=request.thumbnail_prompt,
+                        is_shorts=is_shorts,
+                        style_suffix=style_suffix,
+                        character_paths=char_local_paths,
+                        skip_setup=setup_done
+                    )
+                    
+                    if thumb_bytes:
+                        thumb_key = f"thumbnails/{request.niche_id}/{uuid.uuid4().hex[:8]}_thumb.png"
+                        storage.upload_asset(thumb_bytes, thumb_key, content_type="image/png")
+                        thumb_url = storage.get_url(thumb_key)
+                        
+                        # Yield special thumbnail event
+                        yield json.dumps({"type": "thumbnail", "imageUrl": thumb_url}) + "\n"
+                        print(f"[SUCCESS] Thumbnail generated: {thumb_url}")
+                    else:
+                        print("⚠️ Thumbnail generation returned no bytes")
+                        yield json.dumps({"type": "thumbnail", "error": "Failed to generate thumbnail"}) + "\n"
+                        
+                except Exception as e:
+                    print(f"❌ Thumbnail generation failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    yield json.dumps({"type": "thumbnail", "error": str(e)}) + "\n"
+            else:
+                print("ℹ️ No thumbnail_prompt requested, skipping thumbnail phase.")
+
         except Exception as e:
+            print(f"❌ Global streaming error: {e}")
             import traceback
             traceback.print_exc()
             yield json.dumps({"error": str(e)}) + "\n"
         finally:
+            print("🛑 [Streaming] Generation stream ending. Cleaning up agent...")
             if agent:
+                await asyncio.sleep(1)
                 await agent.close()
             for p in char_local_paths:
                 if p.is_file():
                     try: os.unlink(str(p))
                     except: pass
+
 
     return StreamingResponse(generate_generator(), media_type="application/x-ndjson")
 
@@ -1810,6 +1883,122 @@ async def trigger_video_upload(video_id: str):
     )
     
     return {"status": "upload_queued", "message": "Upload workflow started"}
+
+
+class YouTubeUploadRequest(BaseModel):
+    video_url: str
+    niche_id: str
+    title: str
+    description: str
+    tags: Optional[list[str]] = []
+    thumbnail_url: Optional[str] = None
+    generate_metadata: bool = False # If true, use AI to generate title/desc/tags
+    script_context: Optional[str] = None # Required if generate_metadata is True
+
+
+@app.post("/upload/youtube")
+async def upload_to_youtube(request: YouTubeUploadRequest):
+    """
+    Manually upload a video URL to YouTube for a specific channel.
+    Downloads the video from R2 to a temp file, then uploads via YouTubeUploader.
+    """
+    import tempfile
+    import httpx
+    from pathlib import Path
+    from services.youtube_uploader import YouTubeUploader
+    from services.script_generator import ScriptGenerator
+
+    # 1. Generate Metadata if requested
+    final_title = request.title
+    final_desc = request.description
+    final_tags = request.tags or ["AI Video", "Shorts", "Automation"]
+
+    if request.generate_metadata and request.script_context:
+        try:
+            generator = ScriptGenerator()
+            metadata = await generator.generate_viral_metadata(request.script_context)
+            final_title = metadata.get("title", final_title)
+            final_desc = metadata.get("description", final_desc)
+            final_tags = metadata.get("tags", final_tags)
+            print(f"✨ AI Generated Metadata: {final_title}")
+        except Exception as e:
+            print(f"⚠️ Metadata generation failed: {e}")
+
+    # 2. Download video to temp file
+    video_path = None
+    thumb_path = None
+    
+    try:
+        print(f"📥 Downloading video for YouTube upload: {request.video_url}")
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(request.video_url, follow_redirects=True)
+            resp.raise_for_status()
+            
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+                tmp.write(resp.content)
+                video_path = Path(tmp.name)
+        
+            print(f"✅ Downloaded to {video_path} ({video_path.stat().st_size} bytes)")
+            
+            # Download Thumbnail if provided
+            if request.thumbnail_url:
+                try:
+                    print(f"🖼️ Downloading thumbnail: {request.thumbnail_url}")
+                    resp_thumb = await client.get(request.thumbnail_url, follow_redirects=True)
+                    if resp_thumb.status_code == 200:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp_thumb:
+                            tmp_thumb.write(resp_thumb.content)
+                            thumb_path = Path(tmp_thumb.name)
+                            print(f"✅ Downloaded thumbnail to {thumb_path}")
+                except Exception as e:
+                    print(f"⚠️ Failed to download thumbnail: {e}")
+        
+        # 3. Upload to YouTube
+        uploader = YouTubeUploader(niche_id=request.niche_id)
+        
+        result = uploader.upload_with_copyright_check(
+            video_path=video_path,
+            title=final_title,
+            description=final_desc,
+            tags=final_tags,
+            wait_minutes=2, # Short wait for manual trigger
+            promote_to="unlisted" # Safety first
+        )
+
+        # 4. Set Thumbnail
+        if thumb_path and result.video_id:
+            uploader.set_thumbnail(result.video_id, thumb_path)
+        
+        return {
+            "status": "success",
+            "video_id": result.video_id,
+            "youtube_status": result.status,
+            "message": result.message,
+            "metadata_used": {
+                "title": final_title,
+                "description": final_desc[:50] + "...",
+                "tags": final_tags
+            }
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"YouTube Upload Failed: {str(e)}")
+        
+    finally:
+        # Cleanup
+        if 'video_path' in locals() and video_path.exists():
+            try:
+                video_path.unlink()
+                print(f"🧹 Cleaned up temp video: {video_path}")
+            except:
+                pass
+        if 'thumb_path' in locals() and thumb_path and thumb_path.exists():
+            try:
+                thumb_path.unlink()
+            except:
+                pass
 
 
 if __name__ == "__main__":

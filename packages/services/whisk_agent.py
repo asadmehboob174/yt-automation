@@ -40,23 +40,13 @@ class WhiskAgent:
         self.page = None
         self.gen_count = 0
         self.refresh_threshold = 1000  # DISABLED: Only refresh on explicit error, not proactively.
-        logger.info("🦄 WhiskAgent initialized (Sequence Flow v3.3 - No Auto-Refresh)")
+        self.current_aspect = None # Track current aspect ratio to avoid redundant clicks
+        logger.info("🦄 WhiskAgent initialized (Sequence Flow v3.4 - Aspect Tracking)")
         
-    async def _clean_stale_locks(self):
-        """Removes Singleton lock files and kills dangling chrome processes."""
-        
-        # Windows-specific process cleanup
-        if os.name == 'nt':
-            try:
-                # Force kill any dangling chrome/chromium processes to free the profile lock
-                # Use /T to kill child processes (like the renderer) too
-                os.system('taskkill /F /IM chrome.exe /T 2>nul')
-                os.system('taskkill /F /IM chromium.exe /T 2>nul')
-                logger.info("🔪 Force killed dangling browser processes on Windows.")
-                await asyncio.sleep(1)
-            except Exception as e:
-                logger.warning(f"⚠️ Failed to kill processes: {e}")
-
+    async def _clean_stale_locks(self, force_kill: bool = False):
+        """Removes Singleton lock files without aggressive process killing."""
+        # Aggressive taskkill removed to prevent interference between Whisk and Grok
+        # We only remove the filesystem locks. Browsers should manage their own lifecycles.
         locks = ["SingletonLock", "SingletonCookie", "SingletonSocket"]
         for lock in locks:
             lock_path = self.profile_path / lock
@@ -68,7 +58,7 @@ class WhiskAgent:
                     logger.warning(f"⚠️ Could not remove lock {lock}: {e}")
 
     async def get_context(self) -> tuple[BrowserContext, any]:
-        """Launch browser with persistent profile and retry logic for lock handling."""
+        """Launch browser with persistent profile and soft-retry logic."""
         async with self._lock:
             playwright = await async_playwright().start()
             
@@ -91,27 +81,27 @@ class WhiskAgent:
                 except Exception as e:
                     error_msg = str(e).lower()
                     if "target page, context or browser has been closed" in error_msg or "existing browser session" in error_msg or "in use" in error_msg:
-                        logger.warning(f"⚠️ Browser Lock detected (Attempt {attempt+1}/{MAX_RETRIES}). Cleaning and retrying...")
-                        
-                        # Only cleanup on retry
+                        logger.warning(f"⚠️ Whisk Browser Lock (Attempt {attempt+1}/{MAX_RETRIES}). Cleaning...")
                         await self._clean_stale_locks()
-                        await asyncio.sleep(2 * (attempt + 1)) # Exponential backoff
+                        await asyncio.sleep(2 * (attempt + 1))
                     else:
                         logger.error(f"❌ Unexpected browser launch error: {e}")
-                        # Cleanup playwright if we fail
                         await playwright.stop()
                         raise e
             
             await playwright.stop()
-            raise RuntimeError("Failed to launch browser after multiple cleanup attempts.")
+            raise RuntimeError("Failed to launch Whisk browser after multiple cleanup attempts.")
 
     async def close(self):
         """Close browser and stop playwright."""
+        logger.info("🛑 WhiskAgent.close() called. Cleaning up Playwright...")
         if self.browser:
-            await self.browser.close()
+            try: await self.browser.close()
+            except: pass
             self.browser = None
         if self.pw:
-            await self.pw.stop()
+            try: await self.pw.stop()
+            except: pass
             self.pw = None
         self.page = None
 
@@ -216,23 +206,95 @@ class WhiskAgent:
         skip_setup: bool = False
     ) -> bytes:
         """
-        Generate a single image.
-        Accepts optional 'page' to reuse existing browser session (critical for bulk).
-        skip_setup: If True, assumes URL loaded and characters uploaded (Batch Mode).
+        Generate a single image with recovery for 'TargetClosedError'.
+        """
+        MAX_RECOVERY_ATTEMPTS = 2
+        for recovery_attempt in range(MAX_RECOVERY_ATTEMPTS):
+            try:
+                return await self._generate_image_internal(
+                    prompt=prompt,
+                    is_shorts=is_shorts,
+                    style_suffix=style_suffix,
+                    page=page,
+                    character_paths=character_paths,
+                    style_image_path=style_image_path,
+                    skip_setup=skip_setup and (recovery_attempt == 0) # Force setup on recovery
+                )
+            except Exception as e:
+                error_msg = str(e)
+                if "Target page, context or browser has been closed" in error_msg or "Target closed" in error_msg:
+                    logger.warning(f"🔄 [RECOVERY] Whisk Browser closed unexpectedly during generation. Attempting restart {recovery_attempt+1}/{MAX_RECOVERY_ATTEMPTS}...")
+                    
+                    # Force cleanup
+                    await self.close()
+                    page = None # Reset passed-in page to force new creation
+                    await asyncio.sleep(2)
+                    continue
+                else:
+                    raise e
+        raise RuntimeError("Failed to generate image after multiple browser recovery attempts.")
+
+    async def _generate_image_internal(
+        self, 
+        prompt: str, 
+        is_shorts: bool = False,
+        style_suffix: str = "",
+        page: Optional[Page] = None,
+        character_paths: list[Path] = [],
+        style_image_path: Optional[Path] = None,
+        skip_setup: bool = False
+    ) -> bytes:
+        """
+        Internal implementation of image generation.
         """
         browser = None
         pw = None
         
         # If page not provided, creating full context (Single Shot)
         if not page:
+            # HEALTH CHECK: Re-verify browser and page are still alive
+            try:
+                if self.browser:
+                    # Try a lightweight operation that checks context health
+                    _ = self.browser.pages
+                    # If we reach here, context is technically alive, 
+                    # but let's be double sure by checking if we have any page
+                    # If we have no pages, try to see if we can still interact
+            except Exception as e:
+                logger.warning(f"[RECOVERY] Whisk Browser Context appears closed/dead ({e}). Resetting...")
+                self.browser = None
+                self.page = None
+
             if not self.browser:
+                logger.info("[RECOVERY] Re-launching Whisk browser context...")
                 self.browser, self.pw = await self.get_context()
+            
+            # Double check page health
+            try:
+                if self.page and self.page.is_closed():
+                    self.page = None
+                
+                if self.page:
+                    # One more check: is it really responsive?
+                    _ = await self.page.title()
+            except:
+                self.page = None
+            
             if not self.page:
-                self.page = await self.browser.new_page()
+                logger.info("[RECOVERY] Creating new page for Whisk...")
+                try:
+                    self.page = await self.browser.new_page()
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to create new page, browser might be dead anyway: {e}")
+                    self.browser = None
+                    self.browser, self.pw = await self.get_context()
+                    self.page = await self.browser.new_page()
+            
             page = self.page
             
-            # Only navigate if NOT skipping setup (or if page is blank)
-            if not skip_setup or page.url == "about:blank":
+            # Only navigate if NOT skipping setup (or if page is blank/wrong-url)
+            if not skip_setup or "labs.google" not in page.url:
+                logger.info(f"[BROWSER] Navigating to Whisk Project (skip_setup={skip_setup}, URL={page.url})")
                 await page.goto("https://labs.google/fx/tools/whisk/project", timeout=60000)
         
         try:
@@ -301,14 +363,49 @@ class WhiskAgent:
                     if await option.count() > 0:
                          await option.click()
                          logger.info(f"✅ Selected {target_aspect}")
+                         self.current_aspect = target_aspect
                     else:
                          logger.warning(f"⚠️ Could not find option for {target_aspect}")
+                         # DEBUG: List buttons in popover
+                         try:
+                             btns = await page.locator("button, div[role='menuitem']").all()
+                             labels = []
+                             for b in btns:
+                                 t = await b.text_content()
+                                 if t: labels.append(t.strip())
+                             logger.info(f"🔍 Popover elements: {', '.join(labels[:15])}...")
+                         except: pass
                     
                     # Close menu
                     await page.mouse.click(10, 10) 
                     await asyncio.sleep(0.5)
                 else:
                     logger.warning("⚠️ Aspect Ratio button not found!")
+            
+            # --- ASPECT RATIO SWITCHING (Even during skip_setup) ---
+            # If requesting a different aspect than current, force a switch
+            target_aspect = "Portrait" if is_shorts else "Landscape"
+            if skip_setup and self.current_aspect and self.current_aspect != target_aspect:
+                logger.info(f"📐 Aspect mismatch detected ({self.current_aspect} -> {target_aspect}). Switching...")
+                # Re-run aspect setting even though we skip other setup
+                aspect_btn = page.locator("button").filter(has_text=re.compile(r"aspect_ratio|format_shapes", re.I)).first
+                if await aspect_btn.count() == 0:
+                    aspect_btn = page.locator("button[aria-label*='Aspect ratio'], button[aria-label*='Format']").first
+                
+                if await aspect_btn.count() > 0:
+                    await aspect_btn.click()
+                    await asyncio.sleep(0.5)
+                    option_text = "9:16" if is_shorts else "16:9"
+                    option = page.locator(f"text={option_text}").first
+                    if await option.count() == 0:
+                        option = page.locator(f"text={'Portrait' if is_shorts else 'Landscape'}").first
+                    
+                    if await option.count() > 0:
+                        await option.click()
+                        logger.info(f"✅ Switched Aspect to {target_aspect}")
+                        self.current_aspect = target_aspect
+                    await page.mouse.click(10, 10)
+                    await asyncio.sleep(0.5)
 
             # Ensure textarea is available for subsequent steps (even if we skipped setup)
             textarea = page.locator("textarea[placeholder*='Describe your idea']")

@@ -48,6 +48,8 @@ export interface Scene {
 // ============ Script Types ============
 export interface ScriptBreakdown {
     title: string;
+    description?: string;
+    thumbnail_prompt?: string;
     characters: Character[];
     scenes: Scene[];
 }
