@@ -242,11 +242,11 @@ class HealthChecker:
                     message="GEMINI_API_KEY not configured"
                 )
             
-            import google.generativeai as genai
-            genai.configure(api_key=api_key)
+            from google import genai
+            client = genai.Client(api_key=api_key)
             
             # Quick model listing to verify API key
-            models = list(genai.list_models())
+            models = list(client.models.list())
             
             return HealthCheckResult(
                 name="gemini",

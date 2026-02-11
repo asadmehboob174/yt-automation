@@ -58,6 +58,14 @@ class R2Storage:
         )
         return key
     
+    def exists(self, key: str) -> bool:
+        """Check if an object exists in R2."""
+        try:
+            self.client.head_object(Bucket=self.bucket, Key=key)
+            return True
+        except:
+            return False
+    
     def download(self, remote_key: str, local_path: Path) -> Path:
         """Download a file from R2."""
         self.client.download_file(self.bucket, remote_key, str(local_path))

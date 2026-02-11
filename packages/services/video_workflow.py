@@ -9,11 +9,13 @@ Durable workflow for generating AI videos with:
 - YouTube upload
 """
 import logging
+import asyncio
 from typing import Any
 from inngest import Inngest, Function, Context
 
 from .inngest_client import inngest_client
 from .cloud_storage import R2Storage
+from .email_service import email_service
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +93,15 @@ async def video_generation_workflow(ctx: Context) -> dict:
                     return {"status": "rate_limited", "checkpoint": completed_steps}
                 raise
         else:
-            animated_clips = partial_results["animated_clips"]
+            # INTEGRITY GUARD ON RESUME:
+            # Even if 'animated_clips' is in completed_steps, we MUST verify them
+            # because some might have been corrupt HTML in a previous attempt.
+            logger.info(f"🔄 Resuming from checkpoint. Verifying integrity for {video_id}...")
+            animated_clips = await ctx.step.run(
+                "verify-clips-integrity",
+                lambda: animate_scenes_with_grok(scene_images, script) # This function now handles selective repair!
+            )
+            partial_results["animated_clips"] = animated_clips
         
         # Step 3: Generate voiceover audio (ONLY for documentary videos)
         # Story videos use Grok's built-in dialogue audio
@@ -179,6 +189,16 @@ async def video_generation_workflow(ctx: Context) -> dict:
         
         logger.info(f"✅ Video ready for review: {video_id}")
         
+        # Step 9: Send email notification
+        await ctx.step.run(
+            "send-completion-email",
+            lambda: email_service.send_video_complete(
+                project_name=script.get("title", "New Video"),
+                video_url=R2Storage().get_url(final_video_key),
+                channel_name=channel_config.get("name")
+            )
+        )
+        
         return {
             "video_id": video_id,
             "status": "review_pending",
@@ -226,7 +246,8 @@ async def video_upload_workflow(ctx: Context) -> dict:
                 final_video_key, 
                 script, 
                 channel_config,
-                seo_result
+                seo_result,
+                thumbnail_key
             )
         )
         
@@ -302,34 +323,142 @@ async def generate_scene_images(script: dict, channel_config: dict) -> list[str]
     
     return image_keys
 
+def is_valid_video_content(p: Path) -> bool:
+    """Check if a file is a valid video (not HTML error page)."""
+    try:
+        if p.stat().st_size < 1000: return False
+        with open(p, "rb") as f:
+            head = f.read(200)
+            if b"<!DOCTYPE html>" in head or b"<html" in head:
+                return False
+        # Optional: ffprobe check if too large
+        if p.stat().st_size > 50000:
+            import ffmpeg
+            ffmpeg.probe(str(p))
+        return True
+    except:
+        return False
+
 
 async def animate_scenes_with_grok(image_keys: list[str], script: dict) -> list[str]:
-    """Animate scene images using Grok Imagine."""
+    """
+    Animate scene images using Grok Imagine with Deep Integrity Check.
+    
+    This function:
+    1. Checks for existing clips in R2.
+    2. Performs a "Deep Check" (downloading and verifying against HTML content).
+    3. Retries only the missing or corrupt indices.
+    """
     from .grok_agent import GrokAnimator
+    from pathlib import Path
+    import tempfile
     
     animator = GrokAnimator()
     storage = R2Storage()
-    clip_keys = []
+    scenes = script.get("scenes", [])
+    clip_keys = [None] * len(scenes)
     
-    for i, (image_key, scene) in enumerate(zip(image_keys, script.get("scenes", []))):
-        logger.info(f"🎥 Animating scene {i+1}")
+    # 1. INITIAL SCAN: Check existing clips in R2 for corruption
+    logger.info(f"🔍 Performing Deep Integrity Check on {len(scenes)} potential clips...")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        for i in range(len(scenes)):
+            expected_key = f"clips/{script['niche_id']}/scene_{i:03d}_animated.mp4"
+            
+            # Check if exists in R2 metadata
+            if storage.exists(expected_key):
+                # DEEP CHECK: Download and verify
+                local_check_path = Path(tmp_dir) / f"check_{i}.mp4"
+                try:
+                    storage.download(expected_key, str(local_check_path))
+                    if is_valid_video_content(local_check_path):
+                        clip_keys[i] = expected_key
+                        logger.info(f"   ✅ Scene {i+1} exists and is valid.")
+                    else:
+                        logger.warning(f"   ❌ Scene {i+1} is CORRUPT (HTML) despite being in R2. Marking for repair.")
+                        storage.delete_file(expected_key) # Fixed method name: delete_file
+                except Exception as e:
+                    logger.warning(f"   ⚠️ Could not verify existing scene {i+1}: {e}")
+
+    # 2. GENERATION/REPAIR LOOP
+    MAX_BATCH_ATTEMPTS = 3
+    for batch_attempt in range(MAX_BATCH_ATTEMPTS):
+        missing_indices = [i for i, key in enumerate(clip_keys) if key is None]
+        if not missing_indices:
+            break
+            
+        logger.info(f"🔄 Batch Repair Attempt {batch_attempt+1}/{MAX_BATCH_ATTEMPTS}: Retrying {len(missing_indices)} scenes...")
         
-        # Download image from R2
-        local_image = storage.download(image_key, f"/tmp/scene_{i}.png")
+        for i in missing_indices:
+            image_key = image_keys[i]
+            scene = scenes[i]
+            
+            try:
+                logger.info(f"🎥 Animating scene {i+1}/{len(scenes)}")
+                
+                # Download image from R2
+                local_image = storage.download(image_key, f"/tmp/scene_{i}.png")
+                
+                motion_prompt = scene.get("motion_description", "")
+                
+                try:
+                    # Animate with Grok
+                    video_path = await animator.animate(
+                        image_path=local_image,
+                        motion_prompt=motion_prompt,
+                        duration=scene.get("duration_in_seconds", 10)
+                    )
+                except Exception as e:
+                    from .grok_agent import ModerationError
+                    if isinstance(e, ModerationError):
+                        logger.warning(f"🛑 Moderation detected for scene {i+1}. Attempting AI rewrite...")
+                        from .script_generator import ScriptGenerator
+                        gen = ScriptGenerator()
+                        new_prompt = await gen.rewrite_moderated_prompt(motion_prompt)
+                        
+                        if new_prompt != motion_prompt:
+                            logger.info(f"🔄 Retrying scene {i+1} with sanitized prompt: {new_prompt}")
+                            # RETRY ONCE
+                            video_path = await animator.animate(
+                                image_path=local_image,
+                                motion_prompt=new_prompt,
+                                duration=scene.get("duration_in_seconds", 10)
+                            )
+                        else:
+                            raise e # If rewrite failed or didn't change anything, give up
+                    else:
+                        raise e # Rethrow non-moderation errors
+                
+                # Verify locally before upload
+                if video_path and video_path.exists() and is_valid_video_content(video_path):
+                    # Upload animated clip to R2
+                    clip_key = f"clips/{script['niche_id']}/scene_{i:03d}_animated.mp4"
+                    storage.upload(video_path, clip_key)
+                    clip_keys[i] = clip_key
+                    logger.info(f"   ✅ Scene {i+1} generated and verified.")
+                else:
+                    logger.warning(f"   ⚠️ Scene {i+1} failed verification on generation.")
+                    
+            except Exception as e:
+                logger.error(f"   ❌ Failed to animate scene {i+1}: {e}")
+                if "rate limit" in str(e).lower():
+                    raise # Re-raise rate limit to trigger Inngest recovery
         
-        # Animate with Grok
-        video_path = await animator.animate(
-            image_path=local_image,
-            motion_prompt=scene.get("motion_description", ""),
-            duration=scene.get("duration_in_seconds", 10)
-        )
-        
-        # Upload animated clip to R2
-        clip_key = f"clips/{script['niche_id']}/scene_{i:03d}_animated.mp4"
-        storage.upload(video_path, clip_key)
-        clip_keys.append(clip_key)
+        # Cooling period between batch retries
+        if any(key is None for key in clip_keys) and batch_attempt < MAX_BATCH_ATTEMPTS - 1:
+            wait_time = (batch_attempt + 1) * 30
+            logger.info(f"⏱️ Waiting {wait_time}s before next repair attempt...")
+            await asyncio.sleep(wait_time)
+
+    # 3. FINAL INTEGRITY GUARD
+    final_clips = [k for k in clip_keys if k is not None]
+    if len(final_clips) < len(scenes):
+        missing = [i+1 for i, k in enumerate(clip_keys) if k is None]
+        error_msg = f"❌ Integrity Check Failed: Scenes {missing} are still missing or corrupt."
+        logger.error(error_msg)
+        raise RuntimeError(error_msg)
     
-    return clip_keys
+    logger.info(f"🏆 Batch generation complete with 100% integrity ({len(final_clips)} clips).")
+    return final_clips
 
 
 async def generate_voiceover(script: dict, channel_config: dict) -> list[str]:
@@ -387,7 +516,12 @@ async def render_final_video(
     # Download all clips
     local_clips = []
     for i, clip_key in enumerate(clip_keys):
-        local_clips.append(storage.download(clip_key, f"/tmp/clip_{i}.mp4"))
+        local_path = storage.download(clip_key, Path(f"/tmp/clip_{i}.mp4"))
+        if not is_valid_video_content(local_path):
+             error_msg = f"❌ CRITICAL ERROR: Clip {clip_key} is corrupt (HTML) or too small. Aborting final render."
+             logger.error(error_msg)
+             raise ValueError(error_msg)
+        local_clips.append(local_path)
     
     # Determine Output Resolution
     is_shorts = "shorts" in channel_config.get("nicheId", "").lower() or "shorts" in channel_config.get("styleSuffix", "").lower()
@@ -524,7 +658,7 @@ async def render_final_video(
 
 
 async def generate_seo_content(script: dict, channel_config: dict, background_image_key: str = None) -> dict:
-    """Generate SEO-optimized title, description, tags, and thumbnail."""
+    """Generate SEO-optimized content using LLM."""
     from .youtube_seo import YouTubeSEO
     from pathlib import Path
     
@@ -540,13 +674,15 @@ async def generate_seo_content(script: dict, channel_config: dict, background_im
     # Get niche from script
     niche = script.get("niche_id", "default").split("_")[0] if "_" in script.get("niche_id", "") else script.get("niche_id", "default")
     
-    # Generate SEO content
-    result = seo.optimize(
+    # Get full script text for LLM analysis
+    script_text = script.get("full_text") or "\n".join([s.get("voiceover_text", "") for s in script.get("scenes", [])])
+    
+    # Generate SEO content using LLM
+    result = await seo.optimize_with_llm(
+        script_text=script_text,
         topic=script.get("title", "Video"),
         niche=niche,
-        script_summary=script.get("description", ""),
         background_image=background_image,
-        base_tags=channel_config.get("defaultTags", []),
         output_dir=Path("/tmp")
     )
     
@@ -569,8 +705,8 @@ async def upload_thumbnail(thumbnail_path: str, script: dict) -> str:
     return thumbnail_key
 
 
-async def upload_to_youtube(video_key: str, script: dict, channel_config: dict, seo_result: dict = None) -> dict:
-    """Upload video to YouTube as Private with SEO optimization."""
+async def upload_to_youtube(video_key: str, script: dict, channel_config: dict, seo_result: dict = None, thumbnail_key: str = None) -> dict:
+    """Upload video to YouTube as Private with SEO optimization and thumbnail."""
     from .youtube_uploader import YouTubeUploader
     
     storage = R2Storage()
@@ -578,6 +714,16 @@ async def upload_to_youtube(video_key: str, script: dict, channel_config: dict, 
     
     # Download final video
     local_video = storage.download(video_key, "/tmp/upload_video.mp4")
+    
+    # Download thumbnail if provided
+    local_thumbnail = None
+    if thumbnail_key:
+        from pathlib import Path
+        local_thumbnail = Path("/tmp/upload_thumbnail.jpg")
+        storage.download(thumbnail_key, local_thumbnail)
+    elif seo_result and seo_result.get("thumbnail_path"):
+        from pathlib import Path
+        local_thumbnail = Path(seo_result["thumbnail_path"])
     
     # Use SEO-optimized data if available
     title = seo_result.get("title", script['title']) if seo_result else script['title']
@@ -590,6 +736,7 @@ async def upload_to_youtube(video_key: str, script: dict, channel_config: dict, 
         title=title,
         description=description,
         tags=tags,
+        thumbnail_path=local_thumbnail,
         privacy_status="private"  # Always start as private
     )
     

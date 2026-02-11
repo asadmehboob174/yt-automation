@@ -58,10 +58,10 @@ class SceneBreakdown(BaseModel):
     image_to_video_prompt: str = ""  # Dynamic movement (Legacy/Combined)
     motion_description: str = "" # Added: Specific motion for Grok
     duration_in_seconds: int = 10
-    camera_angle: str = "medium shot"
+    camera_angle: str = "Medium shot"
     dialogue: Optional[str] = None
-    imageUrl: Optional[str] = None
-    videoUrl: Optional[str] = None
+    sound_effect: Optional[str] = None # Added for Grok prompt inclusion
+    emotion: str = "neutrally" # Added for Grok prompt inclusion
 
 
 class TechnicalBreakdownOutput(BaseModel):
@@ -73,8 +73,8 @@ class TechnicalBreakdownOutput(BaseModel):
 class ScriptGenerator:
     """Generate video scripts using HuggingFace Inference API (Mistral-7B)."""
     
-    # Gemini API (commented out - rate limited)
-    # GEMINI_API = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+    # Gemini API
+    GEMINI_API = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
     
     # HuggingFace Inference API (OpenAI-compatible router endpoint)
     HF_API = "https://router.huggingface.co/v1/chat/completions"
@@ -89,7 +89,8 @@ class ScriptGenerator:
         # HuggingFace token
         self.hf_token = os.getenv("HF_TOKEN")
         if not self.hf_token:
-            raise ValueError("HF_TOKEN environment variable is required")
+            # We don't raise error here anymore to allow Gemini-only usage if HF is broken/missing
+            print("⚠️ HF_TOKEN not found. Hugging Face generation will fail.")
         
         # Rate limiter: HuggingFace free tier has 300 req/hour
         self._call_semaphore = asyncio.Semaphore(1)  # One call at a time
@@ -146,11 +147,60 @@ Generate exactly {scene_count} scenes adhering to the structure above.
 """
 
     async def _call_llm(self, prompt: str, gemini_model: str = "gemini-flash-latest", json_mode: bool = False) -> str:
-        """LLM CALLS DISABLED BY USER REQUEST"""
-        print("\n LLM INTEGRATION IS CURRENTLY DISABLED (COMMENTED OUT)")
-        raise ValueError("AI generation is disabled. Please use 'Manual Script' mode.")
+        """
+        Unified LLM caller that handles routing between providers if needed.
+        Currently redirects to HF primarily, but we can use this for Gemini too.
+        """
+        try:
+             # Default to HuggingFace if available
+             if self.hf_token:
+                 return await self._call_huggingface(prompt)
+             elif self.gemini_key:
+                 return await self._call_gemini(prompt)
+             else:
+                 raise ValueError("No AI credentials found (HF_TOKEN or GEMINI_API_KEY)")
+        except Exception:
+             # Fallback to Gemini if HF fails inside this method?
+             # For now, let caller handle fallbacks to be explicit.
+             if self.gemini_key:
+                  return await self._call_gemini(prompt)
+             raise
 
-    # [COMMENTED OUT] async def _call_gemini(self, prompt: str, ...
+    async def _call_gemini(self, prompt: str, model: str = "gemini-2.0-flash") -> str:
+        """Call Google Gemini API."""
+        if not self.gemini_key:
+            raise ValueError("GEMINI_API_KEY is missing")
+            
+        async with self._call_semaphore:
+            # Rate limit handling
+            now = asyncio.get_event_loop().time()
+            if now - self._last_call_time < 0.5: # Gemini is faster
+                await asyncio.sleep(0.5)
+                
+            headers = {"Content-Type": "application/json"}
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.gemini_key}"
+            
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0.7,
+                    "maxOutputTokens": 8192,
+                    "responseMimeType": "application/json"
+                }
+            }
+            
+            print(f"✨ Calling Gemini ({model})...")
+            
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+                
+                self._last_call_time = asyncio.get_event_loop().time()
+                try:
+                    return data["candidates"][0]["content"]["parts"][0]["text"]
+                except (KeyError, IndexError):
+                    return ""
     async def _call_huggingface(self, prompt: str, max_tokens: int = 16384, timeout: float = 120.0, retries: int = 3) -> str:
         """Call HuggingFace Inference API."""
         async with self._call_semaphore:
@@ -721,7 +771,7 @@ Return ONLY this JSON structure, nothing else:
                         for field in ["dialogue", "prompt", "text_to_image_prompt", "image_to_video_prompt", "scene_title", "name"]:
                             simple_repair = re.sub(
                                 rf'("{field}":\s*")(.+?)("(?=\s*[,}}\n]))',
-                                lambda m: f'{m.group(1)}{m.group(2).replace('"', '\\"')}{m.group(3)}',
+                                lambda m: '{}{}{}'.format(m.group(1), m.group(2).replace('"', '\\"'), m.group(3)),
                                 simple_repair,
                                 flags=re.DOTALL
                             )
@@ -771,6 +821,66 @@ Return ONLY this JSON structure, nothing else:
             print(f"❌ LLM Extraction Failed: {e}")
             # Return empty structure instead of brittle regex fallback
             raise ValueError(f"Failed to parse script with LLM: {e}. Please check your script format.")
+
+    async def parse_manual_script_gemini(self, raw_text: str) -> TechnicalBreakdownOutput:
+        """
+        Extract structured data from a manual script using Gemini 2.0 Flash.
+        Serves as a robust fallback to Hugging Face.
+        """
+        print("📝 Manual Extraction: Using Google Gemini 2.0 Flash...")
+        
+        prompt = f"""You are an expert script analyst. Extract structured data from this script into JSON.
+
+SCRIPT:
+---
+{raw_text}
+---
+
+INSTRUCTIONS:
+1. Extract ALL characters (Name + Visual Description).
+2. Extract ALL scenes (Scene Number + Visuals + Audio).
+3. Be precise with "Text-to-Image" vs "Text-to-Video" vs "Dialogue".
+4. If a field is missing, use empty string "".
+
+OUTPUT JSON FORMAT:
+{{
+  "characters": [
+    {{ "name": "NAME", "prompt": "Visual description" }}
+  ],
+  "scenes": [
+    {{
+      "scene_number": 1,
+      "text_to_image_prompt": "...",
+      "image_to_video_prompt": "...",
+      "dialogue": "...",
+      "voiceover_text": "...",
+      "camera_angle": "Medium Shot",
+      "duration_in_seconds": 5
+    }}
+  ]
+}}
+"""
+        try:
+            text = await self._call_gemini(prompt)
+            print(f"DEBUG: Gemini Response (First 200 chars): {text[:200]}...")
+            
+            clean_text = self._clean_json_text(text)
+            data = json.loads(clean_text)
+            
+            # Post-processing (ensure ints, etc)
+            for scene in data.get('scenes', []):
+                 sec = scene.get('duration_in_seconds', 5)
+                 scene['duration_in_seconds'] = int(sec) if isinstance(sec, (int, float)) else 5
+                 
+                 # Ensure all fields exist
+                 for field in ['text_to_image_prompt', 'image_to_video_prompt', 'dialogue', 'character_pose_prompt']:
+                     if field not in scene: scene[field] = ""
+
+            return TechnicalBreakdownOutput(**data)
+
+        except Exception as e:
+            print(f"❌ Gemini Extraction Failed: {e}")
+            raise ValueError(f"Gemini extraction failed: {e}")
 
     def parse_manual_script(self, raw_text: str) -> TechnicalBreakdownOutput:
         """
@@ -1094,8 +1204,8 @@ Return ONLY this JSON structure, nothing else:
         # We replace the emoji to standard "SCENE" first for easier splitting
         clean_text_for_scenes = re.sub(r'🎞️\s*', '', text)
         
-        # Split by "SCENE X"
-        scene_blocks = re.split(r'(?i)\n+SCENE\s+(\d+)', clean_text_for_scenes)
+        # Split by "SCENE X" with optional indentation
+        scene_blocks = re.split(r'(?i)\n+\s*SCENE\s+(\d+)', clean_text_for_scenes)
         
         found_scenes = 0
         
@@ -1112,52 +1222,67 @@ Return ONLY this JSON structure, nothing else:
                     if raw_title and not raw_title.lower().startswith("text to"):
                         scene_title = re.sub(r'^[:\–\-\.]\s*', '', raw_title).strip() or scene_title
                     
-                    def extract_labeled(keys: list, text_block: str) -> str:
-                        """Extract labeled fields like 'Text to Image Prompt: ...'"""
-                        for k in keys:
-                            # FIXED: Use more flexible lookahead that handles both newlines and same-line labels
-                            # Match: Key: Value ... (until next labeled field on new line OR end)
-                            # The lookahead now handles: 1+ newlines OR whitespace before next label
-                            pattern = rf'(?i){k}\s*:\s*(.*?)(?=(?:\n|\r\n)+\s*(?:Text to Image|Text to Video|Image-to-Video|Dialog|Dialogue|Short Type|Shot Type|Audio|Style)\s*:|$)'
-                            m = re.search(pattern, text_block, re.DOTALL)
-                            if m: 
-                                result = m.group(1).strip()
-                                # SAFETY: Ensure we don't include the next label in the result
-                                # Remove any trailing "Text to Video..." if present
-                                for stop_phrase in ['Text to Video Prompt', 'Text-to-Video Prompt', 'Dialog:', 'Dialogue:', 'Short Type:', 'Shot Type:']:
-                                    if stop_phrase in result:
-                                        result = result.split(stop_phrase)[0].strip()
-                                return result
-                        return ""
+                    # --- FIELD EXTRACTION ---
+                    # We use robust regex to find fields regardless of order or exact formatting
                     
-                    # User's STANDARDIZED format:
-                    # Scene X
-                    # Text to Image Prompt: [visual description]
-                    # Text to Video Prompt: [motion description]
-                    # Dialog: [audio cues]
-                    # Short Type: [shot type]
+                    # 1. Image Prompt
+                    # Matches: "(Text-to-Image): ...", "Text-to-Image Prompt: ...", "Image Prompt: ..."
+                    img_match = re.search(
+                        r'(?:(?:\(|\[)?(?:Text-to-Image|Text to Image|Image Prompt)(?:\)|\])?(?:\s*Prompt)?\s*:)\s*(.*?)(?=(?:\n\s*(?:\(|\[)?(?:Image-to-Video|Text-to-Video|Sound|AI News|Dialog|Scene)|$))', 
+                        block, re.DOTALL | re.IGNORECASE
+                    )
+                    img_prompt = img_match.group(1).strip() if img_match else ""
+
+                    # 2. Video/Motion Prompt
+                    # Matches: "(Image-to-Video): ...", "Text-to-Video Prompt: ...", "Video Prompt: ..."
+                    vid_match = re.search(
+                        r'(?:(?:\(|\[)?(?:Image-to-Video|Text-to-Video|Text to Video|Video Prompt)(?:\)|\])?(?:\s*Prompt)?\s*:)\s*(.*?)(?=(?:\n\s*(?:\(|\[)?(?:Text-to-Image|Sound|AI News|Dialog|Scene)|$))', 
+                        block, re.DOTALL | re.IGNORECASE
+                    )
+                    vid_prompt = vid_match.group(1).strip() if vid_match else ""
+
+                    # 3. Dialogue / AI News Line
+                    # Matches: "AI News Line:", "Dialog:", "Dialogue:", "Voiceover:"
+                    # Handles multi-line values until the next keyword or end of block
+                    dial_match = re.search(
+                        r'(?:(?:AI News Line|Dialog|Dialogue|Voiceover|Audio)(?:\s*Line)?\s*:)\s*(.*?)(?=(?:\n\s*(?:\(|\[)?(?:Text-to-Image|Image-to-Video|Sound|Scene)|$))', 
+                        block, re.DOTALL | re.IGNORECASE
+                    )
+                    dialogue_raw = dial_match.group(1).strip() if dial_match else ""
                     
-                    # Extract all labeled fields
-                    img_prompt = extract_labeled(["Text to Image Prompt", "Text-to-Image Prompt", "Image Prompt"], block)
-                    vid_prompt = extract_labeled(["Text to Video Prompt", "Text-to-Video Prompt", "Image-to-Video Prompt", "Video Prompt"], block)
-                    dialogue_raw = extract_labeled(["Dialog", "Dialogue", "Audio", "Voiceover"], block)
-                    shot_type = extract_labeled(["Short Type", "Shot Type", "Shot"], block)
-                    
-                    # Clean dialogue
-                    clean_audio = dialogue_raw.strip('"').strip('"').strip('"')
-                    
-                    # Default shot type if not found
-                    if not shot_type:
-                        shot_type = "Medium Shot"
-                        for st in ["Close-up", "Close up", "Extreme Close-up", "Wide Shot", "Medium Shot"]:
-                            if st.lower() in img_prompt.lower():
-                                shot_type = st
-                                break
+                    # 4. Sound Effect (Optional, append to cues if needed)
+                    sfx_match = re.search(
+                        r'(?:Sound Effect|SFX|Audio Cue)\s*:\s*(.*?)(?=(?:\n\s*(?:\(|\[)?(?:Text-to-Image|Image-to-Video|AI News|Dialog|Scene|Emotion)|$))',
+                        block, re.DOTALL | re.IGNORECASE
+                    )
+                    sfx = sfx_match.group(1).strip() if sfx_match else ""
+
+                    # 5. Emotion (Optional)
+                    emo_match = re.search(
+                        r'(?:Emotion|Mood|Feeling)\s*:\s*(.*?)(?=(?:\n\s*(?:\(|\[)?(?:Text-to-Image|Image-to-Video|AI News|Dialog|Scene|Sound)|$))',
+                        block, re.DOTALL | re.IGNORECASE
+                    )
+                    emotion = emo_match.group(1).strip() if emo_match else "neutrally"
+
+                    # Clean dialogue (remove quotes)
+                    clean_audio = dialogue_raw.strip('"').strip("'").strip()
+                    if sfx and not clean_audio:
+                         # If no dialog but SFX exists, maybe use SFX as audio cue? 
+                         # Usually we only want spoken audio in 'voiceover_text'
+                         pass
+
+                    # Shot Type Inference
+                    shot_type = "Medium Shot"
+                    if "close-up" in img_prompt.lower(): shot_type = "Close-up"
+                    elif "wide" in img_prompt.lower(): shot_type = "Wide Shot"
+                    elif "extreme close" in img_prompt.lower(): shot_type = "Extreme Close-up"
                     
                     print(f"   📦 Scene {s_num}: {scene_title[:30]}...")
                     print(f"      📷 Text-to-Image: {img_prompt[:60]}...")
                     print(f"      🎬 Text-to-Video: {vid_prompt[:60]}...")
-                    print(f"      🎤 Dialog: {clean_audio[:40]}...")
+                    print(f"      🎤 Dialog/News: {clean_audio[:40]}...")
+                    print(f"      🔊 SFX: {sfx[:40]}...")
+                    print(f"      😊 Emotion: {emotion[:40]}...")
                     
                     scenes.append(SceneBreakdown(
                         scene_number=s_num,
@@ -1170,6 +1295,8 @@ Return ONLY this JSON structure, nothing else:
                         background_description=img_prompt,
                         camera_angle=shot_type,
                         dialogue=clean_audio if "(SFX" not in dialogue_raw else None,
+                        sound_effect=sfx,
+                        emotion=emotion,
                         duration_in_seconds=5
                     ))
                     found_scenes += 1
@@ -1272,3 +1399,35 @@ Return ONLY this JSON structure, nothing else:
                 "description": "Watch this incredible story generated by AI Video Factory.",
                 "tags": ["AI", "Animation", "Story"]
             }
+
+    async def rewrite_moderated_prompt(self, original_prompt: str) -> str:
+        """
+        Rewrite a prompt that was flagged by Grok's moderation.
+        Uses clinical, safe language to avoid content filters.
+        """
+        print(f"🔄 Rewriting moderated prompt...")
+        
+        system_prompt = """You are a content safety expert. Rewrite the user's video generation prompt to avoid content moderation filters.
+
+RULES:
+- Keep the SAME creative intent and scene description
+- Replace any potentially flagged words with safe clinical alternatives
+- Avoid words like: violent, blood, weapon, fight, kill, dead, horror, scary, sexy, nude, drug, gun, knife, war, attack, destroy, explode, crash, burn, scream, pain, suffer, abuse, hate
+- Use words like: active, energetic, dynamic, determined, coordinated, focused, moving, traveling, resting, standing, walking, running, jumping, celebrating
+- Keep it under 200 words
+- Output ONLY the rewritten prompt, nothing else"""
+
+        try:
+            rewritten = await self._call_huggingface(
+                f"{system_prompt}\n\nOriginal prompt:\n{original_prompt}",
+                max_tokens=300,
+                timeout=30.0
+            )
+            rewritten = rewritten.strip()
+            if rewritten and len(rewritten) > 20:
+                print(f"   ✅ Rewritten: {rewritten[:80]}...")
+                return rewritten
+        except Exception as e:
+            print(f"   ❌ Rewrite failed: {e}")
+        
+        return original_prompt  # Return original if rewrite fails

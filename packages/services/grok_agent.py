@@ -45,6 +45,11 @@ class UIChangedError(Exception):
     pass
 
 
+class ModerationError(Exception):
+    """Raised when Grok flags content as moderated."""
+    pass
+
+
 # ============================================
 # Loophole #1: 5-Layer Prompt Formula
 # ============================================
@@ -61,6 +66,7 @@ class PromptBuilder:
         style_suffix: str,
         motion_description: str,
         dialogue: Optional[str] = None,
+        sound_effect: Optional[str] = None,
         character_name: str = "Character",
         emotion: str = "neutrally"
     ) -> str:
@@ -71,6 +77,8 @@ class PromptBuilder:
         [Motion Description]
         
         Dialogue ([Character]): "[Text]"
+        Sound Effect: [SFX]
+        Emotion: [Emotion]
         Shot: [Camera Angle]
         [Style Suffix]
         """
@@ -94,13 +102,23 @@ class PromptBuilder:
             else:
                  prompt_parts.append(f'\nDialogue ({character_name}): "{dialogue.strip()}"')
 
-        # Part C: Camera Angle
+        # Part C: Sound Effect (New)
+        if sound_effect and sound_effect.strip():
+            prompt_parts.append(f"\nSound Effect: {sound_effect.strip()}")
+            
+        # Part D: Emotion (New)
+        if emotion and emotion.strip() and emotion.lower() != "neutrally":
+            prompt_parts.append(f"\nEmotion: {emotion.strip()}")
+
+        # Part E: Camera Angle
         if camera_angle:
             prompt_parts.append(f"\nShot: {camera_angle}")
             
-        # Part D: Style (Optional, sometimes better to keep hidden or append at end)
+        # Part F: Style (Optional, sometimes better to keep hidden or append at end)
         if style_suffix:
-            prompt_parts.append(f"\nStyle: {style_suffix}")
+            # Check if style suffix is already partially in motion prompt
+            if style_suffix.lower() not in motion_description.lower():
+                prompt_parts.append(f"\nStyle: {style_suffix}")
             
         return "\n".join(prompt_parts)
 
@@ -147,18 +165,22 @@ class VideoSettings:
     }
     
     # Updated selectors based on actual Grok UI HTML (Feb 2026)
-    # Buttons have aria-label="9:16", aria-label="16:9", etc.
+    # Buttons may have aria-label="9:16" OR text like "Vertical"/"Landscape"
     ASPECT_SELECTORS = {
         "9:16": [
-            "button[aria-label='9:16']",  # Primary - exact match from user's HTML
+            "button[aria-label='9:16']",
             "[aria-label='9:16']",
             "button:has-text('9:16')",
+            "button:has-text('Vertical')",
+            "button:has-text('Portrait')",
             ".aspect-vertical",
         ],
         "16:9": [
-            "button[aria-label='16:9']",  # Primary - exact match from user's HTML
+            "button[aria-label='16:9']",
             "[aria-label='16:9']",
             "button:has-text('16:9')",
+            "button:has-text('Landscape')",
+            "button:has-text('Horizontal')",
             ".aspect-landscape",
         ],
         "2:3": [
@@ -172,6 +194,7 @@ class VideoSettings:
         "1:1": [
             "button[aria-label='1:1']",
             "[aria-label='1:1']",
+            "button:has-text('Square')",
         ],
     }
     
@@ -197,7 +220,11 @@ class VideoSettings:
             try:
                 btn = page.locator(selector)
                 if await btn.count() > 0 and await btn.first.is_visible():
-                    await btn.first.click()
+                    try:
+                        await btn.first.click()
+                    except Exception:
+                        # JS-click fallback
+                        await page.evaluate("(sel) => document.querySelector(sel)?.click()", selector)
                     logger.info(f"✅ Set aspect ratio: {aspect} via {selector}")
                     aspect_clicked = True
                     break
@@ -206,19 +233,61 @@ class VideoSettings:
                 continue
         
         if not aspect_clicked:
-            logger.warning(f"⚠️ Could not find aspect ratio button for {aspect}. Available buttons may have different aria-labels.")
-            # DEBUG: List all buttons found for better diagnosis
+            # ====== AGGRESSIVE DEBUG: Dump ALL buttons to terminal ======
+            print(f"\n{'='*60}")
+            print(f"⚠️ ASPECT RATIO BUTTON NOT FOUND: {aspect}")
+            print(f"{'='*60}")
             try:
                 buttons = await page.locator("button").all()
-                labels = []
-                for b in buttons:
-                    label = await b.get_attribute("aria-label")
-                    if label: labels.append(label)
-                    else:
-                        text = await b.text_content()
-                        if text: labels.append(f"Text: {text.strip()}")
-                logger.info(f"🔍 Discovered buttons on page: {', '.join(labels[:20])}...")
-            except: pass
+                print(f"Total buttons on page: {len(buttons)}")
+                for i, b in enumerate(buttons[:30]):
+                    try:
+                        label = await b.get_attribute("aria-label") or ""
+                        text = (await b.text_content() or "").strip()[:80]
+                        visible = await b.is_visible()
+                        classes = await b.get_attribute("class") or ""
+                        print(f"  Button[{i}]: aria='{label}' text='{text}' visible={visible} class='{classes[:60]}'")
+                    except:
+                        print(f"  Button[{i}]: <error reading>")
+            except Exception as e:
+                print(f"  Error listing buttons: {e}")
+            print(f"{'='*60}\n")
+            
+            # ====== LAST RESORT: Try to find and click by scanning all buttons ======
+            # Look for any button whose text or aria-label contains the aspect ratio number
+            aspect_numbers = aspect.replace(":", "")  # "916" or "169"
+            try:
+                all_btns = await page.locator("button").all()
+                for btn in all_btns:
+                    try:
+                        label = (await btn.get_attribute("aria-label") or "").lower()
+                        text = (await btn.text_content() or "").lower().strip()
+                        # Match on various formats: "9:16", "9/16", "916", "vertical", "portrait"
+                        targets = [aspect.lower(), aspect_numbers, "vertical" if aspect == "9:16" else "landscape"]
+                        for target in targets:
+                            if target in label or target in text:
+                                if await btn.is_visible():
+                                    await btn.click()
+                                    print(f"✅ [LAST RESORT] Set aspect ratio via button text/label match: '{target}' in '{text or label}'")
+                                    aspect_clicked = True
+                                    break
+                        if aspect_clicked:
+                            break
+                    except:
+                        continue
+            except Exception as e:
+                print(f"  Last resort search failed: {e}")
+            
+            if not aspect_clicked:
+                # Save a diagnostic screenshot
+                try:
+                    screenshot_path = Path(os.getcwd()) / f"grok_error_{random.randint(1000,99999)}.png"
+                    await page.screenshot(path=str(screenshot_path))
+                    print(f"📸 Diagnostic screenshot saved: {screenshot_path}")
+                except:
+                    pass
+                logger.warning(f"⚠️ Could not find aspect ratio button for {aspect}.")
+
     
     @staticmethod
     def verify_clip_duration(clip_path: Path, expected_duration: float) -> bool:
@@ -318,6 +387,7 @@ async def get_browser_context(playwright: any) -> BrowserContext:
             return await playwright.chromium.launch_persistent_context(
                 user_data_dir=str(PROFILE_PATH),
                 headless=False,
+                accept_downloads=True,
                 ignore_default_args=["--enable-automation"],
                 args=args
             )
@@ -350,6 +420,7 @@ async def generate_single_clip(
     style_suffix: str,
     motion_description: str,
     dialogue: Optional[str] = None,
+    sound_effect: Optional[str] = None,
     character_name: str = "Character",
     emotion: str = "neutrally",
     duration: str = "10s",
@@ -398,7 +469,8 @@ async def generate_single_clip(
             # Build 5-layer prompt
             prompt = PromptBuilder.build(
                 character_pose, camera_angle, style_suffix,
-                motion_description, dialogue, character_name, emotion
+                motion_description, dialogue,
+                character_name=character_name, emotion=emotion, sound_effect=sound_effect
             )
             logger.info(f"📝 Prompt: {prompt[:100]}...")
             
@@ -761,10 +833,37 @@ async def generate_single_clip(
                             await download.save_as(output)
                             logger.info(f"✅ Successfully downloaded video using {selector}: {output}")
                             
-                            # Verify it's actually a video (sometimes buttons trigger image downloads)
-                            if output.stat().st_size < 10000: # < 10KB is suspicious
+                            # Verify it's actually a video (sometimes buttons trigger image downloads or error pages)
+                            file_size = output.stat().st_size
+                            if file_size < 10000: # < 10KB is suspicious
                                 logger.warning("⚠️ Downloaded file is too small (might be a text error or thumbnail). Retrying...")
                                 continue
+
+                            # Check for HTML error page masquerading as mp4
+                            with open(output, "rb") as f:
+                                header = f.read(100)
+                                if b"<!DOCTYPE html>" in header or b"<html" in header:
+                                    logger.warning(f"⚠️ Downloaded file is HTML (likely error page) - Size: {file_size} bytes")
+                                    # DUMP CONTENT FOR DEBUGGING
+                                    try:
+                                        f.seek(0)
+                                        content = f.read().decode('utf-8', errors='ignore')
+                                        print(f"\n{'='*20} CORRUPT DOWNLOAD CONTENT {'='*20}")
+                                        print(content[:500] + "...")
+                                        print(f"{'='*60}\n")
+                                    except: pass
+                                    
+                                    # Take diagnostic screenshot
+                                    try:
+                                        err_shot = output_dir / f"error_html_{uuid4().hex[:6]}.png"
+                                        await page.screenshot(path=str(err_shot))
+                                        logger.info(f"📸 Saved screenshot of page during HTML download: {err_shot}")
+                                    except: pass
+                                    
+                                    # Delete corrupt file and try next method
+                                    try: output.unlink() 
+                                    except: pass
+                                    continue
                                 
                             button_download_success = True
                             return output
@@ -1000,7 +1099,9 @@ class GrokAnimator:
         duration: int = 10,
         aspect_ratio: str = "9:16",
         camera_angle: str = "Medium shot",
-        dialogue: Optional[str] = None
+        dialogue: Optional[str] = None,
+        sound_effect: Optional[str] = None,
+        emotion: str = "neutrally"
     ) -> Path:
         """
         Animate an image using Grok Imagine with full serialization.
@@ -1032,6 +1133,8 @@ class GrokAnimator:
                         duration=duration_str,
                         aspect=aspect_ratio,
                         dialogue=dialogue,
+                        sound_effect=sound_effect,
+                        emotion=emotion,
                         external_page=page # Pass the active page
                     )
                     

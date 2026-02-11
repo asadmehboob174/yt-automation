@@ -100,21 +100,40 @@ class ThumbnailGenerator:
         output_path: Optional[Path] = None
     ) -> Path:
         """
-        Generate a thumbnail with all optimizations.
-        
-        Args:
-            background_image: Scene image for background
-            title_text: Main text (keep short!)
-            character_image: Optional character face to overlay
-            emoji: Optional emoji to add
-            output_path: Save location
-            
-        Returns:
-            Path to generated thumbnail
+        Generate a thumbnail with all optimizations and 2MB check.
         """
-        # Load and resize background
-        bg = Image.open(background_image).convert("RGBA")
-        bg = bg.resize((self.config.width, self.config.height), Image.LANCZOS)
+        # Load background
+        bg_raw = Image.open(background_image).convert("RGBA")
+        
+        # --- Smart Resizing (Handle 9:16 for Shorts) ---
+        target_w, target_h = self.config.width, self.config.height
+        raw_w, raw_h = bg_raw.size
+        
+        # Calculate aspect ratios
+        target_ratio = target_w / target_h
+        raw_ratio = raw_w / raw_h
+        
+        if abs(raw_ratio - target_ratio) > 0.01:
+            logger.info(f"📐 Adjusting aspect ratio: {raw_w}x{raw_h} -> {target_w}x{target_h}")
+            # If 9:16 (Shorts), we zoom/crop to fill 16:9
+            if raw_ratio < target_ratio: # Taller (Shorts)
+                scale = target_w / raw_w
+                new_h = int(raw_h * scale)
+                bg_raw = bg_raw.resize((target_w, new_h), Image.LANCZOS)
+                # Crop height to target
+                top = (new_h - target_h) // 2
+                bg_raw = bg_raw.crop((0, top, target_w, top + target_h))
+            else: # Wider
+                scale = target_h / raw_h
+                new_w = int(raw_w * scale)
+                bg_raw = bg_raw.resize((new_w, target_h), Image.LANCZOS)
+                # Crop width to target
+                left = (new_w - target_w) // 2
+                bg_raw = bg_raw.crop((left, 0, left + target_w, target_h))
+        else:
+            bg_raw = bg_raw.resize((target_w, target_h), Image.LANCZOS)
+
+        bg = bg_raw
         
         # Apply slight blur and darkening for better text contrast
         bg = bg.filter(ImageFilter.GaussianBlur(radius=2))
@@ -139,9 +158,21 @@ class ThumbnailGenerator:
         if output_path is None:
             output_path = Path(f"/tmp/thumbnail_{hash(title_text)}.jpg")
         
-        bg.save(str(output_path), "JPEG", quality=95)
-        logger.info(f"🖼️ Generated thumbnail: {output_path}")
+        # --- Recursive Compression (Enforce 2MB Limit) ---
+        quality = 95
+        bg.save(str(output_path), "JPEG", quality=quality, optimize=True)
+        file_size = os.path.getsize(output_path)
         
+        # YouTube Limit is 2MB (2,097,152 bytes)
+        MAX_SIZE = 2 * 1024 * 1024 
+        
+        while file_size > MAX_SIZE and quality > 10:
+            quality -= 10
+            logger.warning(f"⚠️ Thumbnail too large ({file_size/1024/1024:.2f}MB). Reducing quality to {quality}")
+            bg.save(str(output_path), "JPEG", quality=quality, optimize=True)
+            file_size = os.path.getsize(output_path)
+            
+        logger.info(f"🖼️ Generated thumbnail ({file_size/1024/1024:.2f}MB): {output_path}")
         return output_path
     
     def _add_character(self, bg: Image.Image, character_path: Path) -> Image.Image:
@@ -247,14 +278,21 @@ class TitleGenerator:
     """
     
     PATTERNS = [
-        "{emoji} {subject} - You Won't Believe What Happened",
-        "The {adjective} Truth About {subject}",
-        "Why {subject} {verb} (And What Happened Next)",
-        "{number} {subject} That Will {emotion} You",
-        "I Tried {subject} for {time} - Here's What Happened",
-        "{subject}: The Untold Story",
-        "What They Don't Tell You About {subject}",
-        "{emoji} {subject} Changed Everything",
+        "{emoji} {subject} - You Won't Believe What Happened! 😱",
+        "The {adjective} Truth About {subject} 🕵️‍♂️",
+        "Why {subject} {verb} (And What Happened Next) 🚀",
+        "{number} {subject} That Will {emotion} You! 🔥",
+        "I Tried {subject} for {time} - Here's What Happened ⏱️",
+        "{subject}: The Untold Story 📜",
+        "What They Don't Tell You About {subject} 🤫",
+        "{emoji} {subject} Changed Everything ✨",
+        "The {adjective} SECRET of {subject} Revealed! 💎",
+        "Stop Scrolling! The {subject} {verb} Is Here 🛑",
+        "I Found the {adjective} {subject} and it's {emotion}! 🌈",
+        "Is {subject} Actually {adjective}? (The Real Story) 🤔",
+        "The Most {adjective} {subject} You've Ever Seen! 🌟",
+        "How {subject} {verb} in {time} 📈",
+        "The {adjective} Ending of {subject}... 😱",
     ]
     
     EMOJIS = {
@@ -264,7 +302,8 @@ class TitleGenerator:
         "default": ["🔥", "💥", "⚡", "✨", "🎯"]
     }
     
-    ADJECTIVES = ["Shocking", "Incredible", "Hidden", "Real", "Dark", "Untold", "Strange"]
+    ADJECTIVES = ["Shocking", "Incredible", "Hidden", "Real", "Dark", "Untold", "Strange", "Eerie", "Forbidden", "Legendary", "Forgotten", "Mysterious"]
+    EMOTIONS = ["SHOCK", "AMAZE", "TERRIFY", "INSPIRE", "BREAK", "CHANGE", "FIX"]
     
     def generate(
         self,
@@ -288,10 +327,10 @@ class TitleGenerator:
             emoji=emoji,
             subject=topic,
             adjective=adjective,
-            verb="Changed History",
-            number=random.choice(["5", "7", "10", "15"]),
-            emotion="SHOCK",
-            time="30 Days"
+            verb=random.choice(["Changed History", "Broke the Internet", "Found a Secret", "Escaped", "Was Reborn"]),
+            number=random.choice(["3", "5", "7", "10", "12"]),
+            emotion=random.choice(self.EMOTIONS),
+            time=random.choice(["24 Hours", "7 Days", "30 Days", "One Year"])
         )
         
         # Ensure title isn't too long (YouTube limit ~100 chars, but 60-70 is optimal)
@@ -308,21 +347,33 @@ class DescriptionGenerator:
     """Generate SEO-optimized video descriptions."""
     
     TEMPLATE = """
-{hook}
+{hook} 🔥
 
-{main_content}
+{main_content} 🚀
 
-🔔 Subscribe for more {niche} content!
-👍 Like if you enjoyed this video
-💬 Comment your thoughts below
+---
+🌟 Support the Channel:
+🔔 SUBSCRIBE for more premium {niche} content: [Link] ✨
+👍 LIKE this video if you enjoyed the story! ❤️
+💬 COMMENT: What part of this story shocked you the most? 😱
+
+---
+🚀 Follow the Journey:
+📸 Instagram: [Link]
+🐦 Twitter/X: [Link]
+🎵 TikTok: [Link]
+
+---
+🎥 Chapters:
+0:00 Introduction 🎬
+1:30 The {adjective} Discovery 🔍
+3:45 The Turning Point ⚡
+6:20 The {adjective} Conclusion 🏆
+9:00 Final Thoughts 💭
 
 ##{tags_line}
 
----
-📧 Business: contact@example.com
-⏰ New videos every week!
-
-{ai_disclosure}
+{ai_disclosure} 🤖
 """
 
     AI_DISCLOSURE = "This video contains AI-generated content. Character imagery and animations were created using artificial intelligence."
@@ -355,6 +406,7 @@ class DescriptionGenerator:
             hook=hook,
             main_content=script_summary,
             niche=niche.replace("_", " ").title(),
+            adjective=random.choice(TitleGenerator.ADJECTIVES),
             tags_line=tags_line,
             ai_disclosure=self.AI_DISCLOSURE if include_ai_disclosure else ""
         )
@@ -512,6 +564,59 @@ class YouTubeSEO:
                 output_path=output_path
             )
         
+        return SEOResult(
+            title=title,
+            description=description,
+            tags=tags,
+            thumbnail_path=thumbnail_path
+        )
+
+    async def optimize_with_llm(
+        self,
+        script_text: str,
+        topic: str,
+        niche: str,
+        background_image: Optional[Path] = None,
+        character_image: Optional[Path] = None,
+        output_dir: Optional[Path] = None
+    ) -> SEOResult:
+        """
+        Generate SEO package using Hugging Face LLM.
+        """
+        from .script_generator import ScriptGenerator
+        llm = ScriptGenerator()
+        
+        # Generate metadata using LLM
+        logger.info(f"🤖 Generating LLM SEO for: {topic}")
+        seo_data = await llm.generate_viral_seo(script_text, topic, niche)
+        
+        title = seo_data.get("title", f"{topic}! 🔥")
+        description = seo_data.get("description", f"A deep dive into {topic}.")
+        tags = seo_data.get("tags", [topic, niche])
+        
+        # Add AI Disclosure to description
+        from .youtube_seo import DescriptionGenerator
+        if "containsSyntheticMedia" not in description:
+            description += f"\n\n{DescriptionGenerator.AI_DISCLOSURE}"
+            
+        # Generate thumbnail using standard generator (image-based)
+        thumbnail_path = None
+        if background_image and Path(background_image).exists():
+            output_path = None
+            if output_dir:
+                output_path = output_dir / f"thumbnail_{topic.replace(' ', '_')[:20]}.jpg"
+            
+            # Use title words for thumbnail hook
+            thumbnail_text = title.split('!')[0].split('(')[0].strip().upper()[:25]
+            
+            thumbnail_path = self.thumbnail_generator.generate(
+                background_image=background_image,
+                title_text=thumbnail_text,
+                character_image=character_image,
+                emoji=random.choice(["🔥", "✨", "🎯", "💥"]),
+                output_path=output_path
+            )
+            
         return SEOResult(
             title=title,
             description=description,

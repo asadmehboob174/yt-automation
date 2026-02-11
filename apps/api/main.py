@@ -589,9 +589,25 @@ async def generate_breakdown(request: GenerateBreakdownRequest):
         is_manual = any(marker in narrative_upper for marker in structure_markers)
         
         # USER REQUEST: Directly use Hugging Face LLM to parse the script (Skip Regex)
+        # USER REQUEST: Directly use Hugging Face LLM to parse the script (Skip Regex)
         if is_manual:
             print(f"ℹ️ Structured Script Detected! Directly using LLM extraction...")
-            breakdown = await generator.parse_manual_script_llm(request.story_narrative)
+            try:
+                # 1. Try Hugging Face
+                breakdown = await generator.parse_manual_script_llm(request.story_narrative)
+            except Exception as e_hf:
+                print(f"⚠️ Hugging Face Extraction Failed: {e_hf}")
+                
+                try:
+                    # 2. Try Gemini Fallback
+                    print(f"ℹ️ Attempting Gemini Fallback...")
+                    breakdown = await generator.parse_manual_script_gemini(request.story_narrative)
+                except Exception as e_gemini:
+                    print(f"⚠️ Gemini Extraction Failed: {e_gemini}")
+                    
+                    # 3. Fallback to Regex Parser
+                    print(f"ℹ️ Falling back to Regex Parser...")
+                    breakdown = generator.parse_manual_script(request.story_narrative)
         else:
             print(f"⚠️ No known structure markers found. Attempting LLM extraction as fallback...")
             try:
@@ -1279,6 +1295,8 @@ class GenerateVideoRequest(BaseModel):
     dialogue: Optional[str] = None
     camera_angle: Optional[str] = None
     is_shorts: Optional[bool] = False
+    sound_effect: Optional[str] = None
+    emotion: Optional[str] = None
 
 
 @app.post("/scenes/generate-video")
@@ -1318,34 +1336,65 @@ async def generate_video(request: GenerateVideoRequest):
                 image_path = Path(tmp.name)
         
         try:
-            # Use GrokAnimator to generate video
-            # Determine aspect ratio based on video type
+            # Determine aspect ratio
             aspect_ratio = "9:16" if request.is_shorts else "16:9"
             print(f"   📐 Aspect Ratio: {aspect_ratio} (shorts={request.is_shorts})")
             
+            from services.grok_agent import GrokAnimator, ModerationError
             animator = GrokAnimator()
-            video_path = await animator.animate(
-                image_path=image_path,
-                motion_prompt=request.prompt,
-                style_suffix="Cinematic, Pixar-style 3D animation",
-                duration=10,
-                camera_angle=request.camera_angle or "Medium Shot",
-                aspect_ratio=aspect_ratio,
-                dialogue=request.dialogue
-            )
+            from services.script_generator import ScriptGenerator
+            gen = ScriptGenerator()
             
-            # Read video and upload to R2
+            async def generate_and_verify(prompt: str) -> Path:
+                """Inner helper to generate and immediately verify integrity."""
+                path = await animator.animate(
+                    image_path=image_path,
+                    motion_prompt=prompt,
+                    style_suffix="Cinematic, Pixar-style 3D animation",
+                    duration=10,
+                    camera_angle=request.camera_angle or "Medium Shot",
+                    aspect_ratio=aspect_ratio,
+                    dialogue=request.dialogue,
+                    sound_effect=request.sound_effect,
+                    emotion=request.emotion or "neutrally"
+                )
+                # Strict Integrity check
+                file_size = os.path.getsize(path)
+                is_html = False
+                if file_size > 0:
+                    with open(path, "rb") as f:
+                        head = f.read(200)
+                        if b"<!DOCTYPE html>" in head or b"<html" in head:
+                            is_html = True
+                            
+                if is_html or file_size < 100000:
+                    print(f"❌ Corrupt Result! Size: {file_size}, HTML: {is_html}")
+                    if path.exists(): os.unlink(path)
+                    raise ModerationError(f"Generated video is content-moderated or corrupt HTML ({file_size} bytes).")
+                return path
+
+            try:
+                # ATTEMPT 1
+                video_path = await generate_and_verify(request.prompt)
+            except ModerationError as e:
+                # AUTO-HEAL
+                print(f"🛑 Moderation/Error detected. Attempting AI rewrite & retry...")
+                new_prompt = await gen.rewrite_moderated_prompt(request.prompt)
+                
+                if new_prompt != request.prompt:
+                    print(f"🔄 Retrying with sanitized prompt: {new_prompt}")
+                    # ATTEMPT 2 (Final Retry)
+                    video_path = await generate_and_verify(new_prompt)
+                else:
+                    raise e # Give up if rewrite failed
+            except Exception as e:
+                print(f"❌ Critical error in animation flow: {e}")
+                raise e
+                
+            # --- Success Path: Upload ---
             storage = R2Storage()
             video_key = f"videos/{request.niche_id}/scene_{request.scene_index}_{uuid.uuid4().hex[:8]}.mp4"
             
-            # Validate Video Size before upload
-            file_size = os.path.getsize(video_path)
-            if file_size < 10000: # < 10KB is definitely suspicious for a video
-                # Read head to see if it's an error message
-                with open(video_path, "rb") as f:
-                    head = f.read(100)
-                raise ValueError(f"Generated video is too small ({file_size} bytes). Head: {head}")
-
             with open(video_path, "rb") as f:
                 video_bytes = f.read()
             
@@ -1353,7 +1402,6 @@ async def generate_video(request: GenerateVideoRequest):
             video_url = storage.get_url(video_key)
             
             print(f"✅ Video generated and uploaded: {video_url}")
-            
             return {"videoUrl": video_url}
             
         finally:
@@ -1375,6 +1423,14 @@ async def generate_video(request: GenerateVideoRequest):
         import traceback
         traceback.print_exc()
         print(f"❌ Error generating video: {e}")
+        
+        # Check for specific ModerationError from grok_agent
+        from services.grok_agent import ModerationError
+        if isinstance(e, HTTPException): # If it's already an HTTPException, re-raise it
+            raise e
+        elif isinstance(e, ModerationError):
+            raise HTTPException(status_code=403, detail=str(e))
+            
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1391,6 +1447,9 @@ class StitchVideosRequest(BaseModel):
     music_mood: Optional[str] = None  # Legacy/alternative field
     is_shorts: bool = False # Explicit aspect ratio control
     script: Optional[str] = None # Full script for AI context
+    auto_upload: bool = False # 1-Click Automation: Upload to YouTube
+    thumbnail_url: Optional[str] = None # Thumbnail to set if auto_upload is True
+    video_id: Optional[str] = None # Database ID for the video job (to allow easy repair)
 
 @app.post("/videos/stitch")
 async def stitch_videos(request: StitchVideosRequest):
@@ -1466,26 +1525,26 @@ async def stitch_videos(request: StitchVideosRequest):
         
         for i, clip_path in enumerate(local_clips):
             is_valid = False
+            head = b""
+            size = -1
             try:
-                # Check size first
-                if clip_path.stat().st_size < 1000: # < 1KB is definitely wrong
-                     print(f"   ❌ Clip {i} {clip_path.name} is too small ({clip_path.stat().st_size} bytes)")
+                size = clip_path.stat().st_size
+                with open(clip_path, "rb") as f:
+                    head = f.read(200)
+                
+                # 1. HTML HEAD CHECK (Critical)
+                if b"<!DOCTYPE html>" in head or b"<html" in head:
+                     print(f"   ❌ Clip {i} {clip_path.name} is HTML content (Corrupt)!")
+                # 2. SIZE CHECK
+                elif size < 50000: # 50KB is very small for an mp4
+                     print(f"   ❌ Clip {i} {clip_path.name} is too small ({size} bytes)")
                 else:
-                    # Check with ffprobe
+                    # 3. FFPROBE CHECK
                     ffprobe_lib.probe(str(clip_path))
                     is_valid = True
             except Exception as e:
-                # Get detailed info about the corrupt file
-                size = -1
-                head = b""
-                try:
-                    size = clip_path.stat().st_size
-                    with open(clip_path, "rb") as f:
-                        head = f.read(100)
-                except: pass
-                
-                print(f"   ❌ Clip {i} {clip_path.name} is invalid/corrupt: {e}")
-                print(f"      Size: {size} bytes. Head: {head}")
+                print(f"   ❌ Clip {i} {clip_path.name} validation failed: {e}")
+                print(f"      Size: {size} bytes. Head: {head[:50]}...")
             
             if not is_valid:
                 corrupt_indices.append(i)
@@ -1504,6 +1563,7 @@ async def stitch_videos(request: StitchVideosRequest):
                 content={
                     "detail": "Corrupt video clips detected",
                     "code": "CORRUPT_CLIPS",
+                    "video_id": request.video_id, # Include video_id if available for repair
                     "corrupt_indices": corrupt_indices,
                     "corrupt_urls": corrupt_urls
                 }
@@ -1660,22 +1720,69 @@ async def stitch_videos(request: StitchVideosRequest):
         
         print(f"✅ Final video uploaded: {final_url}")
 
+        # --- AUTO-UPLOAD TO YOUTUBE (1-Click Automation) ---
+        youtube_info = None
+        if request.auto_upload:
+            print(f"🚀 1-Click Automation: Triggering YouTube Upload...")
+            try:
+                from services.youtube_uploader import YouTubeUploader
+                uploader = YouTubeUploader(niche_id=request.niche_id)
+                
+                # Use request metadata
+                final_title = request.title
+                final_desc = request.script or f"Narrative for {request.title}"
+                final_tags = ["AI Video", "Shorts", "Automation"]
+                
+                # Trigger upload logic (blocking for simplicity in stitch endpoint)
+                result = uploader.upload_with_copyright_check(
+                    video_path=final_path,
+                    title=final_title,
+                    description=final_desc,
+                    tags=final_tags,
+                    wait_minutes=1, # Very short wait for 1-click feedback
+                    promote_to="unlisted" # Safety first
+                )
+                
+                # Set Thumbnail if available
+                if request.thumbnail_url and result.video_id:
+                    # Download thumb to temp file
+                    import httpx
+                    async with httpx.AsyncClient() as client:
+                        resp_thumb = await client.get(request.thumbnail_url)
+                        if resp_thumb.status_code == 200:
+                            thumb_path = temp_dir / "automation_thumbnail.jpg"
+                            thumb_path.write_bytes(resp_thumb.content)
+                            uploader.set_thumbnail(result.video_id, thumb_path)
+                
+                youtube_info = {
+                    "video_id": result.video_id,
+                    "status": result.status,
+                    "message": result.message
+                }
+                print(f"✅ 1-Click Upload Success: {result.video_id}")
+            except Exception as e:
+                print(f"⚠️ 1-Click Upload Failed: {e}")
+                youtube_info = {"error": str(e)}
         # Upload separate music track for debugging
         music_url = None
         if music_path:
-            music_key = f"music/{request.niche_id}/{safe_title}_bgm_{uuid.uuid4().hex[:8]}.wav"
-            with open(music_path, "rb") as f:
-                music_bytes = f.read()
-            storage.upload_asset(music_bytes, music_key, content_type="audio/wav")
-            music_url = storage.get_url(music_key)
-            print(f"✅ Music track uploaded: {music_url}")
-        
+            try:
+                music_key = f"music/{request.niche_id}/{safe_title}_bgm_{uuid.uuid4().hex[:8]}.wav"
+                with open(music_path, "rb") as f:
+                    music_bytes = f.read()
+                storage.upload_asset(music_bytes, music_key, content_type="audio/wav")
+                music_url = storage.get_url(music_key)
+                print(f"✅ Music track uploaded: {music_url}")
+            except Exception as e:
+                print(f"⚠️ Music track upload failed: {e}")
+
         return {
             "status": "success",
             "final_video_url": final_url,
             "final_video_key": final_key,
             "music_url": music_url,
-            "clips_stitched": len(local_clips)
+            "clips_stitched": len(local_clips),
+            "youtube_upload": youtube_info
         }
         
     finally:
@@ -1885,6 +1992,56 @@ async def trigger_video_upload(video_id: str):
     return {"status": "upload_queued", "message": "Upload workflow started"}
 
 
+@app.post("/videos/{video_id}/repair")
+async def repair_video_job(video_id: str):
+    """
+    Manually trigger the 'Self-Healing' repair flow for a video job.
+    This will:
+    1. Scan R2 for existing clips.
+    2. Deep check them for corruption (HTML).
+    3. Re-animate ONLY the missing or corrupt scenes.
+    """
+    video = await db.video.find_unique(where={"id": video_id})
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+        
+    import json
+    script_data = json.loads(video.script)
+    
+    # Trigger generation workflow again with same data
+    # The new Deep Integrity Check in video_workflow.py will handle the selective repair
+    from services.inngest_client import inngest_client
+    from inngest import Event
+    
+    # Get channel config from DB helper
+    channel_data = await get_channel_config(script_data['niche_id'])
+    
+    event = Event(
+        name="video/generation.started",
+        data={
+            "video_id": video.id,
+            "script": script_data,
+            "channel_config": channel_data,
+            "resume_from_checkpoint": {
+                "completed_steps": ["scene_images"], # Assume images are fine, start at animation
+                "partial_results": {
+                    "scene_images": [f"scenes/{script_data['niche_id']}/scene_{i:03d}.png" for i in range(len(script_data['scenes']))]
+                }
+            }
+        }
+    )
+    
+    await inngest_client.send(event)
+    
+    # Update status to PROCESSING
+    await db.video.update(
+        where={"id": video.id},
+        data={"status": "REPAIRING"}
+    )
+    
+    return {"status": "repair_started", "message": f"Repair flow started for {video_id}. Checking integrity..."}
+
+
 class YouTubeUploadRequest(BaseModel):
     video_url: str
     niche_id: str
@@ -1946,7 +2103,7 @@ async def upload_to_youtube(request: YouTubeUploadRequest):
                     print(f"🖼️ Downloading thumbnail: {request.thumbnail_url}")
                     resp_thumb = await client.get(request.thumbnail_url, follow_redirects=True)
                     if resp_thumb.status_code == 200:
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp_thumb:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_thumb:
                             tmp_thumb.write(resp_thumb.content)
                             thumb_path = Path(tmp_thumb.name)
                             print(f"✅ Downloaded thumbnail to {thumb_path}")

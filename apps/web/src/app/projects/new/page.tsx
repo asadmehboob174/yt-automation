@@ -110,6 +110,7 @@ function Step1Script() {
     const [scriptTab, setScriptTab] = useState<'ai' | 'manual'>('manual');
     const [manualScript, setManualScript] = useState('');
     const [isGenerating, setIsGenerating] = useState(false);
+    const [autoUpload, setAutoUpload] = useState(true); // Default to True
 
     const { data: channelsData } = useQuery({
         queryKey: ['channels'],
@@ -204,9 +205,21 @@ function Step1Script() {
             return;
         }
 
-        const result = await startAutomation(manualScript, channelId, format);
+        const result = await startAutomation(manualScript, channelId, format, autoUpload);
         if (result) {
             toast.success('Video generation complete!');
+        }
+    };
+
+    const handleOneClickNoYouTube = async () => {
+        if (!channelId || !manualScript) {
+            toast.error('Please select a channel and paste your script');
+            return;
+        }
+
+        const result = await startAutomation(manualScript, channelId, format, false);
+        if (result) {
+            toast.success('Video generation complete (without YouTube upload)!');
         }
     };
 
@@ -317,6 +330,18 @@ Dialogue: "Where am I?"`}
                             )}
                             1-Click Automation
                         </Button>
+                        <Button
+                            variant="outline"
+                            onClick={handleOneClickNoYouTube}
+                            disabled={isRunning || !channelId || !manualScript}
+                        >
+                            {isRunning ? (
+                                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                            ) : (
+                                <Film className="mr-2 h-4 w-4" />
+                            )}
+                            1-Click (No YouTube)
+                        </Button>
                     </div>
                 </TabsContent>
 
@@ -340,6 +365,21 @@ Dialogue: "Where am I?"`}
                     </Button>
                 </TabsContent>
             </Tabs>
+
+            {/* Automation Options */}
+            <div className="flex items-center space-x-2 pt-2">
+                <input
+                    type="checkbox"
+                    id="autoUpload"
+                    checked={autoUpload}
+                    onChange={(e) => setAutoUpload(e.target.checked)}
+                    className="h-4 w-4 rounded border-gray-300 text-primary focus:ring-primary"
+                />
+                <Label htmlFor="autoUpload" className="text-sm font-medium cursor-pointer">
+                    Auto-upload to YouTube (Unlisted)
+                </Label>
+                <Badge variant="outline" className="text-[10px] ml-2">PRO</Badge>
+            </div>
 
             {/* Automation Progress */}
             {isRunning && (

@@ -22,7 +22,7 @@ interface AutomationState {
     cancelled: boolean;
 
     // Actions
-    startAutomation: (script: string, channelId: string, format: 'short' | 'long') => Promise<string | null>;
+    startAutomation: (script: string, channelId: string, format: 'short' | 'long', autoUpload?: boolean) => Promise<string | null>;
     cancelAutomation: () => void;
     updateStep: (index: number, status: AutomationStepStatus, message?: string) => void;
     updateProgress: (action: string) => void;
@@ -74,7 +74,7 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
         });
     },
 
-    startAutomation: async (script, channelId, format) => {
+    startAutomation: async (script, channelId, format, autoUpload = false) => {
         const { updateStep, updateProgress, reset } = get();
         reset();
         set({ isRunning: true, cancelled: false });
@@ -377,13 +377,15 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
             updateStep(6, 'running');
             updateProgress('Stitching all videos together...');
 
-            const finalVideo = await api.post<{ final_video_url: string }>('/videos/stitch', {
+            const finalVideo = await api.post<{ final_video_url: string, youtube_upload?: any }>('/videos/stitch', {
                 video_urls: finalVideoUrls,
                 niche_id: channelId,
                 title: breakdown.title || 'Untitled Video',
                 music: recommendedMood, // Pass the AI recommended mood
                 is_shorts: format === 'short',
                 script: scriptContent, // Pass full script for context
+                auto_upload: autoUpload,
+                thumbnail_url: useProjectStore.getState().thumbnailUrl,
             });
             updateStep(6, 'done');
 

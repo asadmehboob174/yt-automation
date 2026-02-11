@@ -1,0 +1,43 @@
+﻿Environment variables loaded from .env
+Prisma schema loaded from prisma\schema.prisma
+node.exe : Error: 
+At C:\nvm4w\nodejs\npx.ps1:29 
+char:3
++   & $NODE_EXE $NPX_CLI_JS $args
++   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          :     
+NotSpecified: (Error: :Str    ing) 
+[], RemoteException
+    + FullyQualifiedErrorId :     
+NativeCommandError
+ 
+Γ£ö Generated Prisma Client 
+(v5.22.0) to 
+.\node_modules\@prisma\client in 
+67ms
+
+1 validation error for PythonData
+  Value error, Prisma Client 
+Python expected Prisma version: 393
+aa359c9ad4a4bb28630fb5613f9c281cde0
+53 but got: 605197351a3c8bdd595af2d
+2a9bc3025bca48ea2
+  If this is intentional, set the 
+PRISMA_PY_DEBUG_GENERATOR 
+environment variable to 1 and try 
+again.
+  If you are using the Node CLI 
+then you must switch to v5.17.0, 
+e.g. npx prisma@5.17.0 generate
+  or generate the client using the 
+Python CLI, e.g. python3 -m prisma 
+generate [type=value_error, 
+input_value={'datamodel': 
+'generator 
+...y-engine-windows.exe'}}}, 
+input_type=dict]
+    For further information visit h
+ttps://errors.pydantic.dev/2.12/v/v
+alue_error
+
+
