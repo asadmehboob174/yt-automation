@@ -24,6 +24,7 @@ class SceneOutput(BaseModel):
     dialogue: Optional[str] = None
     character_name: str = "Character"
     emotion: str = "neutrally"
+    sfx: str = ""
 
     def get_full_image_prompt(self, style_suffix: str = "") -> str:
         """Combine fields for a complete image generation prompt."""
@@ -60,6 +61,7 @@ class SceneBreakdown(BaseModel):
     duration_in_seconds: int = 10
     camera_angle: str = "medium shot"
     dialogue: Optional[str] = None
+    sfx: str = ""
     imageUrl: Optional[str] = None
     videoUrl: Optional[str] = None
 
@@ -133,6 +135,7 @@ Return ONLY valid JSON in this exact format:
       "camera_angle": "medium shot",
       "motion_description": "Movement...",
       "dialogue": null,
+      "sfx": "Environment/Sound effects...",
       "character_name": "Character",
       "emotion": "neutrally"
     }}
@@ -145,59 +148,119 @@ Return ONLY valid JSON in this exact format:
 Generate exactly {scene_count} scenes adhering to the structure above.
 """
 
-    async def _call_llm(self, prompt: str, gemini_model: str = "gemini-flash-latest", json_mode: bool = False) -> str:
-        """LLM CALLS DISABLED BY USER REQUEST"""
-        print("\n LLM INTEGRATION IS CURRENTLY DISABLED (COMMENTED OUT)")
-        raise ValueError("AI generation is disabled. Please use 'Manual Script' mode.")
+    async def _call_gemini(self, prompt: str, temperature: float = 0.7) -> str:
+        """Call Google Gemini 1.5 Flash API."""
+        if not self.gemini_key:
+            raise ValueError("GEMINI_API_KEY environment variable is required")
 
-    # [COMMENTED OUT] async def _call_gemini(self, prompt: str, ...
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={self.gemini_key}"
+        
+        payload = {
+            "contents": [{
+                "parts": [{"text": prompt}]
+            }],
+            "generationConfig": {
+                "temperature": temperature,
+                "maxOutputTokens": 8192,
+            }
+        }
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            max_retries = 6
+            for attempt in range(max_retries):
+                try:
+                    response = await client.post(url, json=payload)
+                    
+                    if response.status_code == 429:
+                        wait_time = 10 * (attempt + 1)
+                        print(f"⚠️ Gemini Rate Limit (429). Waiting {wait_time}s...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                        
+                    if response.status_code != 200:
+                        print(f"❌ Gemini Error ({response.status_code}): {response.text}")
+                        if response.status_code >= 500:
+                            # Server error, retry
+                            await asyncio.sleep(5)
+                            continue
+                        response.raise_for_status()
+                        
+                    result = response.json()
+                    
+                    if "candidates" in result and result["candidates"]:
+                        candidate = result["candidates"][0]
+                        if "content" in candidate and "parts" in candidate["content"]:
+                            return candidate["content"]["parts"][0]["text"]
+                    
+                    if "promptFeedback" in result:
+                        block_reason = result["promptFeedback"].get("blockReason")
+                        if block_reason:
+                            raise ValueError(f"Gemini blocked prompt: {block_reason}")
+                    
+                    return ""
+                except Exception as e:
+                    print(f"❌ Gemini API Error (Attempt {attempt+1}): {e}")
+                    if attempt == max_retries - 1:
+                        raise ValueError(f"Gemini API failed after {max_retries} attempts: {e}")
+                    await asyncio.sleep(5)
+            
+            raise ValueError("Gemini API failed: No response after retries.")
+
     async def _call_huggingface(self, prompt: str, max_tokens: int = 16384, timeout: float = 120.0, retries: int = 3) -> str:
-        """Call HuggingFace Inference API."""
-        async with self._call_semaphore:
-            now = asyncio.get_event_loop().time()
-            time_since_last = now - self._last_call_time
-            if time_since_last < self._min_interval:
-                await asyncio.sleep(self._min_interval - time_since_last)
-            
-            headers = {
-                "Authorization": f"Bearer {self.hf_token}",
-                "Content-Type": "application/json"
-            }
-            
-            payload = {
-                "model": self.HF_MODEL,
-                "messages": [
-                    {"role": "system", "content": "You are a helpful assistant that outputs only valid JSON."},
-                    {"role": "user", "content": prompt}
-                ],
-                "max_tokens": max_tokens,
-                "temperature": 0.7,
-                "stream": False
-            }
-            
-            print(f"🤖 Calling HuggingFace ({self.HF_MODEL})...")
-            
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                for attempt in range(retries):
-                    try:
+        """
+        Call HuggingFace Inference API with fallback to Gemini.
+        """
+        headers = {
+            "Authorization": f"Bearer {self.hf_token}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": self.HF_MODEL,
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant that outputs only valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            "max_tokens": max_tokens,
+            "temperature": 0.7,
+            "stream": False
+        }
+        
+        print(f"🤖 Calling HuggingFace ({self.HF_MODEL})...")
+        
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            for attempt in range(retries):
+                try:
+                    # Enforce rate limit
+                    current_time = asyncio.get_event_loop().time()
+                    time_since_last = current_time - self._last_call_time
+                    if time_since_last < self._min_interval:
+                        await asyncio.sleep(self._min_interval - time_since_last)
+                        
+                    async with self._call_semaphore:
                         resp = await client.post(self.HF_API, json=payload, headers=headers)
                         
                         if resp.status_code == 429:
                             wait_time = 5 * (attempt + 1)
-                            print(f"⚠️ Rate limited. Waiting {wait_time}s...")
+                            print(f"⚠️ HuggingFace Rate Limit. Waiting {wait_time}s...")
                             await asyncio.sleep(wait_time)
                             continue
+                            
+                        # If 403/404/410/500 -> Fail fast to trigger fallback
+                        if resp.status_code in [401, 403, 404, 410, 500, 502, 503, 504]:
+                            print(f"⚠️ HuggingFace Error ({resp.status_code}): {resp.text}")
+                            raise ValueError(f"HF Error {resp.status_code}")
                             
                         resp.raise_for_status()
                         result = resp.json()
                         self._last_call_time = asyncio.get_event_loop().time()
                         return result['choices'][0]['message']['content']
-                        
-                    except Exception as e:
-                        print(f"⚠️ HF Call failed (Attempt {attempt+1}/{retries}): {e}")
-                        if attempt == retries - 1:
-                            raise e
-                        await asyncio.sleep(2)
+                    
+                except Exception as e:
+                    print(f"⚠️ HF Call failed (Attempt {attempt+1}/{retries}): {e}")
+                    if attempt == retries - 1:
+                        raise e
+                    await asyncio.sleep(2)
             return ""
 
     async def generate(
@@ -206,19 +269,33 @@ Generate exactly {scene_count} scenes adhering to the structure above.
         niche_style: str,
         scene_count: int = 10
     ) -> VideoScriptOutput:
-        """Generate a video script for the given topic."""
+        """Generate a video script for the given topic using Gemini."""
         prompt = self._build_prompt(topic, niche_style, scene_count)
         
-        # text = await self._call_llm(prompt)
-        raise ValueError("AI generation is disabled. Please use 'Manual Script' mode.")
+        # Try Hugging Face first
+        try:
+            text = await self._call_huggingface(prompt)
+        except Exception as e:
+            print(f"⚠️ HuggingFace failed: {e}. Falling back to Gemini...")
+            text = await self._call_gemini(prompt)
         
+        # Extract JSON
         if "```json" in text:
             text = text.split("```json")[1].split("```")[0]
         elif "```" in text:
             text = text.split("```")[1].split("```")[0]
             
-        script_data = json.loads(text.strip())
-        return VideoScriptOutput(**script_data)
+        # Clean text
+        text = self._clean_json_text(text)
+            
+        try:
+            script_data = json.loads(text.strip())
+            return VideoScriptOutput(**script_data)
+        except json.JSONDecodeError:
+            # Try repair
+            text = self._repair_truncated_json(text)
+            script_data = json.loads(text)
+            return VideoScriptOutput(**script_data)
 
     async def generate_story_narrative(
         self,
@@ -252,11 +329,13 @@ TONE:
 - Write in flowing paragraphs (NOT a scene breakdown yet).
 - Length: Approximately {scene_count * 2} to {scene_count * 3} paragraphs.
 
-Output ONLY the story narrative, no headers or metadata."""
+        Output ONLY the story narrative, no headers or metadata."""
 
-        # text = await self._call_llm(prompt)
-        # return text.strip()
-        raise ValueError("AI generation is disabled. Please use 'Manual Script' mode.")
+        try:
+            return await self._call_huggingface(prompt, max_tokens=2048)
+        except Exception as e:
+            print(f"⚠️ HuggingFace failed: {e}. Falling back to Gemini...")
+            return await self._call_gemini(prompt, temperature=0.8)
 
     def _repair_truncated_json(self, text: str) -> str:
         """Force-closes truncated JSON by finding the last bracket/brace and adding the remainder."""
@@ -389,7 +468,7 @@ Output ONLY the story narrative, no headers or metadata."""
         # This is a complex multi-pass repair.
         fields = ["name", "prompt", "text_to_image_prompt", "image_to_video_prompt", 
                   "dialogue", "scene_title", "voiceover_text", "character_pose_prompt",
-                  "background_description", "motion_description", "duration_in_seconds", "camera_angle"]
+                  "background_description", "motion_description", "duration_in_seconds", "camera_angle", "sfx"]
         
         # We search for "field": "VALUE" where VALUE might contain " that should be escaped.
         # We look ahead for the next field name to know where the current value ends.
@@ -449,6 +528,7 @@ Create a structured breakdown with:
    - text_to_image_prompt: FULL detailed description for image generation.
    - image_to_video_prompt: Dynamic movement for Grok (1-2 sentences).
    - motion_description: Concise instruction (e.g. "Pan right").
+   - sfx: Description of sound effects (e.g. "Birds chirping", "Heavy rain").
    - duration_in_seconds: 5-10.
    - camera_angle: "wide", "medium", "close-up", etc.
    - dialogue: '[CHARACTER]: (emotion) "Speech"'. Use null if no dialogue.
@@ -471,6 +551,7 @@ Return ONLY valid JSON in this exact format:
       "background_description": "...",
       "image_to_video_prompt": "...",
       "motion_description": "...",
+      "sfx": "...",
       "duration_in_seconds": 10,
       "camera_angle": "medium",
       "dialogue": null
@@ -546,7 +627,7 @@ Return ONLY valid JSON.
                 return f'{prefix}{value_fixed}{suffix}'
             
             for field in ["dialogue", "prompt", "text_to_image_prompt", "image_to_video_prompt", 
-                         "scene_title", "name"]:
+                         "scene_title", "name", "sfx"]:
                 repaired = re.sub(
                     rf'("{field}":\s*")(.+?)("(?=\s*[,}}\n]))',
                     fix_internal_quotes,
@@ -569,7 +650,7 @@ Return ONLY valid JSON.
         The LLM is designed to be FULLY FORMAT-AGNOSTIC - it should understand
         ANY reasonable script format without requiring specific labels.
         """
-        print("📝 Manual Extraction: Using Hugging Face LLM (Intelligent Parser)...")
+        print("📝 Manual Extraction: Using Gemini 2.0 Flash (Intelligent Parser)...")
         
         prompt = f"""You are an expert script analyst and AI video production assistant. Your job is to intelligently extract structured data from ANY movie/video script format, regardless of how it's formatted.
 
@@ -601,6 +682,7 @@ Find EVERY scene in the script. Scenes can be labeled as:
 - "Scene 1", "SCENE 1:", "Scene 1:", etc.
 - "Shot 1", "Panel 1", "Frame 1"
 - Or just numbered sections
+- Or implicit scene changes based on location headings (e.g., "INT. KITCHEN - DAY")
 
 For EACH scene, you MUST extract these fields SEPARATELY:
 
@@ -608,7 +690,8 @@ For EACH scene, you MUST extract these fields SEPARATELY:
 |-------|------------------|----------|
 | **text_to_image_prompt** | Visual/image description | "Text to Image Prompt:", "Visual:", "Image:", "Setting:", "Description:" |
 | **image_to_video_prompt** | Motion/animation description | "Text to Video Prompt:", "Motion:", "Animation:", "Action:", "Movement:" |
-| **dialogue** | Speech, audio, sound effects | "Dialog:", "Dialogue:", "Audio:", "Voiceover:", "VO:", "SFX:", "(spoken)" |
+| **sfx** | Sound effects description | "SFX:", "Sound Effects:", "Audio Cues:", "Sound:" |
+| **dialogue** | Speech, audio, voiceover | "Dialog:", "Dialogue:", "Audio:", "Voiceover:", "VO:", "(spoken)" |
 | **camera_angle** | Shot type/camera info | "Shot Type:", "Short Type:", "Shot:", "Camera:", "Angle:", or embedded like "Medium shot of..." |
 
 CRITICAL RULES FOR SCENE EXTRACTION:
@@ -635,7 +718,8 @@ Return ONLY this JSON structure, nothing else:
       "scene_title": "Scene title if any",
       "text_to_image_prompt": "ONLY the visual/image description",
       "image_to_video_prompt": "ONLY the motion/animation description", 
-      "dialogue": "Speech, voiceover, or audio cues",
+      "sfx": "Description of sound effects",
+      "dialogue": "Speech or voiceover text",
       "camera_angle": "Wide Shot, Medium Shot, Close-up, etc.",
       "voiceover_text": "Same as dialogue",
       "motion_description": "Same as image_to_video_prompt",
@@ -654,7 +738,12 @@ Return ONLY this JSON structure, nothing else:
 - Preserve original text exactly as written
 """
         try:
-            text = await self._call_huggingface(prompt, max_tokens=16384)
+            try:
+                text = await self._call_huggingface(prompt, max_tokens=16384)
+            except Exception as e:
+                print(f"⚠️ HuggingFace failed: {e}. Falling back to Gemini...")
+                text = await self._call_gemini(prompt, temperature=0.2)
+            
             print(f"DEBUG: LLM Response (First 4000 chars):\n{text[:4000]}...")
             
             # Robust JSON extraction and cleaning
@@ -718,7 +807,7 @@ Return ONLY this JSON structure, nothing else:
                     # Fallback: Try the simple regex method as a Hail Mary
                     try:
                         simple_repair = clean_text
-                        for field in ["dialogue", "prompt", "text_to_image_prompt", "image_to_video_prompt", "scene_title", "name"]:
+                        for field in ["dialogue", "prompt", "text_to_image_prompt", "image_to_video_prompt", "scene_title", "name", "sfx"]:
                             simple_repair = re.sub(
                                 rf'("{field}":\s*")(.+?)("(?=\s*[,}}\n]))',
                                 lambda m: f'{m.group(1)}{m.group(2).replace('"', '\\"')}{m.group(3)}',

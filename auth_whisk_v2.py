@@ -1,10 +1,10 @@
 
 import asyncio
 from playwright.async_api import async_playwright
-import os
+from pathlib import Path
 
 async def main():
-    profile_dir = r"C:\Users\pc\.whisk-profile"
+    profile_dir = Path.home() / ".whisk-profile"
     print(f"🚀 Launching browser for manual login...")
     print(f"📁 Profile: {profile_dir}")
     

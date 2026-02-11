@@ -61,6 +61,7 @@ class PromptBuilder:
         style_suffix: str,
         motion_description: str,
         dialogue: Optional[str] = None,
+        sfx: Optional[str] = None,
         character_name: str = "Character",
         emotion: str = "neutrally"
     ) -> str:
@@ -98,7 +99,15 @@ class PromptBuilder:
         if camera_angle:
             prompt_parts.append(f"\nShot: {camera_angle}")
             
-        # Part D: Style (Optional, sometimes better to keep hidden or append at end)
+        # Part D: Sound Effects (New)
+        if sfx and sfx.strip():
+            # Only add header if it looks like a description, otherwise just the text
+            if "Sound" in sfx or "SFX" in sfx:
+                prompt_parts.append("\n" + sfx.strip())
+            else:
+                prompt_parts.append(f"\nSound Effects: {sfx.strip()}")
+
+        # Part E: Style (Optional)
         if style_suffix:
             prompt_parts.append(f"\nStyle: {style_suffix}")
             
@@ -350,6 +359,7 @@ async def generate_single_clip(
     style_suffix: str,
     motion_description: str,
     dialogue: Optional[str] = None,
+    sfx: Optional[str] = None,
     character_name: str = "Character",
     emotion: str = "neutrally",
     duration: str = "10s",
@@ -395,7 +405,7 @@ async def generate_single_clip(
         # Build 5-layer prompt
         prompt = PromptBuilder.build(
             character_pose, camera_angle, style_suffix,
-            motion_description, dialogue, character_name, emotion
+            motion_description, dialogue, sfx, character_name, emotion
         )
         logger.info(f"📝 Prompt: {prompt[:100]}...")
         
@@ -711,7 +721,8 @@ async def generate_single_clip(
             async def wait_for_video_element():
                 # Check for video tag or any of the known download buttons
                 selectors = ["video"] + download_selectors
-                for _ in range(60): # Check every 2s for 2 minutes
+                # INCREASED TIMEOUT: Check every 2s for 3 minutes (90 checks)
+                for _ in range(90): 
                     # Inject Preference Check
                     await check_and_handle_preference()
                     
@@ -781,9 +792,13 @@ async def generate_single_clip(
                         logger.info(f"✅ Successfully downloaded video using {selector}: {output}")
                         
                         # Verify it's actually a video (sometimes buttons trigger image downloads)
-                        if output.stat().st_size < 10000: # < 10KB is suspicious
-                            logger.warning("⚠️ Downloaded file is too small (might be a text error or thumbnail). Retrying...")
-                            continue
+                        try:
+                            file_size = output.stat().st_size
+                            if file_size < 50000: # < 50KB is suspicious (was 10KB)
+                                logger.warning(f"⚠️ Downloaded file too small ({file_size} bytes). Likely an error/thumbnail. Retrying...")
+                                continue
+                        except:
+                            pass
                             
                         button_download_success = True
                         return output
@@ -834,8 +849,18 @@ async def generate_single_clip(
                 logger.info("⬇️ Downloading video stream via Python (httpx)...")
                 import httpx
                 async with httpx.AsyncClient(verify=False) as client:
-                    response = await client.get(src, cookies=cookie_dict, headers=headers, follow_redirects=True, timeout=60.0)
+                    response = await client.get(src, cookies=cookie_dict, headers=headers, follow_redirects=True, timeout=90.0)
                     if response.status_code == 200:
+                        # VALIDATION: Check content type and size
+                        content_type = response.headers.get("content-type", "").lower()
+                        if "text" in content_type or "html" in content_type:
+                             logger.warning(f"⚠️ Direct download returned text/html (Alien File): {content_type}")
+                             raise ValueError("Downloaded content is not a video")
+                        
+                        if len(response.content) < 50000: # < 50KB
+                             logger.warning(f"⚠️ Direct download too small ({len(response.content)} bytes). Likely an error page.")
+                             raise ValueError("Downloaded file too small")
+
                         with open(output, "wb") as f:
                             f.write(response.content)
                         logger.info(f"✅ Downloaded video stream: {output} ({len(response.content)} bytes)")
@@ -1004,7 +1029,8 @@ class GrokAnimator:
         duration: int = 10,
         aspect_ratio: str = "9:16",
         camera_angle: str = "Medium shot",
-        dialogue: Optional[str] = None
+        dialogue: Optional[str] = None,
+        sfx: Optional[str] = None
     ) -> Path:
         """
         Animate an image using Grok Imagine.
@@ -1044,6 +1070,7 @@ class GrokAnimator:
                     duration=duration_str,
                     aspect=aspect_ratio,
                     dialogue=dialogue,
+                    sfx=sfx,
                     external_page=page # Pass the active page
                 )
                 

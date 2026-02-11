@@ -8,70 +8,83 @@ import sys
 async def main():
     profile_dir = Path.home() / ".grok-profile"
     
-    print("\n🧩 Grok Extension & Developer Mode")
+    print("\n🚀 Grok Authentication Setup")
     print("---------------------------------------")
-    print("Please provide the paths to your unpacked extensions (folders).")
-    print("Example: C:\\Users\\pc\\Downloads\\Ex 01, C:\\Users\\pc\\Downloads\\Ex 02")
+    print("Select an option:")
+    print("1. Direct Login (Quick - No Extensions)")
+    print("2. Developer Mode (Load Custom Extensions)")
     
-    paths_input = input("\nExtension Path(s): ").strip()
-    
-    extension_paths = []
-    if paths_input:
-        # Split by comma and clean up quotes/whitespace
-        raw_paths = [p.strip().replace('"', '') for p in paths_input.split(',')]
-        for p in raw_paths:
-            full_path = os.path.abspath(p)
-            if os.path.isdir(full_path):
-                extension_paths.append(full_path)
-            else:
-                print(f"⚠️ Warning: Path not found: {full_path}")
+    try:
+        choice = input("\nEnter choice [1 or 2, default 1]: ").strip() or "1"
+    except EOFError:
+        choice = "1"
 
-    print(f"\n🚀 Launching browser with DEVELOPER MODE active...")
-    print(f"📁 Profile: {profile_dir}")
-    
-    # Advanced flags to "un-crip" the browser for developers
+    extension_paths = []
     args = [
         "--start-maximized",
         "--disable-blink-features=AutomationControlled",
-        "--no-sandbox",
-        "--disable-infobars",
-        "--no-first-run",
-        "--enable-extension-apps",
-        "--allow-legacy-extension-manifests",
     ]
-    
-    if extension_paths:
-        print(f"✅ Auto-loading {len(extension_paths)} extension(s)...")
-        load_arg = ",".join(extension_paths)
-        args.append(f"--disable-extensions-except={load_arg}")
-        args.append(f"--load-extension={load_arg}")
 
+    if choice == "2":
+        print("\n🧩 Developer Mode - Extension Setup")
+        print("Please provide paths to your unpacked extensions (folders), separated by commas.")
+        try:
+            paths_input = input("Extension Path(s) [Press Enter to skip]: ").strip()
+        except EOFError:
+            paths_input = ""
+            
+        if paths_input:
+            raw_paths = [p.strip().replace('"', '') for p in paths_input.split(',')]
+            for p in raw_paths:
+                full_path = os.path.abspath(p)
+                if os.path.isdir(full_path):
+                    extension_paths.append(full_path)
+                else:
+                    print(f"⚠️ Warning: Path not found: {full_path}")
+
+        # Extra flags for developer mode with extensions
+        args.extend([
+            "--no-sandbox",
+            "--disable-infobars",
+            "--no-first-run",
+            "--enable-extension-apps",
+            "--allow-legacy-extension-manifests",
+        ])
+        
+        if extension_paths:
+            print(f"✅ Auto-loading {len(extension_paths)} extension(s)...")
+            load_arg = ",".join(extension_paths)
+            args.append(f"--disable-extensions-except={load_arg}")
+            args.append(f"--load-extension={load_arg}")
+    else:
+        print("\n⚡ Launching Direct Login mode...")
+
+    print(f"📁 Profile: {profile_dir}")
+    
     async with async_playwright() as p:
         context = await p.chromium.launch_persistent_context(
             user_data_dir=str(profile_dir),
             headless=False,
-            ignore_default_args=["--enable-automation"], # This helps keep Dev Mode stable
+            ignore_default_args=["--enable-automation"] if choice == "2" else None,
             args=args
         )
         
-        # Reuse the first page if it exists (persistent context often opens one)
-        if len(context.pages) > 0:
-            page = context.pages[0]
-        else:
-            page = await context.new_page()
+        # Reuse page or create new
+        page = context.pages[0] if context.pages else await context.new_page()
             
-        # Open extension management in a background tab just in case they need it
-        ext_page = await context.new_page()
-        await ext_page.goto("chrome://extensions/")
+        if choice == "2":
+            # Open extension management in a background tab
+            ext_page = await context.new_page()
+            await ext_page.goto("chrome://extensions/")
+            await page.bring_to_front()
         
-        # Go back to Grok
-        await page.bring_to_front()
         await page.goto("https://grok.com/imagine")
         
         print("\n" + "="*65)
-        print("🔓 DEVELOPER MODE: The browser is now open in developer-friendly mode.")
-        print("🛠️  Check the 'Extensions' tab to ensure your tools are ON.")
-        print("✅ Once ready, CLOSE THE BROWSER WINDOW to save the session.")
+        print("🔓 ACTION REQUIRED: Please log in to Grok in the browser window.")
+        if choice == "2":
+            print("🛠️  Check the 'Extensions' tab to ensure your tools are ON.")
+        print("✅ Once logged in, CLOSE THE BROWSER WINDOW to save the session.")
         print("="*65 + "\n")
         
         while True:

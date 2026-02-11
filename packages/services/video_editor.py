@@ -9,6 +9,7 @@ import logging
 import tempfile
 from pathlib import Path
 from typing import Optional
+import imageio
 
 logger = logging.getLogger(__name__)
 
@@ -82,8 +83,11 @@ class FFmpegVideoEditor:
         durations = []
         for clip in clip_paths:
             try:
-                probe = ffmpeg.probe(str(clip))
-                dur = float(probe['format']['duration'])
+                # REPLACEMENT: Use imageio instead of ffmpeg.probe (requires ffprobe)
+                with imageio.get_reader(clip, 'ffmpeg') as reader:
+                    meta = reader.get_meta_data()
+                    dur = meta.get('duration', 0)
+                    
                 valid_clips.append(clip)
                 durations.append(dur)
             except Exception as e:
@@ -112,11 +116,16 @@ class FFmpegVideoEditor:
                 f"[{i}:v]scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
                 f"crop={target_w}:{target_h},setsar=1[v{i}]"
             )
-            # Audio: assume exists, map [i:a] -> [a{i}]
-            # We must handle missing audio or mixed formats? 
-            # For simplicity, we assume inputs have audio. If not, 'anullsrc' is needed.
-            inputs_probe = ffmpeg.probe(str(clip))
-            has_audio = any(s['codec_type'] == 'audio' for s in inputs_probe['streams'])
+            # Audio check using imageio
+            has_audio = False
+            try:
+                with imageio.get_reader(clip, 'ffmpeg') as reader:
+                    meta = reader.get_meta_data()
+                    # imageio ffmpeg backend usually puts audio codec in 'audio_codec' if present
+                    if meta.get('audio_codec'):
+                        has_audio = True
+            except: pass
+
             if has_audio:
                 filter_parts.append(f"[{i}:a]aresample=44100[a{i}]")
             else:
@@ -343,8 +352,8 @@ class FFmpegVideoEditor:
         output_path = output_path or self.output_dir / "transition.mp4"
         
         # Get duration of first clip
-        probe = ffmpeg.probe(str(clip_a))
-        duration_a = float(probe['streams'][0]['duration'])
+        with imageio.get_reader(clip_a, 'ffmpeg') as reader:
+             duration_a = reader.get_meta_data().get('duration', 0)
         offset = duration_a - transition_duration
         
         (
@@ -384,8 +393,12 @@ class FFmpegVideoEditor:
         output_path = output_path or self.output_dir / "with_music.mp4"
         
         # Check if video has audio stream
-        probe = ffmpeg.probe(str(video_path))
-        has_audio = any(s['codec_type'] == 'audio' for s in probe['streams'])
+        has_audio = False
+        try:
+            with imageio.get_reader(video_path, 'ffmpeg') as reader:
+                if reader.get_meta_data().get('audio_codec'):
+                    has_audio = True
+        except: pass
         
         # Build command using subprocess for maximum control
         cmd = ['ffmpeg', '-y', '-i', str(video_path), '-i', str(music_path)]

@@ -14,6 +14,7 @@ from inngest import Inngest, Function, Context
 
 from .inngest_client import inngest_client
 from .cloud_storage import R2Storage
+from .email_service import email_service
 
 logger = logging.getLogger(__name__)
 
@@ -177,7 +178,20 @@ async def video_generation_workflow(ctx: Context) -> dict:
             })
         )
         
-        logger.info(f"✅ Video ready for review: {video_id}")
+        # Step 9: Send Email Notification (New)
+        # Sign the URL for the user
+        storage = R2Storage()
+        final_url = storage.get_url(final_video_key)
+        
+        await ctx.step.run(
+            "send-email-notification",
+            lambda: email_service.send_video_complete(
+                project_name=script.get("title", "Untitled Video"),
+                video_url=final_url
+            )
+        )
+        
+        logger.info(f"✅ Video ready for review and email sent: {video_id}")
         
         return {
             "video_id": video_id,
@@ -321,7 +335,9 @@ async def animate_scenes_with_grok(image_keys: list[str], script: dict) -> list[
         video_path = await animator.animate(
             image_path=local_image,
             motion_prompt=scene.get("motion_description", ""),
-            duration=scene.get("duration_in_seconds", 10)
+            duration=scene.get("duration_in_seconds", 10),
+            dialogue=scene.get("voiceover_text"), # Use voiceover_text as dialogue source
+            sfx=scene.get("sfx")
         )
         
         # Upload animated clip to R2

@@ -25,6 +25,41 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "../../.env"))
 # Add packages to path
 sys.path.insert(0, str(os.path.dirname(__file__) + "/../../packages"))
 
+# CUSTOM: Robust FFmpeg Setup for Windows
+try:
+    import imageio_ffmpeg
+    import shutil
+    
+    # 1. Get the source binary (likely named ffmpeg-win-x64-vX.X.exe)
+    src_ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    
+    # 2. Define a stable location for 'ffmpeg.exe'
+    # We use a 'bin' folder in the project root or venv
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) # apps/api -> apps -> root
+    bin_dir = os.path.join(base_dir, "..", ".venv", "bin") # Try venv bin first
+    
+    if not os.path.exists(bin_dir):
+        # Fallback to local bin if venv structure is different
+        bin_dir = os.path.join(base_dir, "..", "bin")
+        os.makedirs(bin_dir, exist_ok=True)
+        
+    dest_ffmpeg = os.path.join(bin_dir, "ffmpeg.exe")
+    
+    # 3. Copy if missing
+    if not os.path.exists(dest_ffmpeg):
+        print(f"🔧 FFmpeg not found at {dest_ffmpeg}. Copying from imageio...")
+        shutil.copy2(src_ffmpeg, dest_ffmpeg)
+        print("✅ FFmpeg binary copied successfully.")
+        
+    # 4. Add to PATH
+    os.environ["PATH"] += os.pathsep + bin_dir
+    print(f"🔧 Added FFmpeg bin to PATH: {bin_dir}")
+    
+except ImportError:
+    print("⚠️ imageio-ffmpeg not found. Ensure FFmpeg is installed system-wide.")
+except Exception as e:
+    print(f"⚠️ FFmpeg setup warning: {e}")
+
 from contextlib import asynccontextmanager
 from prisma import Prisma
 from services.cloud_storage import R2Storage
@@ -80,6 +115,7 @@ class Scene(BaseModel):
     character_name: str = "Character"
     emotion: str = "neutrally"
     characterId: Optional[str] = None # Support for multi-character cast
+    sfx: str = ""
     sfx_markers: list[SFXMarker] = []
 
 class VideoScript(BaseModel):
@@ -1204,6 +1240,7 @@ class GenerateVideoRequest(BaseModel):
     prompt: str
     niche_id: str
     dialogue: Optional[str] = None
+    sfx: Optional[str] = None
     camera_angle: Optional[str] = None
     is_shorts: Optional[bool] = False
 
@@ -1258,7 +1295,8 @@ async def generate_video(request: GenerateVideoRequest):
                 duration=10,
                 camera_angle=request.camera_angle or "Medium Shot",
                 aspect_ratio=aspect_ratio,
-                dialogue=request.dialogue
+                dialogue=request.dialogue,
+                sfx=request.sfx
             )
             
             # Read video and upload to R2
@@ -1387,7 +1425,7 @@ async def stitch_videos(request: StitchVideosRequest):
 
         # 1.5 Validate Clips (Check for corruption)
         print(f"🕵️ Validating {len(local_clips)} clips...")
-        import ffmpeg as ffprobe_lib
+        import imageio
         corrupt_indices = []
         corrupt_urls = []
         
@@ -1398,8 +1436,10 @@ async def stitch_videos(request: StitchVideosRequest):
                 if clip_path.stat().st_size < 1000: # < 1KB is definitely wrong
                      print(f"   ❌ Clip {i} {clip_path.name} is too small ({clip_path.stat().st_size} bytes)")
                 else:
-                    # Check with ffprobe
-                    ffprobe_lib.probe(str(clip_path))
+                    # Check with imageio (uses ffmpeg, not ffprobe)
+                    # Just trying to open it verifies the header
+                    with imageio.get_reader(clip_path, 'ffmpeg') as reader:
+                         meta = reader.get_meta_data()
                     is_valid = True
             except Exception as e:
                 # Get detailed info about the corrupt file
@@ -1495,9 +1535,9 @@ async def stitch_videos(request: StitchVideosRequest):
         
         # 3. Get video duration and generate background music
         print(f"🎵 Generating ambient background music...")
-        import ffmpeg as ffprobe_lib
-        probe = ffprobe_lib.probe(str(stitched_path))
-        video_duration = float(probe['streams'][0]['duration'])
+        import imageio
+        with imageio.get_reader(stitched_path, 'ffmpeg') as reader:
+             video_duration = reader.get_meta_data().get('duration', 0)
         
         from services.music_generator import generate_background_music
         from services.mood_analyzer import MoodAnalyzer
