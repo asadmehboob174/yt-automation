@@ -1,5 +1,7 @@
 import logging
 import httpx
+import os
+import asyncio
 import shutil
 import subprocess
 from pathlib import Path
@@ -240,3 +242,50 @@ class MusicLibrary:
 def generate_background_music(duration: float, mood: str = "calm") -> Path:
     lib = MusicLibrary()
     return lib.get_music_for_video(duration, mood)
+
+async def generate_music_with_ai(prompt: str, duration: int = 10) -> Optional[Path]:
+    """Generate custom music using AI (MusicGen)."""
+    try:
+        api_key = os.getenv("HUGGINGFACE_API_KEY")
+        if not api_key:
+            logger.warning("No HF API Key found. Skipping AI music generation.")
+            return None
+            
+        logger.info(f"🎵 Generating AI Music: '{prompt}' ({duration}s)...")
+        
+        # Using facebook/musicgen-small via HF Inference API
+        API_URL = "https://api-inference.huggingface.co/models/facebook/musicgen-small"
+        headers = {"Authorization": f"Bearer {api_key}"}
+        
+        # MusicGen API expects specific payload structure
+        payload = {"inputs": prompt}
+        
+        async with httpx.AsyncClient() as client:
+            # Increased timeout for audio generation
+            response = await client.post(API_URL, headers=headers, json=payload, timeout=120.0)
+            
+            if response.status_code != 200:
+                logger.error(f"HF MusicGen Error {response.status_code}: {response.text}")
+                return None
+                
+            # Response is binary audio
+            audio_bytes = response.content
+            
+        # Save to cache
+        # Use a safe filename based on prompt hash
+        import hashlib
+        prompt_hash = hashlib.md5(prompt.encode()).hexdigest()[:8]
+        filename = f"ai_music_{prompt_hash}_{duration}s.flac"
+        
+        cache_dir = Path("packages/services/assets/music/generated")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        file_path = cache_dir / filename
+        
+        file_path.write_bytes(audio_bytes)
+        logger.info(f"✅ AI Music Generated: {file_path}")
+        
+        return file_path
+        
+    except Exception as e:
+        logger.error(f"❌ AI Music Generation Failed: {e}")
+        return None

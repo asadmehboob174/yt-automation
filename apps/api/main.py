@@ -88,6 +88,8 @@ class VideoScript(BaseModel):
     description: str
     scenes: list[Scene]
     video_type: str = "story"  # "story" (Grok audio) or "documentary" (voiceover needed)
+    youtube_upload: Optional[dict] = None
+    final_assembly: Optional[dict] = None
 
 class JobStatus(BaseModel):
     job_id: str
@@ -571,54 +573,65 @@ async def generate_breakdown(request: GenerateBreakdownRequest):
     try:
         generator = ScriptGenerator()
         
-        # Check for ANY structured script markers (very flexible detection)
-        narrative_upper = request.story_narrative.upper()
-        
-        # Extended list of markers that indicate a structured storyboard/script
-        structure_markers = [
-            "CHARACTER MASTER PROMPTS", "MASTER CHARACTER", "CHARACTER BIOS",
-            "PART 1", "PART 2", "PART 3",
-            "STEP 1", "STEP 2", "STORYBOARD",
-            "SCENE 1", "SCENE 2", "SCENE:", 
-            "TEXT-TO-IMAGE PROMPT", "IMAGE-TO-VIDEO PROMPT",
-            "MASTER TEXT-TO-IMAGE", "TEXT TO IMAGE",
-            "DIALOGUE:", "SHOT:", "SHOT TYPE:",
-            "— MASTER", "- MASTER", "– MASTER",
-        ]
-        
-        is_manual = any(marker in narrative_upper for marker in structure_markers)
-        
-        # USER REQUEST: Directly use Hugging Face LLM to parse the script (Skip Regex)
-        # USER REQUEST: Directly use Hugging Face LLM to parse the script (Skip Regex)
-        if is_manual:
-            print(f"ℹ️ Structured Script Detected! Directly using LLM extraction...")
+        # 0. Check for JSON Script (Explicit Structure)
+        if request.story_narrative.strip().startswith("{"):
             try:
-                # 1. Try Hugging Face
-                breakdown = await generator.parse_manual_script_llm(request.story_narrative)
-            except Exception as e_hf:
-                print(f"⚠️ Hugging Face Extraction Failed: {e_hf}")
-                
-                try:
-                    # 2. Try Gemini Fallback
-                    print(f"ℹ️ Attempting Gemini Fallback...")
-                    breakdown = await generator.parse_manual_script_gemini(request.story_narrative)
-                except Exception as e_gemini:
-                    print(f"⚠️ Gemini Extraction Failed: {e_gemini}")
-                    
-                    # 3. Fallback to Regex Parser
-                    print(f"ℹ️ Falling back to Regex Parser...")
-                    breakdown = generator.parse_manual_script(request.story_narrative)
+                print("ℹ️ JSON Script detected. Attempting direct parse...")
+                breakdown = generator.parse_json_script(request.story_narrative)
+            except Exception as e:
+                print(f"⚠️ JSON parse failed: {e}. Falling back to standard detection.")
+                breakdown = None
         else:
-            print(f"⚠️ No known structure markers found. Attempting LLM extraction as fallback...")
-            try:
-                breakdown = await generator.parse_manual_script_llm(request.story_narrative)
-            except Exception as llm_error:
-                print(f"⚠️ LLM extraction failed: {llm_error}. Falling back to AI generation...")
-                breakdown = await generator.generate_technical_breakdown(
-                    story_narrative=request.story_narrative,
-                    scene_count=scene_count,
-                    style=channel.styleSuffix or "High-quality Pixar/Disney 3D Render"
-                )
+            breakdown = None
+
+        if not breakdown:
+            # Check for ANY structured script markers (very flexible detection)
+            narrative_upper = request.story_narrative.upper()
+            
+            # Extended list of markers that indicate a structured storyboard/script
+            structure_markers = [
+                "CHARACTER MASTER PROMPTS", "MASTER CHARACTER", "CHARACTER BIOS",
+                "PART 1", "PART 2", "PART 3",
+                "STEP 1", "STEP 2", "STORYBOARD",
+                "SCENE 1", "SCENE 2", "SCENE:", 
+                "TEXT-TO-IMAGE PROMPT", "IMAGE-TO-VIDEO PROMPT",
+                "MASTER TEXT-TO-IMAGE", "TEXT TO IMAGE",
+                "DIALOGUE:", "SHOT:", "SHOT TYPE:",
+                "— MASTER", "- MASTER", "– MASTER",
+            ]
+            
+            is_manual = any(marker in narrative_upper for marker in structure_markers)
+            
+            # USER REQUEST: Directly use Hugging Face LLM to parse the script (Skip Regex)
+            if is_manual:
+                print(f"ℹ️ Structured Script Detected! Directly using LLM extraction...")
+                try:
+                    # 1. Try Hugging Face
+                    breakdown = await generator.parse_manual_script_llm(request.story_narrative)
+                except Exception as e_hf:
+                    print(f"⚠️ Hugging Face Extraction Failed: {e_hf}")
+                    
+                    try:
+                        # 2. Try Gemini Fallback
+                        print(f"ℹ️ Attempting Gemini Fallback...")
+                        breakdown = await generator.parse_manual_script_gemini(request.story_narrative)
+                    except Exception as e_gemini:
+                        print(f"⚠️ Gemini Extraction Failed: {e_gemini}")
+                        
+                        # 3. Fallback to Regex Parser
+                        print(f"ℹ️ Falling back to Regex Parser...")
+                        breakdown = generator.parse_manual_script(request.story_narrative)
+            else:
+                print(f"⚠️ No known structure markers found. Attempting LLM extraction as fallback...")
+                try:
+                    breakdown = await generator.parse_manual_script_llm(request.story_narrative)
+                except Exception as llm_error:
+                    print(f"⚠️ LLM extraction failed: {llm_error}. Falling back to AI generation...")
+                    breakdown = await generator.generate_technical_breakdown(
+                        story_narrative=request.story_narrative,
+                        scene_count=scene_count,
+                        style=channel.styleSuffix or "High-quality Pixar/Disney 3D Render"
+                    )
         
         # Implement Thumbnail Prompt Generation
         thumbnail_prompt = await generator.generate_viral_thumbnail_prompt(request.story_narrative)
@@ -1289,14 +1302,29 @@ async def verify_video(request: VerifyVideoRequest):
 # Request model for video generation
 class GenerateVideoRequest(BaseModel):
     scene_index: int
-    image_url: str  # Updated to match frontend (snake_case)
-    prompt: str
+    image_url: str
+    prompt: str | dict | None = "" # Add default to prevent 422
     niche_id: str
-    dialogue: Optional[str] = None
-    camera_angle: Optional[str] = None
-    is_shorts: Optional[bool] = False
-    sound_effect: Optional[str] = None
-    emotion: Optional[str] = None
+    dialogue: str | dict | None = "" # Add default to prevent 422
+    camera_angle: str | dict | None = None
+    is_shorts: bool = False
+    sound_effect: str | list | None = None
+    emotion: str | None = None
+
+
+def smart_coerce(val: any) -> str:
+    """Extract actual text from potentially structured objects (dicts/lists)."""
+    if val is None: return ""
+    if isinstance(val, str): return val
+    if isinstance(val, dict):
+        # Common keys for dialogue/text
+        for key in ["text", "content", "dialogue", "prompt", "value"]:
+            if key in val and val[key]:
+                return str(val[key])
+        # Fallback: just use first value if possible
+        if val.values():
+            return str(list(val.values())[0])
+    return str(val)
 
 
 @app.post("/scenes/generate-video")
@@ -1305,6 +1333,16 @@ async def generate_video(request: GenerateVideoRequest):
     try:
         from services.grok_agent import GrokAnimator
         from services.cloud_storage import R2Storage
+        
+        # Coerce any non-string fields to strings carefully
+        request.prompt = smart_coerce(request.prompt)
+        request.dialogue = smart_coerce(request.dialogue)
+        request.camera_angle = smart_coerce(request.camera_angle)
+        
+        if isinstance(request.sound_effect, list):
+            request.sound_effect = ", ".join([str(s) for s in request.sound_effect])
+        else:
+            request.sound_effect = str(request.sound_effect) if request.sound_effect is not None else ""
         import httpx
         import tempfile
         import uuid
@@ -1340,7 +1378,7 @@ async def generate_video(request: GenerateVideoRequest):
             aspect_ratio = "9:16" if request.is_shorts else "16:9"
             print(f"   📐 Aspect Ratio: {aspect_ratio} (shorts={request.is_shorts})")
             
-            from services.grok_agent import GrokAnimator, ModerationError
+            from services.grok_agent import GrokAnimator, PromptBuilder, ModerationError
             animator = GrokAnimator()
             from services.script_generator import ScriptGenerator
             gen = ScriptGenerator()
@@ -1368,7 +1406,8 @@ async def generate_video(request: GenerateVideoRequest):
                             is_html = True
                             
                 if is_html or file_size < 100000:
-                    print(f"❌ Corrupt Result! Size: {file_size}, HTML: {is_html}")
+                    status_reason = "Grok Moderation (HTML Error Page)" if is_html else f"Corrupt/Too Small ({file_size}b)"
+                    print(f"⚠️ {status_reason} detected. Grok refused the prompt.")
                     if path.exists(): os.unlink(path)
                     raise ModerationError(f"Generated video is content-moderated or corrupt HTML ({file_size} bytes).")
                 return path
@@ -1376,21 +1415,38 @@ async def generate_video(request: GenerateVideoRequest):
             try:
                 # ATTEMPT 1
                 video_path = await generate_and_verify(request.prompt)
+                sent_prompt = request.prompt
             except ModerationError as e:
                 # AUTO-HEAL
-                print(f"🛑 Moderation/Error detected. Attempting AI rewrite & retry...")
+                print(f"🛡️ Safety System: Moderation detected. Attempting to sanitize and rewrite prompt...")
                 new_prompt = await gen.rewrite_moderated_prompt(request.prompt)
                 
                 if new_prompt != request.prompt:
-                    print(f"🔄 Retrying with sanitized prompt: {new_prompt}")
+                    print(f"♻️ Retrying with 'Safe Mode' prompt: {new_prompt}")
                     # ATTEMPT 2 (Final Retry)
                     video_path = await generate_and_verify(new_prompt)
+                    sent_prompt = new_prompt
                 else:
+                    print("❌ Safety System: Rewrite failed or returned identical prompt. Giving up.")
                     raise e # Give up if rewrite failed
             except Exception as e:
                 print(f"❌ Critical error in animation flow: {e}")
                 raise e
-                
+            
+            # Recalculate formatted prompt based on what was ACTUALLY sent (if it was rewritten)
+            # or just use the PromptBuilder to get the final "Director's Script" version of whatever we sent
+            formatted_prompt = PromptBuilder.build(
+                character_pose="",
+                camera_angle=request.camera_angle or "",
+                style_suffix="",
+                motion_description=sent_prompt if isinstance(sent_prompt, str) else "",
+                dialogue=request.dialogue,
+                character_name="Character",
+                emotion=request.emotion or "neutrally",
+                grok_video_prompt=sent_prompt if isinstance(sent_prompt, dict) else None,
+                sfx=request.sound_effect.split(", ") if isinstance(request.sound_effect, str) else request.sound_effect
+            )
+
             # --- Success Path: Upload ---
             storage = R2Storage()
             video_key = f"videos/{request.niche_id}/scene_{request.scene_index}_{uuid.uuid4().hex[:8]}.mp4"
@@ -1402,7 +1458,7 @@ async def generate_video(request: GenerateVideoRequest):
             video_url = storage.get_url(video_key)
             
             print(f"✅ Video generated and uploaded: {video_url}")
-            return {"videoUrl": video_url}
+            return {"videoUrl": video_url, "formattedPrompt": formatted_prompt}
             
         finally:
             # Clean up temp image and local video
@@ -1450,6 +1506,8 @@ class StitchVideosRequest(BaseModel):
     auto_upload: bool = False # 1-Click Automation: Upload to YouTube
     thumbnail_url: Optional[str] = None # Thumbnail to set if auto_upload is True
     video_id: Optional[str] = None # Database ID for the video job (to allow easy repair)
+    youtube_upload: Optional[dict] = None
+    final_assembly: Optional[dict] = None
 
 @app.post("/videos/stitch")
 async def stitch_videos(request: StitchVideosRequest):
@@ -1626,10 +1684,24 @@ async def stitch_videos(request: StitchVideosRequest):
         )
         print(f"   ✅ Stitched video created: {stitched_path}")
         
+        current_video_path = stitched_path
+        
+        # --- FINAL ASSEMBLY (Color Grading) ---
+        if request.final_assembly and request.final_assembly.get("color_grading"):
+            print(f"🎨 Applying Color Grading...")
+            try:
+                grading_config = request.final_assembly["color_grading"]
+                graded_path = temp_dir / "graded_video.mp4"
+                editor.apply_color_grading(current_video_path, grading_config, graded_path)
+                current_video_path = graded_path
+                print(f"   ✅ Color grading applied.")
+            except Exception as e:
+                print(f"   ⚠️ Color grading failed: {e}")
+
         # 3. Get video duration and generate background music
         print(f"🎵 Generating ambient background music...")
         import ffmpeg as ffprobe_lib
-        probe = ffprobe_lib.probe(str(stitched_path))
+        probe = ffprobe_lib.probe(str(current_video_path))
         video_duration = float(probe['streams'][0]['duration'])
         
         from services.music_generator import generate_background_music
@@ -1700,12 +1772,12 @@ async def stitch_videos(request: StitchVideosRequest):
         
         if music_path:
             print(f"🔊 Mixing background music at 30% volume...")
-            editor.add_background_music(stitched_path, music_path, final_path, music_volume=0.30)
+            editor.add_background_music(current_video_path, music_path, final_path, music_volume=0.30)
             print(f"   ✅ Background music mixed")
         else:
             print(f"   ℹ️ No background music to mix. Using original video.")
             import shutil
-            shutil.copy(stitched_path, final_path)
+            shutil.copy(current_video_path, final_path)
         
         # 5. Upload to R2
         storage = R2Storage()
@@ -1728,10 +1800,16 @@ async def stitch_videos(request: StitchVideosRequest):
                 from services.youtube_uploader import YouTubeUploader
                 uploader = YouTubeUploader(niche_id=request.niche_id)
                 
-                # Use request metadata
-                final_title = request.title
-                final_desc = request.script or f"Narrative for {request.title}"
-                final_tags = ["AI Video", "Shorts", "Automation"]
+                # Use request metadata with fallback
+                yt_meta = request.youtube_upload.get("metadata", {}) if request.youtube_upload else {}
+                
+                final_title = yt_meta.get("title") or request.title
+                final_desc = yt_meta.get("description") or request.script or f"Narrative for {request.title}"
+                final_tags = yt_meta.get("tags") or ["AI Video", "Shorts", "Automation"]
+                privacy_status = yt_meta.get("privacyStatus", "unlisted")
+                publish_at = yt_meta.get("publishAt")
+                made_for_kids = yt_meta.get("madeForKids", False)
+                playlist_name = yt_meta.get("playlistTitle")
                 
                 # Trigger upload logic (blocking for simplicity in stitch endpoint)
                 result = uploader.upload_with_copyright_check(
@@ -1739,8 +1817,11 @@ async def stitch_videos(request: StitchVideosRequest):
                     title=final_title,
                     description=final_desc,
                     tags=final_tags,
-                    wait_minutes=1, # Very short wait for 1-click feedback
-                    promote_to="unlisted" # Safety first
+                    privacy_status=privacy_status,
+                    publish_at=publish_at,
+                    made_for_kids=made_for_kids,
+                    playlist_name=playlist_name,
+                    wait_minutes=1 # Very short wait for 1-click feedback
                 )
                 
                 # Set Thumbnail if available

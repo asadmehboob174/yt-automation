@@ -152,3 +152,89 @@ class AudioEngine:
             return self.mix_with_sidechain_compression(
                 narration_path, music_path, output_path, music_volume
             )
+    def construct_dynamic_soundtrack(
+        self,
+        track_segments: list[dict],
+        total_duration: float,
+        output_path: Optional[Path] = None,
+        crossfade_duration: float = 3.0
+    ) -> Path:
+        """
+        Construct a continuous soundtrack from segments.
+        track_segments: [{'path': Path, 'duration': float}] (ordered by time)
+        """
+        output_path = output_path or self.output_dir / "dynamic_soundtrack.mp3"
+        
+        if not track_segments:
+             raise ValueError("No track segments provided")
+        
+        # 1. Prepare each segment (loop if needed, trim to duration)
+        processed_segments = []
+        for i, seg in enumerate(track_segments):
+            seg_path = seg['path']
+            target_dur = seg['duration']
+            
+            # Ensure file exists
+            if not Path(seg_path).exists():
+                logger.warning(f"⚠️ Music segment missing: {seg_path}")
+                continue
+                
+            temp_seg = self.output_dir / f"seg_{i}.mp3"
+            
+            # Loop and Trim
+            # -stream_loop -1 loops infinitely
+            # -t trims to target duration
+            cmd = [
+                "ffmpeg", "-y",
+                "-stream_loop", "-1",
+                "-i", str(seg_path),
+                "-t", str(target_dur),
+                "-c:a", "libmp3lame",
+                str(temp_seg)
+            ]
+            try:
+                subprocess.run(cmd, check=True, capture_output=True)
+                processed_segments.append(temp_seg)
+            except subprocess.CalledProcessError as e:
+                logger.error(f"❌ Failed to process segment {i}: {e}")
+                
+        if not processed_segments:
+            raise ValueError("No valid music segments created")
+
+        # 2. Stitch with crossfades
+        # [0][1]acrossfade=d=3[a01];[a01][2]acrossfade=d=3[out]
+        
+        if len(processed_segments) == 1:
+            import shutil
+            shutil.copy(processed_segments[0], output_path)
+            logger.info(f"✅ Created single-track soundtrack -> {output_path.name}")
+            return output_path
+            
+        inputs = []
+        filter_parts = []
+        last_label = "[0]"
+        
+        for i in range(len(processed_segments)):
+            inputs.extend(["-i", str(processed_segments[i])])
+            
+        for i in range(len(processed_segments) - 1):
+            next_label = f"[{i+1}]"
+            out_label = f"[af{i+1}]" if i < len(processed_segments) - 2 else "[out]"
+            
+            # Only crossfade if duration allows
+            filter_parts.append(f"{last_label}{next_label}acrossfade=d={crossfade_duration}:c1=tri:c2=tri{out_label}")
+            last_label = out_label
+            
+        filter_str = ";".join(filter_parts)
+        
+        cmd = ["ffmpeg", "-y"] + inputs + [
+            "-filter_complex", filter_str,
+            "-map", "[out]",
+            "-c:a", "libmp3lame",
+            str(output_path)
+        ]
+        
+        subprocess.run(cmd, check=True, capture_output=True)
+        logger.info(f"✅ Created dynamic soundtrack ({len(processed_segments)} segments) -> {output_path.name}")
+        
+        return output_path

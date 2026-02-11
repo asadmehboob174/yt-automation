@@ -65,62 +65,99 @@ class PromptBuilder:
         camera_angle: str,
         style_suffix: str,
         motion_description: str,
-        dialogue: Optional[str] = None,
+        dialogue: Optional[str | dict] = None,
         sound_effect: Optional[str] = None,
         character_name: str = "Character",
-        emotion: str = "neutrally"
+        emotion: str = "neutrally",
+        grok_video_prompt: Optional[dict] = None,
+        sfx: Optional[list[str]] = None,
+        music_notes: Optional[str] = None
     ) -> str:
         """
-        Builds the prompt in the optimal 'Motion First' format.
-        
-        Format:
-        [Motion Description]
-        
-        Dialogue ([Character]): "[Text]"
-        Sound Effect: [SFX]
-        Emotion: [Emotion]
-        Shot: [Camera Angle]
-        [Style Suffix]
+        Builds the prompt in the "Director's Script" format for Grok Imagine 1.0.
+        Format: [Timeline Actions] + AUDIO: [Character] (Tone): "Text" + SFX: [Effects]
         """
-        # 1. Motion is King (First for strongest adherence)
-        # If motion_description is "clean", use it. If it looks like it already has headers, use it as is?
-        # Assuming we will clean up the input source, so we trust motion_description here.
         
-        prompt_parts = []
-        
-        # Part A: Motion
-        if motion_description:
-            prompt_parts.append(motion_description.strip())
+        def format_timeline(text: str) -> str:
+            """Converts shorthand (0-2s) or [0-2s] to strict [00:00–00:02] format."""
+            import re
             
-        # Part B: Dialogue
-        if dialogue and dialogue.strip():
-            # Format: Dialogue (Character): "Line"
-            # If dialogue string already contains "Dialogue (X):", just add it.
-            # Otherwise format it.
-            if "Dialogue" in dialogue:
-                prompt_parts.append("\n" + dialogue.strip())
+            # Pattern for (0-2s), [0-2], (2:4), etc.
+            pattern = r'[\(\[]([0-9]+)[\-–:]([0-9]+)s?[\)\]]'
+            
+            def replacer(match):
+                start = int(match.group(1))
+                end = int(match.group(2))
+                return f"[{start // 60:02d}:{start % 60:02d}–{end // 60:02d}:{end % 60:02d}]"
+                
+            return re.sub(pattern, replacer, text)
+
+        # 1. Base Motion / Timeline
+        base_prompt = ""
+        if grok_video_prompt and grok_video_prompt.get("full_prompt"):
+            base_prompt = grok_video_prompt["full_prompt"]
+        else:
+            prompt_parts = []
+            motion_core = motion_description
+            if grok_video_prompt:
+                if grok_video_prompt.get("main_action"):
+                    motion_core = grok_video_prompt["main_action"]
+                    if grok_video_prompt.get("character_animation"):
+                        motion_core += f" {grok_video_prompt['character_animation']}"
+            
+            if motion_core: prompt_parts.append(motion_core.strip())
+            if camera_angle: prompt_parts.append(f"Shot: {camera_angle}")
+            if emotion and emotion.lower() != "neutrally": prompt_parts.append(f"Emotion: {emotion}")
+            if style_suffix: prompt_parts.append(f"Style: {style_suffix}")
+            base_prompt = ". ".join(prompt_parts)
+
+        # Apply timeline formatting to the base prompt
+        base_prompt = format_timeline(base_prompt)
+        
+        # 2. Synchronized AUDIO
+        audio_block = ""
+        if dialogue:
+            tone = f"({emotion})" if emotion and emotion.lower() != "neutrally" else "(Natural)"
+            
+            if isinstance(dialogue, dict):
+                audio_parts = []
+                for char, text in dialogue.items():
+                    audio_parts.append(f'[{char.upper()}] {tone}: "{text.strip()}"')
+                audio_block = " AUDIO: " + " ".join(audio_parts)
             else:
-                 prompt_parts.append(f'\nDialogue ({character_name}): "{dialogue.strip()}"')
+                d_str = str(dialogue).strip()
+                if "AUDIO:" not in base_prompt and "Dialogue" not in base_prompt:
+                    # Clean up existing character names if present in string like "BOY: Hello"
+                    match = re.search(r'^([^:]+):\s*"?(.+?)"?$', d_str)
+                    if match:
+                        char, text = match.groups()
+                        audio_block = f' AUDIO: [{char.upper()}] {tone}: "{text}"'
+                    else:
+                        audio_block = f' AUDIO: [{character_name.upper()}] {tone}: "{d_str}"'
 
-        # Part C: Sound Effect (New)
-        if sound_effect and sound_effect.strip():
-            prompt_parts.append(f"\nSound Effect: {sound_effect.strip()}")
-            
-        # Part D: Emotion (New)
-        if emotion and emotion.strip() and emotion.lower() != "neutrally":
-            prompt_parts.append(f"\nEmotion: {emotion.strip()}")
+        # 3. Layered SFX
+        sfx_block = ""
+        all_sfx = []
+        if sound_effect: all_sfx.append(sound_effect)
+        if sfx: all_sfx.extend(sfx)
+        
+        if all_sfx:
+            unique_sfx = list(dict.fromkeys([s for s in all_sfx if s]))
+            sfx_str = ", ".join(unique_sfx)
+            if "SFX:" not in base_prompt and "Sound Effect" not in base_prompt:
+                sfx_block = f" SFX: {sfx_str}."
 
-        # Part E: Camera Angle
-        if camera_angle:
-            prompt_parts.append(f"\nShot: {camera_angle}")
-            
-        # Part F: Style (Optional, sometimes better to keep hidden or append at end)
-        if style_suffix:
-            # Check if style suffix is already partially in motion prompt
-            if style_suffix.lower() not in motion_description.lower():
-                prompt_parts.append(f"\nStyle: {style_suffix}")
-            
-        return "\n".join(prompt_parts)
+        # Final assembly
+        final_prompt = base_prompt.strip()
+        if audio_block: final_prompt += audio_block
+        if sfx_block: final_prompt += sfx_block
+        
+        # Ensure it starts with the duration if not present (e.g. "6s: ")
+        if not re.search(r'^[0-9]+s:', final_prompt):
+             duration_prefix = "6s: " # Default to 6s for Grok Imagine
+             final_prompt = duration_prefix + final_prompt
+
+        return final_prompt
 
 
 # ============================================
@@ -140,8 +177,8 @@ class URLListener:
         async def wait_for_new_url():
             while True:
                 current_url = page.url
-                # Grok post URLs contain /post/ or /status/
-                if current_url != original_url and ("/post/" in current_url or "/status/" in current_url):
+                # Grok URLs can be /post/, /status/, or /project/ after generation
+                if current_url != original_url and any(x in current_url for x in ["/post/", "/status/", "/project/"]):
                     return current_url
                 await asyncio.sleep(0.5)
         
@@ -169,31 +206,35 @@ class VideoSettings:
     ASPECT_SELECTORS = {
         "9:16": [
             "button[aria-label='9:16']",
+            "button[aria-label*='Vertical']",
+            "button[aria-label*='Portrait']",
             "[aria-label='9:16']",
             "button:has-text('9:16')",
             "button:has-text('Vertical')",
             "button:has-text('Portrait')",
             ".aspect-vertical",
+            "button:has-text('9')", # Partial match fallback
+            "svg:has-text('9:16')", # Sometimes it's an SVG text
+            "button:has(svg[aria-label='9:16'])",
         ],
         "16:9": [
             "button[aria-label='16:9']",
+            "button[aria-label*='Landscape']",
+            "button[aria-label*='Horizontal']",
             "[aria-label='16:9']",
             "button:has-text('16:9')",
             "button:has-text('Landscape')",
             "button:has-text('Horizontal')",
             ".aspect-landscape",
-        ],
-        "2:3": [
-            "button[aria-label='2:3']",
-            "[aria-label='2:3']",
-        ],
-        "3:2": [
-            "button[aria-label='3:2']",
-            "[aria-label='3:2']",
+            "button:has-text('16')", # Partial match fallback
+            "svg:has-text('16:9')",
+            "button:has(svg[aria-label='16:9'])",
         ],
         "1:1": [
             "button[aria-label='1:1']",
+            "button[aria-label*='Square']",
             "[aria-label='1:1']",
+            "button:has-text('1:1')",
             "button:has-text('Square')",
         ],
     }
@@ -233,22 +274,93 @@ class VideoSettings:
                 continue
         
         if not aspect_clicked:
+            # Attempt to find "Settings" or "Options" button which might hide the controls
+            logger.info("🔍 Aspect buttons not visible, checking for Settings/Options toggle...")
+            settings_selectors = [
+                 "button[aria-label='Settings']",
+                 "button[aria-label='Options']",
+                 "button[aria-label='Video settings']",
+                 "button[aria-label='Settings toggle']",
+                 "button:has-text('Settings')",
+                 "button:has-text('Options')",
+                 "[data-testid='settings-button']",
+                 # New: Ellipsis button is often used for options
+                 "button:has(svg.lucide-ellipsis)",
+                 "button:has(svg.lucide-more-horizontal)",
+                 "button:has(.lucide-settings)",
+                 "button svg:has-text('...')",
+                 ".lucide-more-vertical",
+                 # The 'Film' icon button sometimes holds the aspect ratio
+                 "button:has(svg path[d*='M2 6a2 2 0 0 1 2-2h16'])" # Common film icon path
+            ]
+            
+            settings_toggled = False
+            for sel in settings_selectors:
+                try:
+                    # Look for settings buttons that are NOT in the sidebar (aria-label='Options' is repeated in sidebar)
+                    locators = page.locator(sel)
+                    count = await locators.count()
+                    for i in range(count):
+                        btn = locators.nth(i)
+                        
+                        # Heuristic: main content buttons are usually below the fold or have specific parents
+                        # For now, let's try to click ANY that isn't obviously a sidebar item
+                        classes = await btn.get_attribute("class") or ""
+                        if "sidebar" in classes.lower() or "menu" in classes.lower():
+                            continue
+                            
+                        # Attempt to click even if Playwright thinks it's not visible
+                        try:
+                            await btn.click(timeout=1500)
+                            settings_toggled = True
+                            logger.info(f"📂 Toggled Settings/Options menu via: {sel} (item {i})")
+                        except:
+                            # Use a separate string to avoid backslash in f-string braces
+                            js_selector = sel.replace("'", "\\'")
+                            await page.evaluate(f"document.querySelectorAll('{js_selector}')[{i}].click()")
+                            settings_toggled = True
+                            logger.info(f"📂 JS-Toggled Settings/Options menu via: {sel} (item {i})")
+                        
+                        if settings_toggled:
+                            await asyncio.sleep(1.5) # Wait for animation
+                            break
+                    if settings_toggled: break
+                except: continue
+
+            if settings_toggled:
+                # Retry aspect selection
+                for selector in cls.ASPECT_SELECTORS.get(aspect, []):
+                    try:
+                        btn = page.locator(selector)
+                        if await btn.count() > 0 and await btn.is_visible():
+                            await btn.first.click()
+                            logger.info(f"✅ Set aspect ratio (after toggle): {aspect}")
+                            aspect_clicked = True
+                            break
+                    except Exception:
+                        continue
+            
+        if not aspect_clicked:
             # ====== AGGRESSIVE DEBUG: Dump ALL buttons to terminal ======
             print(f"\n{'='*60}")
             print(f"⚠️ ASPECT RATIO BUTTON NOT FOUND: {aspect}")
             print(f"{'='*60}")
             try:
-                buttons = await page.locator("button").all()
-                print(f"Total buttons on page: {len(buttons)}")
-                for i, b in enumerate(buttons[:30]):
-                    try:
-                        label = await b.get_attribute("aria-label") or ""
-                        text = (await b.text_content() or "").strip()[:80]
-                        visible = await b.is_visible()
-                        classes = await b.get_attribute("class") or ""
-                        print(f"  Button[{i}]: aria='{label}' text='{text}' visible={visible} class='{classes[:60]}'")
-                    except:
-                        print(f"  Button[{i}]: <error reading>")
+                # Only dump if page is still open
+                if not page.is_closed():
+                    buttons = await page.locator("button").all()
+                    print(f"Total buttons on page: {len(buttons)}")
+                    for i, b in enumerate(buttons[:30]):
+                        try:
+                            label = await b.get_attribute("aria-label") or ""
+                            text = (await b.text_content() or "").strip()[:80]
+                            visible = await b.is_visible()
+                            classes = await b.get_attribute("class") or ""
+                            print(f"  Button[{i}]: aria='{label}' text='{text}' visible={visible} class='{classes[:60]}'")
+                        except:
+                            print(f"  Button[{i}]: <error reading>")
+                else:
+                    print("  (Page closed, cannot dump buttons)")
             except Exception as e:
                 print(f"  Error listing buttons: {e}")
             print(f"{'='*60}\n")
@@ -257,24 +369,25 @@ class VideoSettings:
             # Look for any button whose text or aria-label contains the aspect ratio number
             aspect_numbers = aspect.replace(":", "")  # "916" or "169"
             try:
-                all_btns = await page.locator("button").all()
-                for btn in all_btns:
-                    try:
-                        label = (await btn.get_attribute("aria-label") or "").lower()
-                        text = (await btn.text_content() or "").lower().strip()
-                        # Match on various formats: "9:16", "9/16", "916", "vertical", "portrait"
-                        targets = [aspect.lower(), aspect_numbers, "vertical" if aspect == "9:16" else "landscape"]
-                        for target in targets:
-                            if target in label or target in text:
-                                if await btn.is_visible():
-                                    await btn.click()
-                                    print(f"✅ [LAST RESORT] Set aspect ratio via button text/label match: '{target}' in '{text or label}'")
-                                    aspect_clicked = True
-                                    break
-                        if aspect_clicked:
-                            break
-                    except:
-                        continue
+                if not page.is_closed():
+                    all_btns = await page.locator("button").all()
+                    for btn in all_btns:
+                        try:
+                            label = (await btn.get_attribute("aria-label") or "").lower()
+                            text = (await btn.text_content() or "").lower().strip()
+                            # Match on various formats: "9:16", "9/16", "916", "vertical", "portrait"
+                            targets = [aspect.lower(), aspect_numbers, "vertical" if aspect == "9:16" else "landscape"]
+                            for target in targets:
+                                if target in label or target in text:
+                                    if await btn.is_visible():
+                                        await btn.click()
+                                        print(f"✅ [LAST RESORT] Set aspect ratio via button text/label match: '{target}' in '{text or label}'")
+                                        aspect_clicked = True
+                                        break
+                            if aspect_clicked:
+                                break
+                        except:
+                            continue
             except Exception as e:
                 print(f"  Last resort search failed: {e}")
             
@@ -282,8 +395,9 @@ class VideoSettings:
                 # Save a diagnostic screenshot
                 try:
                     screenshot_path = Path(os.getcwd()) / f"grok_error_{random.randint(1000,99999)}.png"
-                    await page.screenshot(path=str(screenshot_path))
-                    print(f"📸 Diagnostic screenshot saved: {screenshot_path}")
+                    if not page.is_closed():
+                        await page.screenshot(path=str(screenshot_path))
+                        print(f"📸 Diagnostic screenshot saved: {screenshot_path}")
                 except:
                     pass
                 logger.warning(f"⚠️ Could not find aspect ratio button for {aspect}.")
@@ -389,7 +503,8 @@ async def get_browser_context(playwright: any) -> BrowserContext:
                 headless=False,
                 accept_downloads=True,
                 ignore_default_args=["--enable-automation"],
-                args=args
+                args=args,
+                viewport={'width': 1100, 'height': 800}
             )
         except Exception as e:
             error_msg = str(e).lower()
@@ -425,7 +540,10 @@ async def generate_single_clip(
     emotion: str = "neutrally",
     duration: str = "10s",
     aspect: str = "9:16",
-    external_page: Optional[Page] = None
+    external_page: Optional[Page] = None,
+    grok_video_prompt: Optional[dict] = None,
+    sfx: Optional[list[str]] = None,
+    music_notes: Optional[str] = None
 ) -> Path:
     browser = None
     pw = None
@@ -466,13 +584,35 @@ async def generate_single_clip(
             if await check_rate_limit(page):
                 raise RateLimitError("Rate limit detected")
 
+            # Check for "Start a conversation" or "Project" dashboard that blocks Imagine
+            if await page.locator("text='Start a conversation in this project'").count() > 0 or "/project/" in page.url:
+                logger.warning("📍 Detected Project Dashboard instead of Imagine view. Attempting to force Imagine mode...")
+                
+                # Check for "Imagine" sidebar item first as it's more reliable than goto
+                sidebar_imagine = page.locator("a[aria-label='Imagine'], button:has-text('Imagine'), a:has-text('Imagine')").first
+                if await sidebar_imagine.count() > 0 and await sidebar_imagine.is_visible():
+                    logger.info("🖱️ Clicking 'Imagine' in sidebar...")
+                    await sidebar_imagine.click()
+                    await asyncio.sleep(2)
+                
+                if "/imagine" not in page.url:
+                    await page.goto("https://grok.com/imagine", wait_until="networkidle")
+                    await asyncio.sleep(3)
+
             # Build 5-layer prompt
             prompt = PromptBuilder.build(
                 character_pose, camera_angle, style_suffix,
                 motion_description, dialogue,
-                character_name=character_name, emotion=emotion, sound_effect=sound_effect
+                character_name=character_name, emotion=emotion, sound_effect=sound_effect,
+                grok_video_prompt=grok_video_prompt,
+                sfx=sfx,
+                music_notes=music_notes
             )
-            logger.info(f"📝 Prompt: {prompt[:100]}...")
+            # LOG FULL PROMPT (User Request)
+            print(f"\n{'*'*60}")
+            print(f"🚀 FULL GROK PROMPT:\n{prompt}")
+            print(f"{'*'*60}\n")
+            logger.info(f"📝 Prompt length: {len(prompt)} chars")
             
             if not image_path.exists():
                 raise FileNotFoundError(f"Image text file not found at {image_path}")
@@ -764,21 +904,67 @@ async def generate_single_clip(
                 async def wait_for_video_element():
                     # Check for video tag or any of the known download buttons
                     selectors = ["video"] + download_selectors
-                    for _ in range(60): # Check every 2s for 2 minutes
+                    
+                    # Grok loading indicators
+                    generating_indicators = [
+                        "Generating...",
+                        "Generating video...",
+                        "Thinking...",
+                        "Drawing...",
+                        "[role='progressbar']",
+                        ".animate-pulse"
+                    ]
+                    
+                    for i in range(150): # Check every 2s for 5 minutes
+                        if page.is_closed():
+                            raise RuntimeError("Browser closed during wait")
+                            
                         # Inject Preference Check
                         await check_and_handle_preference()
                         
+                        # High-level check: is it STILL generating?
+                        still_generating = False
+                        for ind in generating_indicators:
+                            try:
+                                # Use both text and selector checks
+                                count = 0
+                                if "[" in ind or "." in ind:
+                                    count = await page.locator(ind).count()
+                                else:
+                                    count = await page.get_by_text(ind, exact=False).count()
+                                
+                                if count > 0:
+                                    still_generating = True
+                                    if i % 10 == 0:
+                                        logger.info(f"⏳ Grok is still generating (indicator: {ind})...")
+                                    break
+                            except: continue
+                        
+                        if still_generating:
+                            await asyncio.sleep(2)
+                            continue
+
+                        # Check for ready elements
                         for selector in selectors:
-                            if await page.locator(selector).count() > 0:
-                                logger.info(f"✨ Found element via selector: {selector}")
-                                return "element_found"
+                            try:
+                                el = page.locator(selector).first
+                                if await el.count() > 0:
+                                    # Basic verification for video tags
+                                    if selector == "video":
+                                        src = await el.get_attribute("src")
+                                        if not src or len(src) < 5: continue
+                                    
+                                    logger.info(f"✨ Found ready element via selector: {selector}")
+                                    return "element_found"
+                            except Exception:
+                                continue
                         await asyncio.sleep(2)
-                    raise TimeoutError("Neither video nor download button appeared")
+                    raise TimeoutError("Neither video nor download button appeared ready after 5 mins")
 
                 # Race the two tasks
                 done, pending = await asyncio.wait(
                     [
-                        asyncio.create_task(URLListener.wait_for_post_navigation(page, timeout=120000)),
+                        asyncio.create_task(URLListener.wait_for_post_navigation(page, timeout=180000)),
                         asyncio.create_task(wait_for_video_element())
                     ],
                     return_when=asyncio.FIRST_COMPLETED
@@ -788,14 +974,26 @@ async def generate_single_clip(
                 for task in pending:
                     task.cancel()
                     
-                if any(t.result() == "element_found" for t in done if not t.cancelled() and not t.exception()):
+                # Check results safely
+                result = None
+                for t in done:
+                    if not t.cancelled():
+                        try:
+                            result = t.result()
+                        except Exception as e:
+                            logger.debug(f"Task exception in race: {e}")
+                            result = None
+                        break
+
+                if result == "element_found":
                     logger.info("🎥 Video or Download element appeared! Proceeding directly...")
-                else:
+                elif result and ("http" in result or "/post/" in result):
                      # It was a URL change
-                    new_url = done.pop().result()
+                    new_url = result
                     logger.info(f"🔗 Navigation detected: {new_url}")
-                    await page.goto(new_url)
-                    await asyncio.sleep(3)
+                    if not page.is_closed():
+                        await page.goto(new_url)
+                        await asyncio.sleep(5) # Extra buffer for post-navigation load
 
             except Exception as e:
                 logger.info(f"⚠️ Wait condition warning: {e}. Checking for video anyway...")
@@ -807,143 +1005,143 @@ async def generate_single_clip(
             output = output_dir / f"clip_{uuid4()}.mp4"
             logger.info(f"💾 Saving video to: {output}")
             
-            
+            if page.is_closed():
+                raise RuntimeError("Browser closed before download could start")
+
             button_download_success = False
             try:
+                # TRY BUTTONS WITH RETRIES (to handle "not ready on backend" case)
                 for selector in download_selectors:
-                    try:
-                        el = page.locator(selector)
-                        if await el.count() > 0:
-                            logger.info(f"🎯 Found download button: {selector}")
-                            
-                            # Set up the download listener BEFORE clicking
-                            async with page.expect_download(timeout=45000) as dl:
-                                # Try normal click first
+                    if page.is_closed(): break
+                    
+                    for attempt in range(3): # Try each button up to 3 times with delays
+                        if page.is_closed(): break
+                        try:
+                            el = page.locator(selector).first
+                            if await el.count() > 0:
+                                if attempt == 0:
+                                    logger.info(f"🎯 Found download button: {selector}")
+                                else:
+                                    logger.info(f"♻️ Retrying download button: {selector} (Attempt {attempt+1})")
+                                
+                                # Set up the download listener BEFORE clicking
                                 try:
-                                    await el.first.click(timeout=3000)
-                                except:
-                                    # If intercepted, use JS force click
-                                    logger.info("⚠️ Click intercepted/failed, trying JS click...")
-                                    await page.evaluate(f"document.querySelector(`{selector}`).click()")
-                            
-                            # Wait for the download to start
-                            download = await dl.value
-                            
-                            # Save it
-                            await download.save_as(output)
-                            logger.info(f"✅ Successfully downloaded video using {selector}: {output}")
-                            
-                            # Verify it's actually a video (sometimes buttons trigger image downloads or error pages)
-                            file_size = output.stat().st_size
-                            if file_size < 10000: # < 10KB is suspicious
-                                logger.warning("⚠️ Downloaded file is too small (might be a text error or thumbnail). Retrying...")
-                                continue
-
-                            # Check for HTML error page masquerading as mp4
-                            with open(output, "rb") as f:
-                                header = f.read(100)
-                                if b"<!DOCTYPE html>" in header or b"<html" in header:
-                                    logger.warning(f"⚠️ Downloaded file is HTML (likely error page) - Size: {file_size} bytes")
-                                    # DUMP CONTENT FOR DEBUGGING
-                                    try:
-                                        f.seek(0)
-                                        content = f.read().decode('utf-8', errors='ignore')
-                                        print(f"\n{'='*20} CORRUPT DOWNLOAD CONTENT {'='*20}")
-                                        print(content[:500] + "...")
-                                        print(f"{'='*60}\n")
-                                    except: pass
+                                    async with page.expect_download(timeout=30000) as dl:
+                                        # Try normal click first
+                                        try:
+                                            await el.click(timeout=3000)
+                                        except:
+                                            # If intercepted, use JS force click
+                                            await page.evaluate(f"document.querySelector(`{selector}`).click()")
                                     
-                                    # Take diagnostic screenshot
-                                    try:
-                                        err_shot = output_dir / f"error_html_{uuid4().hex[:6]}.png"
-                                        await page.screenshot(path=str(err_shot))
-                                        logger.info(f"📸 Saved screenshot of page during HTML download: {err_shot}")
-                                    except: pass
+                                    # Wait for the download to start
+                                    download = await dl.value
                                     
-                                    # Delete corrupt file and try next method
-                                    try: output.unlink() 
-                                    except: pass
+                                    # Save it
+                                    await download.save_as(output)
+                                except Exception as e:
+                                    logger.debug(f"Download trigger failed: {e}")
+                                    await asyncio.sleep(5)
                                     continue
                                 
-                            button_download_success = True
-                            return output
-                    except Exception as e:
-                        logger.debug(f"Button attempt failed ({selector}): {e}")
-                        continue
+                                # Verify it's actually a video
+                                if output.exists():
+                                    file_size = output.stat().st_size
+                                    
+                                    # Verify it's not HTML
+                                    is_html = False
+                                    try:
+                                        with open(output, "rb") as f:
+                                            header = f.read(100)
+                                            if b"<!DOCTYPE html>" in header or b"<html" in header:
+                                                is_html = True
+                                    except: pass
+
+                                    if file_size < 15000 or is_html: # < 15KB or HTML is suspicious
+                                        logger.warning(f"⚠️ Downloaded file is invalid (Size: {file_size}b, HTML: {is_html}). Waiting and retrying...")
+                                        try: output.unlink() 
+                                        except: pass
+                                        await asyncio.sleep(8) # Wait for backend sync
+                                        continue
+                                    
+                                    logger.info(f"✅ Successfully downloaded video using {selector}: {output}")
+                                    button_download_success = True
+                                    return output
+                        except Exception as e:
+                            logger.debug(f"Button attempt failed ({selector}): {e}")
+                            break # Move to next selector if error isn't retryable
             except Exception:
                 pass
                 
             if not button_download_success:
-                 logger.warning("⚠️ High-quality button download failed. Falling back to direct stream capture...")
+                 logger.warning("⚠️ All high-quality buttons failed or returned invalid files. Falling back to direct stream capture...")
 
             # METHOD 2: Direct Video Source Download (Fallback - Lower Quality)
             try:
-                video_el = page.locator("video").first
-                await video_el.wait_for(state="attached", timeout=10000)
-                src = await video_el.get_attribute("src")
-                
-                if src:
-                    logger.info(f"🎥 Found video source: {src[:50]}...")
+                if not page.is_closed():
+                    video_el = page.locator("video").first
+                    # Use a short timeout for fallback
+                    try:
+                        await video_el.wait_for(state="attached", timeout=5000)
+                    except: pass
                     
-                    if src.startswith("blob:"):
-                        logger.info("⬇️ Fallback: Downloading via IMG SRC (Blob Support)...")
-                        # Use browser-side fetch to get blob contents as base64
-                        b64_data = await page.evaluate("""async (url) => {
-                            const response = await fetch(url);
-                            const blob = await response.blob();
-                            return new Promise((resolve) => {
-                                const reader = new FileReader();
-                                reader.onloadend = () => resolve(reader.result.split(',')[1]);
-                                reader.readAsDataURL(blob);
-                            });
-                        }""", src)
-                        import base64
-                        with open(output, "wb") as f:
-                            f.write(base64.b64decode(b64_data))
-                        logger.info(f"✅ Downloaded blob video via JS: {output}")
-                        return output
+                    if await video_el.count() > 0:
+                        src = await video_el.get_attribute("src")
+                        
+                        if src:
+                            logger.info(f"🎥 Found video source: {src[:50]}...")
+                            
+                            if src.startswith("blob:"):
+                                logger.info("⬇️ Fallback: Downloading via IMG SRC (Blob Support)...")
+                                # Use browser-side fetch
+                                b64_data = await page.evaluate("""async (url) => {
+                                    const response = await fetch(url);
+                                    const blob = await response.blob();
+                                    return new Promise((resolve) => {
+                                        const reader = new FileReader();
+                                        reader.onloadend = () => resolve(reader.result.split(',')[1]);
+                                        reader.readAsDataURL(blob);
+                                    });
+                                }""", src)
+                                import base64
+                                with open(output, "wb") as f:
+                                    f.write(base64.b64decode(b64_data))
+                                logger.info(f"✅ Downloaded blob video via JS: {output}")
+                                return output
 
-                    # Get cookies from browser context
-                    cookies = await page.context.cookies()
-                    cookie_dict = {c['name']: c['value'] for c in cookies}
-                    headers = {
-                        "User-Agent": await page.evaluate("navigator.userAgent"),
-                        "Referer": "https://grok.com/"
-                    }
+                            # Get cookies from browser context
+                            cookies = await page.context.cookies()
+                            cookie_dict = {c['name']: c['value'] for c in cookies}
+                            headers = {
+                                "User-Agent": await page.evaluate("navigator.userAgent"),
+                                "Referer": "https://grok.com/"
+                            }
 
-                    logger.info("⬇️ Downloading video stream via Python (httpx)...")
-                    import httpx
-                    async with httpx.AsyncClient(verify=False) as client:
-                        response = await client.get(src, cookies=cookie_dict, headers=headers, follow_redirects=True, timeout=60.0)
-                        if response.status_code == 200:
-                            with open(output, "wb") as f:
-                                f.write(response.content)
-                            logger.info(f"✅ Downloaded video stream: {output} ({len(response.content)} bytes)")
-                            return output
-                        else:
-                            raise ValueError(f"HTTP {response.status_code}")
-                    
+                            logger.info("⬇️ Downloading video stream via Python (httpx)...")
+                            import httpx
+                            async with httpx.AsyncClient(verify=False) as client:
+                                response = await client.get(src, cookies=cookie_dict, headers=headers, follow_redirects=True, timeout=60.0)
+                                if response.status_code == 200:
+                                    with open(output, "wb") as f:
+                                        f.write(response.content)
+                                    logger.info(f"✅ Downloaded video stream: {output} ({len(response.content)} bytes)")
+                                    return output
+                                else:
+                                    logger.warning(f"HTTP {response.status_code} on video stream download")
+                            
             except Exception as e:
                 logger.warning(f"❌ Direct download failed: {e}")       
             
             if not output.exists():
-                 raise RuntimeError("Failed to download video by any method.")
-            
-            if not output.exists():
                 # Last ditch: Look for video element src directly
-                video_el = page.locator("video").first
-                if await video_el.count() > 0:
-                    src = await video_el.get_attribute("src")
-                    if src:
-                        logger.info(f"🔗 Found video source directly: {src}")
-                        # We can't easily download blob: or protected URLs here without headers
-                        # But often it's a direct mp4 link we can fetch
-                        if src.startswith("http"):
-                             # Implementation for direct download would go here, 
-                             # but usually button click is safer for expiration tokens
-                             pass
+                if not page.is_closed():
+                    video_el = page.locator("video").first
+                    if await video_el.count() > 0:
+                        src = await video_el.get_attribute("src")
+                        if src:
+                            logger.info(f"🔗 Found video source directly: {src}")
 
-                raise RuntimeError("Failed to download video - button not clickable")
+                raise RuntimeError("Failed to download video - button not clickable or page closed")
             
             # Verify duration
             expected_duration = 10.0 if duration == "10s" else 6.0
@@ -1032,7 +1230,7 @@ class BrowserProfileManager:
                     user_data_dir=str(self.profile_path),
                     headless=os.getenv("GROK_HEADLESS", "false").lower() == "true",
                     args=args,
-                    viewport={'width': 1920, 'height': 1080},
+                    viewport={'width': 1100, 'height': 800},
                     user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
                 )
                 
@@ -1044,12 +1242,18 @@ class BrowserProfileManager:
             except Exception as e:
                 error_msg = str(e).lower()
                 if "target page, context or browser has been closed" in error_msg or "existing browser session" in error_msg or "in use" in error_msg:
-                    logger.warning(f"⚠️ Grok Browser Lock (ProfileManager) detected (Attempt {attempt+1}/{MAX_RETRIES}). Cleaning...")
-                    await _clean_grok_locks(self.profile_path)
-                    await asyncio.sleep(2 * (attempt + 1))
+                    logger.warning(f"⚠️ Profile in use or corrupt. Attempting to clean lock files (Attempt {attempt+1}/{MAX_RETRIES})")
+                    _clean_grok_locks(self.profile_path)
+                    await asyncio.sleep(2)
+                    continue
                 else:
                     await playwright.stop()
+                    logger.error(f"❌ Failed to launch browser: {e}")
                     raise e
+        
+        # If we got here, all retries failed
+        await playwright.stop()
+        raise RuntimeError(f"Could not launch browser after {MAX_RETRIES} attempts.")
         
         await playwright.stop()
         raise RuntimeError(f"Failed to launch Grok browser context for profile {self.profile_path} after multiple attempts.")
@@ -1101,7 +1305,10 @@ class GrokAnimator:
         camera_angle: str = "Medium shot",
         dialogue: Optional[str] = None,
         sound_effect: Optional[str] = None,
-        emotion: str = "neutrally"
+        emotion: str = "neutrally",
+        grok_video_prompt: Optional[dict] = None,
+        sfx: Optional[list[str]] = None,
+        music_notes: Optional[str] = None
     ) -> Path:
         """
         Animate an image using Grok Imagine with full serialization.
@@ -1135,7 +1342,10 @@ class GrokAnimator:
                         dialogue=dialogue,
                         sound_effect=sound_effect,
                         emotion=emotion,
-                        external_page=page # Pass the active page
+                        external_page=page, # Pass the active page
+                        grok_video_prompt=grok_video_prompt,
+                        sfx=sfx,
+                        music_notes=music_notes
                     )
                     
                     # Validation: Check if file actually exists and has size

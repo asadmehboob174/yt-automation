@@ -79,15 +79,177 @@ class YouTubeUploader:
         
         return creds
     
+    def add_to_playlist(self, video_id: str, playlist_name: str):
+        """Add video to a playlist (create if not exists)."""
+        # 1. Search for existing playlist
+        request = self.youtube.playlists().list(
+            part="snippet,id",
+            mine=True,
+            maxResults=50
+        )
+        response = request.execute()
+        
+        playlist_id = None
+        for item in response.get("items", []):
+            if item["snippet"]["title"].lower() == playlist_name.lower():
+                playlist_id = item["id"]
+                break
+        
+        # 2. Create if missing
+        if not playlist_id:
+            logger.info(f"✨ Creating new playlist: {playlist_name}")
+            create_response = self.youtube.playlists().insert(
+                part="snippet,status",
+                body={
+                    "snippet": {"title": playlist_name},
+                    "status": {"privacyStatus": "public"}
+                }
+            ).execute()
+            playlist_id = create_response["id"]
+        
+        # 3. Add video
+        try:
+            self.youtube.playlistItems().insert(
+                part="snippet",
+                body={
+                    "snippet": {
+                        "playlistId": playlist_id,
+                        "resourceId": {
+                            "kind": "youtube#video",
+                            "videoId": video_id
+                        }
+                    }
+                }
+            ).execute()
+            logger.info(f"✅ Added video {video_id} to playlist {playlist_name}")
+        except Exception as e:
+            if "already in playlist" in str(e).lower():
+                logger.info(f"ℹ️ Video already in playlist {playlist_name}")
+            else:
+                logger.error(f"❌ Failed to add to playlist: {e}")
+
+    def post_comment(self, video_id: str, text: str, pin: bool = False):
+        """Post a comment and optionally pin it."""
+        try:
+            # Post comment
+            response = self.youtube.commentThreads().insert(
+                part="snippet",
+                body={
+                    "snippet": {
+                        "videoId": video_id,
+                        "topLevelComment": {
+                            "snippet": {
+                                "textOriginal": text
+                            }
+                        }
+                    }
+                }
+            ).execute()
+            
+            comment_id = response["id"]
+            logger.info(f"💬 Posted comment on {video_id}")
+            
+            # Pin if requested
+            if pin:
+                # Note: 'channel' scope is enough, but sometimes restricted?
+                # Using 'commentThreads' response, the ID is top-level.
+                # To pin, we might need to use 'comments' endpoint?
+                # Actually, only top-level comments can be pinned?
+                # No, we assume it's the thread. Can we pin a thread?
+                # We can pin a comment.
+                # Use 'videos.rate'? No.
+                # Use 'comments.setModerationStatus'? No, that's for holding.
+                # Actually, pinning is not officially supported in public API for *inserting* as pinned.
+                # But we can try 'commentThreads' update? No.
+                # Wait, strictly speaking, pinning comments via API is NOT supported in v3.
+                # "The YouTube Data API does not support pinning comments."
+                # I should probably log a warning but implement the post at least.
+                # User asked for it. I'll add a check or mock it if needed.
+                # Let's check update... no.
+                # Okay, I will just log that pinning is not API supported if I can't find it.
+                # EXCEPT: Some sources say it's possible via internal calls but not public.
+                # However, the user plan says "Post and pin".
+                # I'll implement the posting. For pinning, I'll log a "Manual Action Required" or try a workaround if I knew one.
+                # But actually, I'll just skip the pin part to avoid crashing, and maybe log it.
+                logger.warning("⚠️ Pinning comments is not supported by public YouTube API. Comment posted but not pinned.")
+                
+        except Exception as e:
+            logger.error(f"❌ Failed to post comment: {e}")
+
+    async def upload(
+        self,
+        video_path: Path,
+        title: str,
+        description: str,
+        tags: list[str],
+        thumbnail_path: Optional[Path] = None,
+        privacy_status: str = "private",
+        category_id: str = "22",
+        made_for_kids: bool = False,
+        publish_at: Optional[str] = None,
+        playlist_name: Optional[str] = None
+    ) -> dict:
+        """
+        Unified upload method with extended metadata support.
+        """
+        try:
+            # 1. Upload video
+            # Modify upload_private inline logic here or update it?
+            # It's cleaner to update upload_private or just implement body constr here.
+            # I'll use upload_private but I need to pass extra args.
+            
+            # Re-implementing upload_private logic inside here to support new fields
+            # efficiently without changing the other method signature too much if it's used elsewhere.
+            # Actually, upload_private is used by 'upload_with_copyright_check'.
+            # I should update upload_private signature too.
+            
+            video_id = self.upload_private(
+                video_path=video_path,
+                title=title,
+                description=description,
+                tags=tags,
+                category_id=category_id,
+                made_for_kids=made_for_kids,
+                publish_at=publish_at
+            )
+            
+            # 2. Upload thumbnail if exists
+            if thumbnail_path and thumbnail_path.exists():
+                self.set_thumbnail(video_id, thumbnail_path)
+            
+            # 3. Promote/Polish
+            # If publish_at is set, video is already scheduled (must remain private until then).
+            # If not scheduled, handle privacy.
+            if not publish_at:
+                if privacy_status == "public":
+                    self.promote_to_public(video_id)
+                elif privacy_status == "unlisted":
+                    self.promote_to_unlisted(video_id)
+            
+            # 4. Add to Playlist
+            if playlist_name:
+                self.add_to_playlist(video_id, playlist_name)
+
+            return {
+                "video_id": video_id,
+                "status": "scheduled" if publish_at else privacy_status,
+                "url": f"https://youtu.be/{video_id}"
+            }
+        except Exception as e:
+            logger.error(f"❌ Upload failed: {e}")
+            raise
+
     def upload_private(
         self,
         video_path: Path,
         title: str,
         description: str,
         tags: list[str],
-        category_id: str = "22"  # People & Blogs
+        category_id: str = "22",
+        made_for_kids: bool = False,
+        publish_at: Optional[str] = None
     ) -> str:
-        """Upload video as PRIVATE with AI disclosure flag."""
+        """Upload video as PRIVATE (or Scheduled) with metadata."""
         body = {
             "snippet": {
                 "title": title,
@@ -97,17 +259,20 @@ class YouTubeUploader:
             },
             "status": {
                 "privacyStatus": "private",
-                "selfDeclaredMadeForKids": False,
-                # AI Disclosure (YouTube 2026 requirement)
+                "selfDeclaredMadeForKids": made_for_kids,
                 "containsSyntheticMedia": True,
             },
         }
+        
+        if publish_at:
+            body["status"]["publishAt"] = publish_at
+            # When publishAt is set, privacyStatus must be private.
         
         media = MediaFileUpload(
             str(video_path),
             mimetype="video/mp4",
             resumable=True,
-            chunksize=256 * 1024  # 256KB chunks
+            chunksize=256 * 1024
         )
         
         request = self.youtube.videos().insert(
@@ -123,8 +288,9 @@ class YouTubeUploader:
                 logger.info(f"Upload progress: {int(status.progress() * 100)}%")
         
         video_id = response["id"]
-        logger.info(f"✅ Uploaded as PRIVATE: {video_id}")
+        logger.info(f"✅ Uploaded: {video_id}")
         return video_id
+
     
     def check_copyright_status(self, video_id: str) -> dict:
         """Check copyright status of an uploaded video."""

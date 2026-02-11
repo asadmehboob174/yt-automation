@@ -28,7 +28,8 @@ import {
     Clock,
     ImagePlus,
     Video,
-    Youtube
+    Youtube,
+    FileJson
 } from 'lucide-react';
 import { useProjectStore } from '@/lib/stores/project-store';
 import { useAutomationStore } from '@/lib/stores/automation-store';
@@ -44,6 +45,132 @@ const STEPS = [
     { number: 4, title: 'Scene Videos', icon: Video },
     { number: 5, title: 'Final', icon: Film },
 ];
+
+// Helper to format timeline (0-2s) or (0:02-0:04) to [00:00-00:02]
+const formatTimeline = (text: string): string => {
+    if (!text) return "";
+    // Match (M:SS-M:SS) or (SS-SS)
+    const pattern = /[(\[]([\d:]+)(?:s)?-([\d:]+)(?:s)?[)\]]/g;
+    return text.replace(pattern, (match, startStr, endStr) => {
+        const parseTime = (s: string) => {
+            const parts = s.split(':').map(p => parseInt(p));
+            if (parts.length === 2 && !isNaN(parts[1])) return parts[0] * 60 + parts[1];
+            return !isNaN(parts[0]) ? parts[0] : 0;
+        };
+        const start = parseTime(startStr);
+        const end = parseTime(endStr);
+        const pad = (num: number) => num.toString().padStart(2, '0');
+        const formatTime = (seconds: number) => `${pad(Math.floor(seconds / 60))}:${pad(seconds % 60)}`;
+        return `[${formatTime(start)}–${formatTime(end)}]`;
+    });
+};
+
+// Helper to build the final Grok prompt (TypeScript version of PromptBuilder.py)
+const buildGrokPrompt = (scene: any): string => {
+    const parts = ["6s:"];
+    
+    // 1. Description
+    let desc = scene.grok_video_prompt?.full_prompt || scene.full_prompt || scene.image_to_video_prompt || scene.motion_description || scene.textToVideo || "";
+    desc = formatTimeline(desc);
+    parts.push(desc);
+
+    // 2. Shot Type
+    const camera = scene.camera_angle || scene.shot_type || scene.shotType || "";
+    if (camera && !desc.toLowerCase().includes(camera.toLowerCase())) {
+        parts.push(`Shot: ${camera.toLowerCase()}`);
+    }
+
+    // 3. Audio / Dialogue
+    let audioBlock = "";
+    const dialogue = scene.dialogue || "";
+    const emotion = scene.emotion || scene.grok_video_prompt?.emotion || "neutrally";
+    
+    if (typeof dialogue === 'object' && dialogue !== null) {
+        audioBlock = Object.entries(dialogue)
+            .map(([char, text]) => `[${char}] (${emotion}): "${text}"`)
+            .join(' ');
+    } else if (dialogue) {
+        audioBlock = `[Character] (${emotion}): "${dialogue}"`;
+    }
+
+    if (audioBlock) {
+        parts.push(`AUDIO: ${audioBlock}`);
+    }
+
+    // 4. SFX
+    const sfxList: string[] = [];
+    if (Array.isArray(scene.sfx)) sfxList.push(...scene.sfx);
+    if (scene.sound_effect) sfxList.push(scene.sound_effect);
+    
+    const uniqueSfx = Array.from(new Set(sfxList.filter(Boolean).map(s => s.trim())));
+    if (uniqueSfx.length > 0) {
+        parts.push(`SFX: ${uniqueSfx.join(', ')}.`);
+    } else {
+        parts.push(`SFX: .`); // Match user's request for trailing dot header
+    }
+
+    return parts.join(' ');
+};
+
+// Helper for parsing JSON script
+const parseJsonScript = (jsonScript: string): ScriptBreakdown => {
+    const parsed = JSON.parse(jsonScript);
+    
+    // Basic Validation
+    if (!parsed.scenes || !Array.isArray(parsed.scenes)) {
+        throw new Error("Invalid JSON: 'scenes' array is missing.");
+    }
+
+    // Map snake_case to camelCase and validate
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const mappedScenes: any[] = parsed.scenes.map((s: any, idx: number) => ({
+        index: idx,
+        textToImage: s.text_to_image_prompt || s.static_image_prompt || s.text_to_image || s.image_prompt || s.textToImage || s.prompt || "",
+        textToVideo: s.grok_video_prompt?.full_prompt || s.grokVideoPrompt?.fullPrompt || s.image_to_video_prompt || s.motion_description || s.text_to_video_prompt || s.video_prompt || s.motion_prompt || s.textToVideo || s.motion || "",
+        characterPose: s.character_pose_prompt || s.character_pose || s.characterPose || s.pose || "",
+        backgroundDesc: s.background_description || s.background_desc || s.backgroundDesc || s.background || "",
+        shotType: s.camera_angle || s.camera_movement || s.shot_type || s.shotType || s.shot_type_prompt || "medium shot",
+        imageUrl: s.imageUrl || s.image_url || null,
+        videoUrl: s.videoUrl || s.video_url || null,
+        // Map new structured fields
+        grokVideoPrompt: {
+            mainAction: s.grok_video_prompt?.main_action || s.grokVideoPrompt?.mainAction || s.main_action || "",
+            cameraMovement: s.grok_video_prompt?.camera_movement || s.grokVideoPrompt?.cameraMovement || s.camera_movement,
+            characterAnimation: s.grok_video_prompt?.character_animation || s.grokVideoPrompt?.characterAnimation || s.character_animation,
+            emotion: s.grok_video_prompt?.emotion || s.grokVideoPrompt?.emotion || s.emotion,
+            vfx: s.grok_video_prompt?.vfx || s.grokVideoPrompt?.vfx || s.vfx,
+            lightingChanges: s.grok_video_prompt?.lighting_changes || s.grokVideoPrompt?.lightingChanges || s.lighting,
+            fullPrompt: s.grok_video_prompt?.full_prompt || s.grokVideoPrompt?.fullPrompt || s.full_prompt,
+        },
+        sfx: s.sfx || (s.sound_effect ? [s.sound_effect] : []),
+        musicNotes: s.music_notes || s.musicNotes || "",
+        // Legacy fields
+        dialogue: s.dialogue || "",
+        // Ensure duration is present
+        duration: s.duration_in_seconds || s.duration || 10,
+        // Computed Preview Prompt
+        formattedPrompt: buildGrokPrompt(s)
+    }));
+
+    // Map characters with aliases
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const mappedCharacters = (parsed.characters || []).map((c: any) => ({
+        id: c.id || c.name || `char-${Math.random()}`,
+        name: c.name,
+        prompt: c.whisk_prompt || c.prompt || c.description || "",
+        imageUrl: c.imageUrl || c.image_url,
+        isLocked: c.isLocked || c.locked || false
+    }));
+
+    // Construct Breakdown
+    return {
+        title: parsed.title || "Imported Script",
+        description: parsed.description || "",
+        thumbnail_prompt: parsed.thumbnail_prompt || parsed.thumbnailPrompt || "",
+        characters: mappedCharacters,
+        scenes: mappedScenes
+    };
+};
 
 export default function NewVideoPage() {
     const { currentStep, setStep, canProceed } = useProjectStore();
@@ -107,8 +234,9 @@ function Step1Script() {
     } = useProjectStore();
     const { isRunning, progress, steps, currentAction, startAutomation } = useAutomationStore();
 
-    const [scriptTab, setScriptTab] = useState<'ai' | 'manual'>('manual');
+    const [scriptTab, setScriptTab] = useState<'ai' | 'manual' | 'json'>('manual');
     const [manualScript, setManualScript] = useState('');
+    const [jsonScript, setJsonScript] = useState('');
     const [isGenerating, setIsGenerating] = useState(false);
     const [autoUpload, setAutoUpload] = useState(true); // Default to True
 
@@ -223,6 +351,40 @@ function Step1Script() {
         }
     };
 
+    const handleJsonAutomation = async () => {
+        if (!channelId || !jsonScript) {
+             toast.error('Please select a channel and paste your JSON script');
+             return;
+        }
+
+        try {
+             const breakdown = parseJsonScript(jsonScript);
+             // Start automation with prepared breakdown (bypassing backend parsing)
+             const result = await startAutomation(jsonScript, channelId, format, autoUpload, breakdown);
+             if (result) {
+                 toast.success('Video generation started from JSON!');
+             }
+
+        } catch (e) {
+             toast.error(`Invalid JSON: ${e instanceof Error ? e.message : "Parse error"}`);
+        }
+    };
+
+    const handleJsonContinue = () => {
+        try {
+            if (!jsonScript) return;
+            // Use helper
+            const breakdown = parseJsonScript(jsonScript);
+            
+            setBreakdown(breakdown);
+            toast.success("JSON Script parsed successfully!");
+            setStep(2);
+
+        } catch (e) {
+            toast.error(`Invalid JSON: ${e instanceof Error ? e.message : "Parse error"}`);
+        }
+    };
+
     return (
         <div className="space-y-6">
             {/* Channel Selection */}
@@ -286,10 +448,11 @@ function Step1Script() {
             <Separator />
 
             {/* Script Tabs */}
-            <Tabs value={scriptTab} onValueChange={(v) => setScriptTab(v as 'ai' | 'manual')}>
-                <TabsList className="grid w-full grid-cols-2">
+            <Tabs value={scriptTab} onValueChange={(v) => setScriptTab(v as 'ai' | 'manual' | 'json')}>
+                <TabsList className="grid w-full grid-cols-3">
                     <TabsTrigger value="manual">Manual Script</TabsTrigger>
                     <TabsTrigger value="ai">AI Script</TabsTrigger>
+                    <TabsTrigger value="json">JSON Script</TabsTrigger>
                 </TabsList>
 
                 <TabsContent value="manual" className="space-y-4 mt-4">
@@ -363,6 +526,37 @@ Dialogue: "Where am I?"`}
                         )}
                         Generate Script
                     </Button>
+                </TabsContent>
+
+                <TabsContent value="json" className="space-y-4 mt-4">
+                    <div className="space-y-2">
+                        <Label>Paste Valid JSON Script</Label>
+                        <Textarea
+                            value={jsonScript}
+                            onChange={(e) => setJsonScript(e.target.value)}
+                            placeholder='{ "title": "My Video", "scenes": [ ... ] }'
+                            rows={15}
+                            className="font-mono text-xs"
+                        />
+                    </div>
+                    <div className="flex gap-4">
+                        <Button onClick={handleJsonContinue} disabled={!jsonScript}>
+                            <FileJson className="mr-2 h-4 w-4" />
+                            Parse & Continue
+                        </Button>
+                        <Button 
+                            variant="secondary"
+                            onClick={handleJsonAutomation}
+                            disabled={!jsonScript || !channelId || isRunning}
+                        >
+                            {isRunning ? (
+                                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                            ) : (
+                                <Rocket className="mr-2 h-4 w-4" />
+                            )}
+                            1-Click Automation
+                        </Button>
+                    </div>
                 </TabsContent>
             </Tabs>
 
@@ -753,7 +947,9 @@ function Step3SceneImages() {
                                                 <div className="pt-1">
                                                     <p className="text-[10px] uppercase font-bold text-muted-foreground/70 mb-1">🎤 Voiceover/Dialogue</p>
                                                     <div className="bg-background/50 border rounded px-3 py-1.5 text-sm">
-                                                        {scene.dialogue}
+                                                        {typeof scene.dialogue === 'object' 
+                                                            ? Object.entries(scene.dialogue).map(([char, text]) => `${char}: "${text}"`).join(' ')
+                                                            : scene.dialogue}
                                                     </div>
                                                 </div>
                                             )}
@@ -834,10 +1030,16 @@ function Step4SceneVideos() {
     const handleGenerateVideo = async (index: number, retryCount = 0): Promise<boolean> => {
         const MAX_RETRIES = 3;
         const scene = scenes[index];
+
+        if (!scene.imageUrl) {
+            toast.error(`Scene ${index + 1} has no image URL. Please generate the image in Step 3 first.`);
+            return false;
+        }
+
         setGeneratingIndex(index);
 
         try {
-            const result = await api.post<{ videoUrl: string }>('/scenes/generate-video', {
+            const result = await api.post<{ videoUrl: string, formattedPrompt: string }>('/scenes/generate-video', {
                 scene_index: index,
                 image_url: scene.imageUrl,
                 prompt: scene.textToVideo,
@@ -852,7 +1054,10 @@ function Step4SceneVideos() {
                 throw new Error('Empty video URL returned');
             }
 
-            updateScene(index, { videoUrl: result.videoUrl });
+            updateScene(index, { 
+                videoUrl: result.videoUrl,
+                formattedPrompt: result.formattedPrompt 
+            });
             toast.success(`Scene ${index + 1} video generated!`);
             return true;
         } catch (error) {
@@ -969,8 +1174,18 @@ function Step4SceneVideos() {
                                 </p>
                                 {scene.dialogue && (
                                     <p className="text-sm text-muted-foreground">
-                                        <strong>🎤 Dialogue:</strong> {scene.dialogue}
+                                        <strong>🎤 Dialogue:</strong> {typeof scene.dialogue === 'object' 
+                                            ? Object.entries(scene.dialogue).map(([char, text]) => `${char}: "${text}"`).join(' ')
+                                            : scene.dialogue}
                                     </p>
+                                )}
+                                {(scene.formattedPrompt || buildGrokPrompt(scene)) && (
+                                    <div className="mt-2 p-2 bg-blue-500/10 border border-blue-500/20 rounded-md">
+                                        <p className="text-[10px] uppercase font-bold text-blue-400 mb-1">🎬 Final Grok Imagine Prompt</p>
+                                        <p className="text-xs text-blue-100/80 italic font-mono leading-relaxed">
+                                            {scene.formattedPrompt || buildGrokPrompt(scene)}
+                                        </p>
+                                    </div>
                                 )}
                                 <Button
                                     size="sm"

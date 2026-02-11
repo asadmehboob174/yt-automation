@@ -400,12 +400,35 @@ async def animate_scenes_with_grok(image_keys: list[str], script: dict) -> list[
                 
                 motion_prompt = scene.get("motion_description", "")
                 
+                # Extract new structured fields
+                grok_prompt = scene.get("grok_video_prompt")
+                sfx_list = scene.get("sfx")
+                music_notes = scene.get("music_notes")
+                
+                # Derive components for fallback/hybrid usage
+                current_emotion = "neutrally"
+                if grok_prompt and isinstance(grok_prompt, dict):
+                    current_emotion = grok_prompt.get("emotion", "neutrally")
+                
+                # Format dialogue for Grok prompt
+                dialogue_raw = scene.get("dialogue")
+                dialogue_str = ""
+                if isinstance(dialogue_raw, dict):
+                    dialogue_str = " ".join([f'{k}: "{v}"' for k, v in dialogue_raw.items()])
+                elif isinstance(dialogue_raw, str):
+                    dialogue_str = dialogue_raw
+
                 try:
                     # Animate with Grok
                     video_path = await animator.animate(
                         image_path=local_image,
                         motion_prompt=motion_prompt,
-                        duration=scene.get("duration_in_seconds", 10)
+                        duration=scene.get("duration_in_seconds", 10),
+                        grok_video_prompt=grok_prompt,
+                        sfx=sfx_list,
+                        music_notes=music_notes,
+                        emotion=current_emotion,
+                        dialogue=dialogue_str
                     )
                 except Exception as e:
                     from .grok_agent import ModerationError
@@ -418,10 +441,15 @@ async def animate_scenes_with_grok(image_keys: list[str], script: dict) -> list[
                         if new_prompt != motion_prompt:
                             logger.info(f"🔄 Retrying scene {i+1} with sanitized prompt: {new_prompt}")
                             # RETRY ONCE
+                            # Pass grok_video_prompt=None to stick to the sanitized text prompt
                             video_path = await animator.animate(
                                 image_path=local_image,
                                 motion_prompt=new_prompt,
-                                duration=scene.get("duration_in_seconds", 10)
+                                duration=scene.get("duration_in_seconds", 10),
+                                grok_video_prompt=None, # Force use of new_prompt
+                                sfx=sfx_list,
+                                music_notes=music_notes,
+                                emotion=current_emotion
                             )
                         else:
                             raise e # If rewrite failed or didn't change anything, give up
@@ -488,6 +516,69 @@ async def generate_voiceover(script: dict, channel_config: dict) -> list[str]:
     return audio_keys
 
 
+async def _generate_dynamic_soundtrack(soundtrack_config: dict, script: dict, total_duration: float) -> Any:
+    """Generate dynamic soundtrack based on timing config."""
+    from .music_generator import generate_music_with_ai
+    from .audio_engine import AudioEngine
+    import re
+    import math
+    
+    timing_str = soundtrack_config.get("music_timing", "")
+    # Example: "Adventure (scene 1-3) -> Horror (4-6)"
+    
+    engine = AudioEngine()
+    segments = []
+    scenes = script.get("scenes", [])
+    
+    # 1. Parse timing string
+    # Regex to find "Description (Range)" patterns
+    # Handles: "Desc (scene 1)", "Desc (1-3)", "Desc (scenes 1-3)"
+    pattern = r"(.+?)\s*\((?:scene\w*\s*)?(\d+)(?:-(\d+))?\)"
+    matches = re.findall(pattern, timing_str, re.IGNORECASE)
+    
+    if not matches:
+        # Fallback: Generate one track for whole video based on background_music description
+        desc = soundtrack_config.get("background_music", "Background music")
+        logger.info(f"🎵 Dynamic Soundtrack: No timing found, generating single track for '{desc}'")
+        path = await generate_music_with_ai(desc, duration=int(total_duration) + 5)
+        return path
+
+    logger.info(f"🎵 Constructing Dynamic Soundtrack with {len(matches)} segments...")
+    
+    current_time = 0.0
+    
+    for desc, start_idx, end_idx in matches:
+        start_scene = int(start_idx) - 1
+        end_scene = int(end_idx) - 1 if end_idx else start_scene
+        
+        # Calculate duration based on scenes
+        # We need to know duration of these scenes.
+        # Estimate from script or passed info? 
+        # We don't have exact duration of *generated* clips here easily unless we probe them.
+        # But render_final_video has local_clips... 
+        # We'll rely on script['duration_in_seconds'] as estimate or just assume 5s?
+        # Better: use script duration.
+        
+        segment_duration = 0.0
+        for i in range(start_scene, min(end_scene + 1, len(scenes))):
+             segment_duration += scenes[i].get("duration_in_seconds", 5)
+             
+        # Add buffer for crossfades
+        gen_duration = int(segment_duration) + 10
+        
+        logger.info(f"   🎹 Segment: '{desc.strip()}' for scenes {start_scene+1}-{end_scene+1} ({segment_duration}s)")
+        
+        music_path = await generate_music_with_ai(desc.strip(), duration=gen_duration)
+        if music_path:
+            segments.append({
+                "path": music_path,
+                "duration": segment_duration
+            })
+            
+    if segments:
+        return engine.construct_dynamic_soundtrack(segments, total_duration)
+    return None
+
 async def render_final_video(
     clip_keys: list[str], 
     audio_keys: list[str], 
@@ -495,166 +586,159 @@ async def render_final_video(
     channel_config: dict
 ) -> str:
     """
-    Render final video with transitions, audio, and subtitles.
-    
-    Modes:
-    - story: Clips already have dialogue audio from Grok, just stitch them
-    - documentary: Mix voiceover audio with clips
+    Render final video with transitions, audio, grading, and subtitles.
+    Supports 'FinalAssembly' features.
     """
     from .video_editor import FFmpegVideoEditor
     from .subtitle_engine import SubtitleEngine
+    import ffmpeg
     
     storage = R2Storage()
     editor = FFmpegVideoEditor()
     subtitle_engine = SubtitleEngine()
     
+    assembly = script.get("final_assembly")
     video_type = script.get("video_type", "story")
     
-    # Ensure we have storage space
+    # Ensure storage space
     storage.ensure_storage_available(required_gb=1.0)
     
-    # Download all clips
+    # 1. Download Core Clips
     local_clips = []
     for i, clip_key in enumerate(clip_keys):
         local_path = storage.download(clip_key, Path(f"/tmp/clip_{i}.mp4"))
         if not is_valid_video_content(local_path):
-             error_msg = f"❌ CRITICAL ERROR: Clip {clip_key} is corrupt (HTML) or too small. Aborting final render."
-             logger.error(error_msg)
-             raise ValueError(error_msg)
+             raise ValueError(f"Clip {clip_key} is corrupt.")
         local_clips.append(local_path)
     
-    # Determine Output Resolution
+    # 2. Title Cards (Opening/Closing)
+    if assembly and assembly.get("title_cards"):
+        tc = assembly["title_cards"]
+        style = "horror" if "horror" in script.get("niche_id", "") else "standard"
+        
+        if tc.get("opening"):
+            opener = editor.render_title_card(tc["opening"], style=style, output_path=Path("/tmp/title_opener.mp4"))
+            local_clips.insert(0, opener)
+            # Adjust audio keys index? Title cards have no audio usually.
+            
+        if tc.get("closing"):
+            closer = editor.render_title_card(tc["closing"], style=style, output_path=Path("/tmp/title_closer.mp4"))
+            local_clips.append(closer)
+
+    # Determine Resolution
     is_shorts = "shorts" in channel_config.get("nicheId", "").lower() or "shorts" in channel_config.get("styleSuffix", "").lower()
     target_res = (1080, 1920) if is_shorts else (1920, 1080)
-    logger.info(f"📐 Stitching Resolution: {target_res} (Shorts={is_shorts})")
-
-    # Stitch clips with transitions
-    # Stitch clips with transitions
+    
+    # 3. Stitching
+    logger.info(f"🧵 Stitching {len(local_clips)} clips...")
     stitched_path = editor.stitch_clips_with_transitions(
         local_clips, 
         "/tmp/stitched.mp4",
         target_resolution=target_res,
-        transition_duration=0.4 # User requested 0.4s
+        transition_duration=0.5
     )
     
-    # Calculate total duration for music generation
-    # Estimate from clips count * 5s if unknown, or rely on actual video length later?
-    # Better to probe the stitched video.
+    # 4. Color Grading
+    if assembly and assembly.get("color_grading"):
+        logger.info("🎨 Applying Color Grading...")
+        stitched_path = editor.apply_color_grading(
+            stitched_path, 
+            assembly["color_grading"],
+            output_path=Path("/tmp/stitched_graded.mp4")
+        )
+
+    # Calculate Duration
     try:
-        import ffmpeg
         probe = ffmpeg.probe(str(stitched_path))
         total_duration = float(probe['format']['duration'])
     except:
-        total_duration = len(local_clips) * 10.0 # Fallback
+        total_duration = len(local_clips) * 5.0
+
+    # 5. Audio Construction
+    bg_music_local = None
+    
+    # A. Dynamic Soundtrack (Priority)
+    if assembly and assembly.get("soundtrack"):
+        try:
+            bg_music_local = await _generate_dynamic_soundtrack(assembly["soundtrack"], script, total_duration)
+        except Exception as e:
+            logger.error(f"❌ Dynamic soundtrack failed: {e}")
+    
+    # B. Fallback to existing logic if no dynamic track
+    if not bg_music_local:
+         # ... (existing selection logic) ...
+         bg_music_cfg = channel_config.get("bgMusic")
+         if bg_music_cfg:
+             try:
+                bg_music_local = storage.download(bg_music_cfg, "/tmp/bg_music_manual.mp3")
+             except: pass
+         else:
+             from .music_generator import generate_background_music
+             mood = script.get("music_mood") or "calm"
+             try:
+                 bg_music_local = generate_background_music(total_duration, mood)
+             except: pass
+
+    # 6. Final Mix
+    final_audio_path = stitched_path # Default if no audio added
     
     if video_type == "documentary" and audio_keys:
-        # DOCUMENTARY MODE: Mix voiceover with video
-        logger.info("📚 Documentary mode: Adding voiceover audio")
+        # Documentary: Download VO and Mix
+        local_audio = [storage.download(k, f"/tmp/audio_{i}.mp3") for i, k in enumerate(audio_keys)]
         
-        # Download audio files
-        local_audio = []
-        for i, audio_key in enumerate(audio_keys):
-            local_audio.append(storage.download(audio_key, f"/tmp/audio_{i}.mp3"))
-        
-        # Generate subtitles
+        # Generate Subtitles
         srt_path = subtitle_engine.generate_srt(script, "/tmp/subtitles.srt")
         
-        # Mix audio with background music
-        bg_music = channel_config.get("bgMusic")
-        bg_music_local = None
+        # Mix VO + BGM
+        final_audio_path = editor.mix_audio(local_audio, bg_music_local, "/tmp/final_audio_mix.mp3")
         
-        if bg_music:
-             # Manual Override
-             try:
-                bg_music_local = storage.download(bg_music, "/tmp/bg_music.mp3")
-             except: None
-        else:
-             # Intelligent Selection
-             from .music_generator import generate_background_music
-             mood = script.get("music_mood", "calm") # Fallback to calm
-             logger.info(f"🎶 Auto-selecting music for mood: {mood}")
-             try:
-                 bg_music_local = generate_background_music(total_duration, mood)
-             except Exception as e:
-                 logger.error(f"⚠️ Music generation failed: {e}. Skipping BGM.")
-                 bg_music_local = None
+        # Finalize
+        final_path = editor.finalize(stitched_path, final_audio_path, srt_path, "/tmp/final_video.mp4")
         
-        final_audio = editor.mix_audio(local_audio, bg_music_local, "/tmp/final_audio.mp3")
-        
-        # Combine video + audio + subtitles
-        final_path = editor.finalize(
-            video_path=stitched_path,
-            audio_path=final_audio,
-            subtitle_path=srt_path,
-            output_path="/tmp/final_video.mp4"
-        )
-        
-        # Cleanup audio files
-        for audio_key in audio_keys:
-            storage.delete_file(audio_key)
+        # Cleanup VO
+        for f in local_audio: Path(f).unlink(missing_ok=True)
+            
     else:
-        # STORY MODE: Clips already have Grok's dialogue audio
-        logger.info("🎭 Story mode: Using Grok's built-in audio, just stitching clips")
+        # Story Mode: Audio already in clips (except title cards)
+        # We need to mix BGM with the *video's existing audio*
         
-        # Optionally add background music (ducked under Grok audio)
-        bg_music = channel_config.get("bgMusic")
-        bg_music_local = None
-        
-        if bg_music:
-             try:
-                bg_music_local = storage.download(bg_music, "/tmp/bg_music.mp3")
-             except: None
-        else:
-             from .music_generator import generate_background_music
-             mood = script.get("music_mood", "calm")
-             logger.info(f"🎶 Auto-selecting music for mood: {mood}")
-             try:
-                 bg_music_local = generate_background_music(total_duration, mood)
-             except Exception as e:
-                 logger.error(f"⚠️ Music generation failed: {e}. Skipping BGM.")
-                 bg_music_local = None
-
         if bg_music_local:
             final_audio_path = editor.add_background_music(
                 stitched_path,
                 bg_music_local,
-                "/tmp/final_video_music.mp4",
-                music_volume=0.15  # Keep low so dialogue is clear
+                "/tmp/final_video_w_music.mp4",
+                music_volume=0.15
             )
         else:
             final_audio_path = stitched_path
-
-        # Generate Subtitles (Even for Story Mode)
-        # Use dialogue if present, otherwise voiceover_text
-        logger.info("📝 Generating subtitles for Story Mode...")
-        # Note: generate_from_script expects 'voiceover_text' usually. 
-        # We need to map 'dialogue' to 'voiceover_text' if missing.
+            
+        # Subtitles for Story
         subtitle_scenes = []
         for s in script.get("scenes", []):
-            scene_copy = s.copy()
-            if not scene_copy.get("voiceover_text") and scene_copy.get("dialogue"):
-                 scene_copy["voiceover_text"] = scene_copy["dialogue"]
-            subtitle_scenes.append(scene_copy)
-
+            sc = s.copy()
+            if not sc.get("voiceover_text") and sc.get("dialogue"):
+                sc["voiceover_text"] = sc["dialogue"]
+            subtitle_scenes.append(sc)
+            
         srt_path = subtitle_engine.generate_from_script(subtitle_scenes, "/tmp/subtitles.srt")
         
-        # Burn Subtitles
         final_path = editor.finalize(
-            video_path=final_audio_path,
-            audio_path=final_audio_path, # Audio is already in the video file
-            subtitle_path=srt_path,
-            output_path="/tmp/final_video.mp4"
+             video_path=final_audio_path,
+             audio_path=final_audio_path, # Embedded
+             subtitle_path=srt_path,
+             output_path="/tmp/final_video.mp4"
         )
-    
-    # Upload final video to R2
+
+    # Upload
     final_key = f"videos/{script['niche_id']}/{script['title'].replace(' ', '_')}.mp4"
     storage.upload(final_path, final_key)
     
-    # Cleanup raw clip files
-    for clip_key in clip_keys:
-        storage.delete_file(clip_key)
+    # Cleanup
+    for c in local_clips: Path(c).unlink(missing_ok=True)
+    if bg_music_local: Path(bg_music_local).unlink(missing_ok=True)
     
     return final_key
+
 
 
 async def generate_seo_content(script: dict, channel_config: dict, background_image_key: str = None) -> dict:
@@ -725,10 +809,28 @@ async def upload_to_youtube(video_key: str, script: dict, channel_config: dict, 
         from pathlib import Path
         local_thumbnail = Path(seo_result["thumbnail_path"])
     
-    # Use SEO-optimized data if available
-    title = seo_result.get("title", script['title']) if seo_result else script['title']
-    description = seo_result.get("description", script['description']) if seo_result else script['description']
-    tags = seo_result.get("tags", channel_config.get("defaultTags", [])) if seo_result else channel_config.get("defaultTags", [])
+    # --- Metadata Logic ---
+    yt_data = script.get("youtube_upload") or {}
+    metadata = yt_data.get("metadata", {})
+    engagement = yt_data.get("engagement", {})
+    
+    # Priority 1: YouTubeUpload (Manual/Json)
+    # Priority 2: SEO Result (LLM)
+    # Priority 3: Fallback (Script/Config)
+    
+    title = metadata.get("title") or (seo_result.get("title") if seo_result else script['title'])
+    description = metadata.get("description") or (seo_result.get("description") if seo_result else script['description'])
+    
+    tags = metadata.get("tags")
+    if not tags:
+        tags = seo_result.get("tags") if seo_result else channel_config.get("defaultTags", [])
+        
+    # Extended Metadata
+    privacy_status = metadata.get("privacyStatus", "private")
+    publish_at = metadata.get("publishAt")
+    made_for_kids = metadata.get("madeForKids", False)
+    category_id = metadata.get("categoryId", "22")
+    playlist_name = metadata.get("playlistTitle")
     
     # Upload to YouTube
     result = await uploader.upload(
@@ -737,8 +839,17 @@ async def upload_to_youtube(video_key: str, script: dict, channel_config: dict, 
         description=description,
         tags=tags,
         thumbnail_path=local_thumbnail,
-        privacy_status="private"  # Always start as private
+        privacy_status=privacy_status,
+        category_id=category_id,
+        made_for_kids=made_for_kids,
+        publish_at=publish_at,
+        playlist_name=playlist_name
     )
+    
+    # Engagement
+    pinned_comment = engagement.get("pinnedComment")
+    if pinned_comment:
+        uploader.post_comment(result["video_id"], pinned_comment, pin=True)
     
     return result
 

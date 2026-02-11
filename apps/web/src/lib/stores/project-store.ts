@@ -93,14 +93,14 @@ export const useProjectStore = create<ProjectState>()(
                     // Map text-to-image prompt
                     textToImage: s.textToImage || s.text_to_image_prompt || s.character_pose_prompt || '',
                     // Map text-to-video/motion prompt
-                    textToVideo: s.textToVideo || s.image_to_video_prompt || s.motion_description || '',
-                    // Map dialogue
-                    dialogue: s.dialogue || s.voiceover_text || undefined,
+                    textToVideo: (s.grok_video_prompt as any)?.full_prompt || (s.grokVideoPrompt as any)?.fullPrompt || (s.textToVideo as string) || (s.image_to_video_prompt as string) || (s.motion_description as string) || '',
+                    // Map dialogue - DEFAULT TO EMPTY STRING
+                    dialogue: (s.dialogue as string) || (s.voiceover_text as string) || '',
                     // Map shot type
-                    shotType: s.shotType || s.camera_angle || undefined,
+                    shotType: (s.shotType as string) || (s.camera_angle as string) || 'medium shot',
                     // Existing URLs
-                    imageUrl: s.imageUrl || s.image_url || undefined,
-                    videoUrl: s.videoUrl || s.video_url || undefined,
+                    imageUrl: (s.imageUrl as string) || (s.image_url as string) || '',
+                    videoUrl: (s.videoUrl as string) || (s.video_url as string) || '',
                 }));
 
                 set({

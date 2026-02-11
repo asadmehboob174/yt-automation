@@ -47,6 +47,18 @@ class MasterCharacter(BaseModel):
     locked: bool = False
 
 
+class GrokVideoPrompt(BaseModel):
+    """Detailed Grok-specific prompt structure for cinema-quality video."""
+    main_action: str
+    camera_movement: str = ""
+    character_animation: str = ""
+    emotion: str = ""
+    pacing: str = ""
+    vfx: str = ""
+    lighting_changes: str = ""
+    full_prompt: Optional[str] = None
+
+
 class SceneBreakdown(BaseModel):
     """Scene breakdown with both image and video prompts."""
     scene_number: int
@@ -60,14 +72,67 @@ class SceneBreakdown(BaseModel):
     duration_in_seconds: int = 10
     camera_angle: str = "Medium shot"
     dialogue: Optional[str] = None
-    sound_effect: Optional[str] = None # Added for Grok prompt inclusion
-    emotion: str = "neutrally" # Added for Grok prompt inclusion
+    sound_effect: Optional[str] = None # Legacy single string
+    emotion: str = "neutrally" # Legacy string
+    
+    # New structured fields
+    grok_video_prompt: Optional[GrokVideoPrompt] = None
+    sfx: Optional[list[str]] = None
+    music_notes: Optional[str] = None
+
+
+class YouTubeUploadMetadata(BaseModel):
+    title: str
+    description: str
+    tags: list[str]
+    privacyStatus: str = "private"
+    madeForKids: bool = False
+    categoryId: str = "22"
+    publishAt: Optional[str] = None
+    playlistId: Optional[str] = None
+    playlistTitle: Optional[str] = None
+
+class YouTubeEngagement(BaseModel):
+    pinnedComment: Optional[str] = None
+
+class YouTubeUpload(BaseModel):
+    metadata: YouTubeUploadMetadata
+    engagement: Optional[YouTubeEngagement] = None
+
+
+class SoundtrackConfig(BaseModel):
+    background_music: str
+    music_timing: str
+    sfx_mixing: str
+
+class TransitionConfig(BaseModel):
+    type: str
+    duration: str
+    effects: str
+
+class ColorGradingConfig(BaseModel):
+    overall_look: str
+    consistency: str
+
+class TitleCardsConfig(BaseModel):
+    opening: str
+    closing: str
+
+class FinalAssembly(BaseModel):
+    total_clips: int
+    soundtrack: SoundtrackConfig
+    transitions: TransitionConfig
+    color_grading: ColorGradingConfig
+    title_cards: TitleCardsConfig
+    youtube_optimization: Optional[dict] = None
 
 
 class TechnicalBreakdownOutput(BaseModel):
     """Output schema for technical breakdown (characters + scenes)."""
     characters: list[MasterCharacter]
     scenes: list[SceneBreakdown]
+    youtube_upload: Optional[YouTubeUpload] = None
+    final_assembly: Optional[FinalAssembly] = None
 
 
 class ScriptGenerator:
@@ -243,6 +308,13 @@ Generate exactly {scene_count} scenes adhering to the structure above.
                         self._last_call_time = asyncio.get_event_loop().time()
                         return result['choices'][0]['message']['content']
                         
+                    except httpx.HTTPStatusError as e:
+                        if e.response.status_code == 403:
+                            print(f"❌ HF Access Forbidden (403). Your token may not have access to {self.HF_MODEL} or the router endpoint.")
+                            raise e # Propagate to allow fallback logic in caller
+                        print(f"⚠️ HF HTTP Error (Attempt {attempt+1}/{retries}): {e}")
+                        if attempt == retries - 1: raise e
+                        await asyncio.sleep(2)
                     except Exception as e:
                         print(f"⚠️ HF Call failed (Attempt {attempt+1}/{retries}): {e}")
                         if attempt == retries - 1:
@@ -612,6 +684,77 @@ Return ONLY valid JSON.
                 print(f"❌ Final repair failed: {e2}")
                 print(f"\n📝 CLEANED TEXT (first 1000 chars):\n{clean_text[:1000]}\n")
                 raise e
+
+    def parse_json_script(self, json_content: str) -> TechnicalBreakdownOutput:
+        """Parse a JSON string directly into the breakdown model."""
+        data = None
+        try:
+            # 1. Try Direct Parse (Best for valid JSON)
+            data = json.loads(json_content)
+        except json.JSONDecodeError:
+            try:
+                # 2. Try Cleaning (For LLM output / markdown)
+                clean_text = self._clean_json_text(json_content)
+                data = json.loads(clean_text)
+            except Exception as e:
+                print(f"❌ JSON Parsing failed: {e}")
+                raise ValueError(f"Invalid JSON script: {e}")
+            
+        try:
+            # Ensure fields exist
+            characters = []
+            if "characters" in data:
+                for c in data["characters"]:
+                    try:
+                        # Alias support
+                        if "whisk_prompt" in c and "prompt" not in c:
+                            c["prompt"] = c["whisk_prompt"]
+                            
+                        # Handle ID if name is missing (or map ID as name fallback)
+                        if "id" in c and "name" not in c:
+                            c["name"] = c["id"]
+
+                        characters.append(MasterCharacter(**c))
+                    except Exception as e:
+                        print(f"⚠️ Skipping invalid character: {e}")
+            
+            scenes = []
+            if "scenes" in data:
+                for s in data["scenes"]:
+                    # Ensure defaults for key fields if missing
+                    if "static_image_prompt" in s and not s.get("text_to_image_prompt"):
+                        s["text_to_image_prompt"] = s.pop("static_image_prompt")
+                        
+                    s.setdefault("duration_in_seconds", 5)
+                    s.setdefault("scene_number", len(scenes) + 1)
+                    try:
+                        scenes.append(SceneBreakdown(**s))
+                    except Exception as e:
+                        print(f"⚠️ Skipping invalid scene: {e}")
+            
+            youtube_upload = None
+            if "youtube_upload" in data:
+                try:
+                    youtube_upload = YouTubeUpload(**data["youtube_upload"])
+                except Exception as e:
+                    print(f"⚠️ Skipping invalid youtube_upload: {e}")
+            
+            final_assembly = None
+            if "final_assembly" in data:
+                try:
+                    final_assembly = FinalAssembly(**data["final_assembly"])
+                except Exception as e:
+                    print(f"⚠️ Skipping invalid final_assembly: {e}")
+                    
+            return TechnicalBreakdownOutput(
+                characters=characters,
+                scenes=scenes,
+                youtube_upload=youtube_upload,
+                final_assembly=final_assembly
+            )
+        except Exception as e:
+            print(f"❌ JSON Model Validation failed: {e}")
+            raise ValueError(f"Invalid JSON structure: {e}")
 
     async def parse_manual_script_llm(self, raw_text: str) -> TechnicalBreakdownOutput:
         """
@@ -1425,9 +1568,19 @@ RULES:
             )
             rewritten = rewritten.strip()
             if rewritten and len(rewritten) > 20:
-                print(f"   ✅ Rewritten: {rewritten[:80]}...")
+                print(f"   ✅ Rewritten (via HF): {rewritten[:80]}...")
                 return rewritten
-        except Exception as e:
-            print(f"   ❌ Rewrite failed: {e}")
+        except Exception as hf_err:
+            print(f"   ⚠️ HuggingFace rewrite failed ({hf_err}). Falling back to Gemini...")
+            try:
+                # FALLBACK TO GEMINI
+                gemini_prompt = f"{system_prompt}\n\nOriginal prompt:\n{original_prompt}"
+                rewritten = await self._call_gemini(gemini_prompt)
+                rewritten = rewritten.strip()
+                if rewritten and len(rewritten) > 10:
+                    print(f"   ✅ Rewritten (via Gemini): {rewritten[:80]}...")
+                    return rewritten
+            except Exception as gem_err:
+                print(f"   ❌ Gemini rewrite also failed: {gem_err}")
         
-        return original_prompt  # Return original if rewrite fails
+        return original_prompt  # Return original if all rewrites fail

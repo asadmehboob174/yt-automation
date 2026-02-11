@@ -22,7 +22,8 @@ interface AutomationState {
     cancelled: boolean;
 
     // Actions
-    startAutomation: (script: string, channelId: string, format: 'short' | 'long', autoUpload?: boolean) => Promise<string | null>;
+    // Actions
+    startAutomation: (script: string, channelId: string, format: 'short' | 'long', autoUpload?: boolean, preparedBreakdown?: any) => Promise<string | null>;
     cancelAutomation: () => void;
     updateStep: (index: number, status: AutomationStepStatus, message?: string) => void;
     updateProgress: (action: string) => void;
@@ -34,6 +35,12 @@ const createInitialSteps = (): AutomationStep[] =>
         name,
         status: 'pending' as AutomationStepStatus,
     }));
+
+const ensureString = (val: any): string => {
+    if (val === null || val === undefined) return '';
+    if (typeof val === 'string') return val;
+    return JSON.stringify(val);
+};
 
 export const useAutomationStore = create<AutomationState>((set, get) => ({
     isRunning: false,
@@ -74,7 +81,7 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
         });
     },
 
-    startAutomation: async (script, channelId, format, autoUpload = false) => {
+    startAutomation: async (script, channelId, format, autoUpload = false, preparedBreakdown = null) => {
         const { updateStep, updateProgress, reset } = get();
         reset();
         set({ isRunning: true, cancelled: false });
@@ -82,21 +89,22 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
         try {
             // Step 1: Parse script
             updateStep(0, 'running');
-            updateProgress('Sending script to backend...');
-            const breakdown = await api.post<{
-                title: string;
-                characters: Array<{ name: string; prompt: string }>;
-                scenes: Array<{
-                    character_pose_prompt: string;
-                    image_to_video_prompt: string;
-                    dialogue?: string;
-                }>;
-            }>('/scripts/generate-breakdown', {
-                story_narrative: script,
-                niche_id: channelId,
-                video_length: format,  // 'short' or 'long'
-                video_type: 'story',   // Default to 'story' for 1-click automation
-            });
+            let breakdown: any;
+
+            if (preparedBreakdown) {
+                updateProgress('Using provided JSON script...');
+                breakdown = preparedBreakdown;
+                // Simulate small delay for UX
+                await new Promise(r => setTimeout(r, 500));
+            } else {
+                updateProgress('Sending script to backend...');
+                breakdown = await api.post<any>('/scripts/generate-breakdown', {
+                    story_narrative: script,
+                    niche_id: channelId,
+                    video_length: format,  // 'short' or 'long'
+                    video_type: 'story',   // Default to 'story' for 1-click automation
+                });
+            }
 
             if (get().cancelled) return null;
             updateStep(0, 'done');
@@ -120,7 +128,7 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
             updateStep(2, 'running');
             const characterImages: Array<{ name: string; imageUrl: string }> = [];
 
-            const charactersToGenerate = characters.map((c, i) => ({
+            const charactersToGenerate = characters.map((c: any, i: number) => ({
                 index: i,
                 name: c.name,
                 prompt: c.prompt,
@@ -212,9 +220,10 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
             updateProgress(`Starting pipelined image and video generation...`);
 
             const videoPromises = new Map<number, Promise<void>>();
-            const scenesToGenerate = breakdown.scenes.map((s, i) => ({
+            const scenesToGenerate = breakdown.scenes.map((s: any, i: number) => ({
                 index: i,
-                prompt: (s as any).text_to_image_prompt || s.character_pose_prompt || '',
+                // Support both snake_case (API) and camelCase (JSON) keys
+                prompt: s.text_to_image_prompt || s.textToImage || s.character_pose_prompt || s.characterPose || '',
             }));
 
             // Use direct fetch for streaming
@@ -276,13 +285,18 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
                                 for (let attempt = 0; attempt < 3; attempt++) {
                                     if (get().cancelled) return;
                                     try {
+                                        // SANITIZE PAYLOAD
+                                        const sceneData = breakdown.scenes[index];
                                         const videoResult = await api.post<{ videoUrl: string }>('/scenes/generate-video', {
                                             scene_index: index,
                                             image_url: imageUrl,
-                                            prompt: breakdown.scenes[index].image_to_video_prompt,
-                                            dialogue: breakdown.scenes[index].dialogue,
+                                            prompt: ensureString(sceneData.image_to_video_prompt || sceneData.textToVideo || sceneData.prompt),
+                                            dialogue: ensureString(sceneData.dialogue),
                                             niche_id: channelId,
                                             is_shorts: format === 'short',
+                                            camera_angle: ensureString(sceneData.camera_angle || sceneData.cameraAngle),
+                                            sound_effect: sceneData.sfx || sceneData.sound_effect,
+                                            emotion: ensureString(sceneData.emotion)
                                         });
                                         useProjectStore.getState().updateScene(index, { videoUrl: videoResult.videoUrl });
                                         videoSuccess = true;
@@ -331,16 +345,23 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
 
                 if (!isValid) {
                     updateProgress(`Regenerating missing/corrupt video for scene ${i + 1}...`);
-                    const repairResult = await api.post<{ videoUrl: string }>('/scenes/generate-video', {
+                    const sceneData = breakdown.scenes[i];
+                    const repairResult = await api.post<{ videoUrl: string, formattedPrompt: string }>('/scenes/generate-video', {
                         scene_index: i,
-                        image_url: scene.imageUrl,
-                        prompt: breakdown.scenes[i].image_to_video_prompt,
-                        dialogue: breakdown.scenes[i].dialogue,
+                        image_url: scene.imageUrl || '',
+                        prompt: ensureString(sceneData.image_to_video_prompt || sceneData.textToVideo || sceneData.prompt),
+                        dialogue: ensureString(sceneData.dialogue),
                         niche_id: channelId,
                         is_shorts: format === 'short',
+                        camera_angle: ensureString(sceneData.camera_angle || sceneData.cameraAngle),
+                        sound_effect: sceneData.sfx || sceneData.sound_effect,
+                        emotion: ensureString(sceneData.emotion)
                     });
                     currentVideoUrl = repairResult.videoUrl;
-                    useProjectStore.getState().updateScene(i, { videoUrl: currentVideoUrl });
+                    useProjectStore.getState().updateScene(i, {
+                        videoUrl: currentVideoUrl,
+                        formattedPrompt: repairResult.formattedPrompt
+                    });
                 }
 
                 finalVideoUrls.push(currentVideoUrl || '');
@@ -386,6 +407,8 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
                 script: scriptContent, // Pass full script for context
                 auto_upload: autoUpload,
                 thumbnail_url: useProjectStore.getState().thumbnailUrl,
+                youtube_upload: (breakdown as any).youtube_upload,
+                final_assembly: (breakdown as any).final_assembly,
             });
             updateStep(6, 'done');
 

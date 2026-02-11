@@ -545,3 +545,111 @@ class FFmpegVideoEditor:
             
             logger.info(f"✅ Finalized video -> {output_path}")
             return Path(output_path)
+    
+    def stitch_clips_with_transitions(
+        self,
+        clip_paths: list[Path],
+        output_path: Optional[Path] = None,
+        transition_duration: float = 0.5,
+        target_resolution: tuple[int, int] = (1920, 1080)
+    ) -> Path:
+        """Stitch clips with crossfade transitions (alias for workflow)."""
+        return self.stitch_clips_with_fade(
+            clip_paths, 
+            output_path, 
+            fade_duration=transition_duration, 
+            target_resolution=target_resolution
+        )
+
+    def apply_color_grading(
+        self,
+        video_path: Path,
+        grading_config: dict,
+        output_path: Optional[Path] = None
+    ) -> Path:
+        """
+        Apply color grading using FFmpeg filters.
+        config example: {"overall_look": "desaturated", "consistency": "dark_stormy"}
+        """
+        output_path = output_path or self.output_dir / "graded.mp4"
+        
+        # Determine filters based on config
+    def apply_color_grading(
+        self,
+        video_path: Path,
+        grading_config: dict,
+        output_path: Optional[Path] = None
+    ) -> Path:
+        """
+        Apply color grading using FFmpeg filters.
+        config example: {"overall_look": "desaturated", "consistency": "dark_stormy"}
+        """
+        import subprocess
+        output_path = output_path or self.output_dir / "graded.mp4"
+        
+        # Determine filters based on config
+        look = grading_config.get("overall_look", "").lower()
+        filters = []
+        
+        if "desaturated" in look or "horror" in look:
+            # Desaturate and increase contrast (eq) + slight blue tint (colorbalance)
+            filters.append("eq=saturation=0.6:contrast=1.2:brightness=-0.05")
+            filters.append("colorbalance=bs=0.1") # Blue shadows
+        elif "vibrant" in look:
+            filters.append("eq=saturation=1.3:contrast=1.1")
+        elif "vintage" in look:
+            filters.append("curves=vintage")
+        else:
+            # Default mild enhancement
+            filters.append("eq=saturation=1.1:contrast=1.05")
+            
+        filter_str = ",".join(filters)
+        
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(video_path),
+            "-vf", filter_str,
+            "-c:a", "copy",
+            str(output_path)
+        ]
+        
+        logger.info(f"🎨 Applying color grading ({look})...")
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+            logger.info(f"✅ Applied color grading -> {output_path.name}")
+            return output_path
+        except subprocess.CalledProcessError as e:
+            logger.error(f"❌ Grading failed: {e.stderr.decode('utf-8')}")
+            raise e
+
+    def render_title_card(
+        self,
+        text: str,
+        style: str = "horror",
+        duration: float = 3.0,
+        output_path: Optional[Path] = None
+    ) -> Path:
+        """Generate a title card video clip."""
+        output_path = output_path or self.output_dir / "title_card.mp4"
+        
+        # Styles
+        # Horror: Red text on black
+        # Standard: White on black
+        font_color = "red" if "horror" in style.lower() else "white"
+        font_size = 96
+        
+        # Use simple color source + drawtext
+        # Escape text for drawtext
+        text_escaped = text.replace(":", "\\:").replace("'", "")
+        
+        (
+            ffmpeg
+            .input(f"color=c=black:s=1920x1080:d={duration}", f="lavfi")
+            .filter("drawtext", text=text_escaped, fontsize=font_size, fontcolor=font_color, x="(w-text_w)/2", y="(h-text_h)/2")
+            .output(str(output_path))
+            .overwrite_output()
+            .run(quiet=True)
+        )
+        
+        logger.info(f"🪧 Generated title card: '{text}'")
+        return output_path

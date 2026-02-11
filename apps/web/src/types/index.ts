@@ -43,6 +43,19 @@ export interface Scene {
     shotType?: string;  // e.g., "Medium Shot", "Close-up"
     imageUrl?: string;
     videoUrl?: string;
+    // New structured fields
+    grokVideoPrompt?: {
+        mainAction: string;
+        cameraMovement?: string;
+        characterAnimation?: string;
+        emotion?: string;
+        vfx?: string;
+        lightingChanges?: string;
+        fullPrompt?: string;
+    };
+    sfx?: string[];
+    musicNotes?: string;
+    formattedPrompt?: string;
 }
 
 // ============ Script Types ============
@@ -52,6 +65,8 @@ export interface ScriptBreakdown {
     thumbnail_prompt?: string;
     characters: Character[];
     scenes: Scene[];
+    youtube_upload?: any;
+    final_assembly?: any;
 }
 
 export interface GenerateScriptRequest {
