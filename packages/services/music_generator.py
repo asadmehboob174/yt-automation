@@ -246,7 +246,7 @@ def generate_background_music(duration: float, mood: str = "calm") -> Path:
 async def generate_music_with_ai(prompt: str, duration: int = 10) -> Optional[Path]:
     """Generate custom music using AI (MusicGen)."""
     try:
-        api_key = os.getenv("HUGGINGFACE_API_KEY")
+        api_key = os.getenv("HUGGINGFACE_API_KEY") or os.getenv("HF_TOKEN")
         if not api_key:
             logger.warning("No HF API Key found. Skipping AI music generation.")
             return None

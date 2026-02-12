@@ -625,6 +625,35 @@ class YouTubeSEO:
         )
 
 
+    def extract_from_json(self, youtube_upload_data: dict) -> SEOResult:
+        """
+        Extract SEO data from the detailed youtube_upload JSON structure.
+        Adapter to convert new schema to SEOResult.
+        """
+        try:
+            # Extract basic metadata
+            title = youtube_upload_data.get("titles", {}).get("primary", "")
+            description = youtube_upload_data.get("description", "")
+            tags = youtube_upload_data.get("tags", [])
+            
+            # Extract thumbnail info (we still need to generate it, but we have the text)
+            thumbnail_data = youtube_upload_data.get("thumbnail", {})
+            thumbnail_text = thumbnail_data.get("text", "")
+            
+            # We don't have the image path here, so we return what we have
+            # and let the caller handle the actual image generation using the text
+            return SEOResult(
+                title=title,
+                description=description,
+                tags=tags,
+                thumbnail_path=None # Path needs t be generated
+            )
+        except Exception as e:
+            logger.error(f"❌ Failed to extract SEO from JSON: {e}")
+            # Fallback to empty
+            return SEOResult(title="", description="", tags=[])
+
+
 # ============================================
 # Hook Script Generator
 # ============================================

@@ -10,8 +10,9 @@ Durable workflow for generating AI videos with:
 """
 import logging
 import asyncio
-from typing import Any
 from inngest import Inngest, Function, Context
+from pathlib import Path
+from typing import Any, Optional
 
 from .inngest_client import inngest_client
 from .cloud_storage import R2Storage
@@ -914,3 +915,61 @@ async def rate_limit_recovery(ctx: Context) -> dict:
     )
     
     return {"status": "resumed", "video_id": video_id}
+
+
+async def _generate_dynamic_soundtrack(soundtrack_config: dict, script: dict, duration: float) -> Optional[Path]:
+    """
+    Generate soundtrack based on Final Assembly config.
+    Decides between Stock Music (Mood) and AI Music (Prompt).
+    """
+    from .music_generator import generate_background_music, generate_music_with_ai, MusicLibrary
+    
+    bg_desc = soundtrack_config.get("background_music", "")
+    if not bg_desc:
+        return None
+        
+    logger.info(f"🎵 Generating Soundtrack: '{bg_desc}'")
+    
+    # 1. Analyze if it's a Stock Mood or Custom Prompt
+    # Check if the description matches any known mood keys
+    # specific moods often used: horror, happy, cinematic, etc.
+    
+    # Simple heuristic: If it's a single word, check stock first
+    # If it's a sentence, use AI
+    
+    is_stock = False
+    mood_candidate = bg_desc.lower().split(" ")[0].strip() # First word
+    if mood_candidate in MusicLibrary.TRACKS:
+        is_stock = True
+        
+    # Also check if user explicitly requested "Stock" or "AI" in metadata (advanced)
+    
+    generated_path = None
+    
+    if is_stock:
+        logger.info(f"   ↳ Detected Stock Mood: {mood_candidate}")
+        try:
+            generated_path = generate_background_music(duration, mood_candidate)
+        except Exception as e:
+            logger.error(f"   ❌ Stock generation failed: {e}")
+    else:
+        logger.info(f"   ↳ Detected Custom Prompt. Attempting AI Generation...")
+        try:
+            # AI Music Gen is slow and has length limits (usually 30s max on free tier HF)
+            # We might need to loop it if the video is long
+            # For now, we generate a 10-30s clip and the editor will loop it if needed?
+            # Actually simple editor just loops inputs.
+            
+            # Use 30s as standard generation length for background loop
+             generated_path = await generate_music_with_ai(bg_desc, duration=30)
+             
+             if not generated_path:
+                 logger.warning("   ⚠️ AI Generation returned None. Falling back to Stock 'Cinematic'.")
+                 generated_path = generate_background_music(duration, "cinematic")
+                 
+        except Exception as e:
+            logger.error(f"   ❌ AI Generation failed: {e}")
+            logger.info("   ↳ Fallback to Stock 'Cinematic'")
+            generated_path = generate_background_music(duration, "cinematic")
+            
+    return generated_path

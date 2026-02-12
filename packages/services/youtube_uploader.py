@@ -11,6 +11,7 @@ Implements safe upload process:
 import os
 import time
 import logging
+import json
 from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass
@@ -471,3 +472,159 @@ class YouTubeUploader:
                 else:
                     logger.error(f"❌ Failed to set thumbnail after {max_retries} attempts")
 
+    def add_end_screen(self, video_id: str, end_screen_data: dict):
+        """
+        Add end screen elements to a video.
+        Note: This uses the 'endScreen' part which is available in the API but sometimes restricted.
+        """
+        try:
+            elements = []
+            for item in end_screen_data.get("elements", []):
+                element = {
+                    "type": item["type"],  # subscribe, video, playlist, best_for_viewer
+                    "startOffset": {"type": "milliseconds", "value": item["start_time_seconds"] * 1000},
+                    "endOffset": {"type": "milliseconds", "value": item["end_time_seconds"] * 1000},
+                    "position": self._get_position_coordinates(item["position"])
+                }
+                
+                # Add specific fields based on type
+                if item["type"] == "playlist" and item.get("playlist_name"):
+                    # We need playlist ID, not name. In a real app we'd search for it.
+                    # For now, we'll log a warning if ID is missing or use a placeholder
+                    # element["playlistId"] = self._find_playlist_id(item["playlist_name"]) 
+                    pass
+                
+                elements.append(element)
+                
+            # Note: updating endScreen often requires 'partner' scope or similar.
+            # If it fails, we catch and log.
+            # The public API *does* support reading endScreens, but writing might be restricted
+            # to Content ID partners. We will try.
+            # Actually, videos().update() with part='endScreen' is not standard in v3 public docs.
+            # It might be an internal or partner-only feature.
+            # However, the user asked for it "via API".
+            # I will implement the logic as if it exists or use a workaround if known.
+            # Standard v3 does NOT have 'endScreen' in video resource.
+            # It was deperecated or never fully public.
+            # I will log this limitation.
+            logger.warning("⚠️ End Screens API is not fully supported in public YouTube Data API v3. Skipping actual API call to avoid 400 error.")
+            logger.info(f"📋 End Screen Configuration for {video_id}: {json.dumps(elements, indent=2)}")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to add end screen: {e}")
+
+    def _get_position_coordinates(self, position_name: str) -> dict:
+        """Map position names to relative coordinates (0.0-1.0)."""
+        positions = {
+            "top_center": {"left": 0.35, "top": 0.1},
+            "bottom_left": {"left": 0.05, "top": 0.6},
+            "bottom_right": {"left": 0.55, "top": 0.6},
+            "center": {"left": 0.3, "top": 0.4}
+        }
+        return positions.get(position_name, {"left": 0.05, "top": 0.1})
+
+    def handle_engagement(self, video_id: str, engagement_data: dict):
+        """Handle comments and replies."""
+        if not engagement_data:
+            return
+
+        # 1. Pinned Comment
+        if "pinned_comment" in engagement_data:
+            self.post_comment(video_id, engagement_data["pinned_comment"], pin=True)
+            
+        # 2. Reply Templates (Just logging for now as we can't reply to non-existent comments yet)
+        if "reply_templates" in engagement_data:
+            logger.info(f"📝 Reply templates loaded for {video_id}: {list(engagement_data['reply_templates'].keys())}")
+
+    def handle_community_posts(self, community_data: dict, video_id: str):
+        """
+        Handle Community Posts.
+        """
+        if not community_data:
+            return
+            
+        logger.info("📢 COMMUNITY POSTS (API Not Available - Manual Action Required):")
+        
+        if "pre_launch" in community_data:
+            post = community_data.get("pre_launch")
+            if post:
+                logger.info(f"   [PRE-LAUNCH] ({post.get('timing')}): {post.get('text')}")
+            
+        if "post_launch" in community_data:
+            post = community_data.get("post_launch")
+            if post:
+                text = post.get('text', '').replace('{video_url}', f"https://youtu.be/{video_id}")
+                logger.info(f"   [POST-LAUNCH] ({post.get('timing')}): {text}")
+
+    def handle_analytics_targets(self, video_id: str, targets: dict):
+        """Log analytics targets."""
+        if not targets:
+            return
+        logger.info(f"📊 Analytics Targets set for {video_id}. (Monitoring implementation pending)")
+
+
+    async def upload_enriched(
+        self,
+        video_path: Path,
+        youtube_upload_data: dict,
+        thumbnail_path: Optional[Path] = None
+    ) -> dict:
+        """
+        Master upload method using the full youtube_upload JSON structure.
+        """
+        try:
+            # Extract Core Metadata
+            settings = youtube_upload_data.get("video_settings") or {}
+            titles = youtube_upload_data.get("titles") or {}
+            
+            title = titles.get("primary", "Untitled Video")
+            description = youtube_upload_data.get("description", "")
+            tags = youtube_upload_data.get("tags", [])
+            
+            # Privacy & scheduling
+            privacy = settings.get("privacy", "private")
+            logger.info(f"🔒 Privacy setting detected: {privacy}")
+            publish_at = None
+            
+            # 1. Upload Video
+            video_id = self.upload_private(
+                video_path=video_path,
+                title=title,
+                description=description,
+                tags=tags,
+                category_id=settings.get("category", "22"),
+                made_for_kids=settings.get("made_for_kids", False)
+            )
+            
+            # 2. Upload Thumbnail
+            if thumbnail_path and thumbnail_path.exists():
+                self.set_thumbnail(video_id, thumbnail_path)
+            
+            # 3. Apply Engagement (Comments, etc.)
+            self.handle_engagement(video_id, youtube_upload_data.get("engagement", {}))
+            
+            # 4. End Screens (Simulated)
+            if "end_screen" in youtube_upload_data:
+                self.add_end_screen(video_id, youtube_upload_data["end_screen"])
+                
+            # 5. Community Posts (Log)
+            self.handle_community_posts(youtube_upload_data.get("community_posts", {}), video_id)
+            
+            # 6. Analytics Targets
+            self.handle_analytics_targets(video_id, youtube_upload_data.get("analytics_targets", {}))
+            
+            # 7. Promote Status
+            if privacy == "public":
+                self.promote_to_public(video_id)
+            elif privacy == "unlisted":
+                self.promote_to_unlisted(video_id)
+
+            return {
+                "video_id": video_id,
+                "status": privacy,
+                "url": f"https://youtu.be/{video_id}"
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Enriched Upload failed: {e}")
+            raise
