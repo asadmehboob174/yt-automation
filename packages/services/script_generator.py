@@ -9,7 +9,7 @@ import httpx
 import json
 import asyncio
 import re
-from typing import Optional
+from typing import Optional, Union
 from pydantic import BaseModel
 
 
@@ -49,7 +49,7 @@ class MasterCharacter(BaseModel):
 
 class GrokVideoPrompt(BaseModel):
     """Detailed Grok-specific prompt structure for cinema-quality video."""
-    main_action: str
+    main_action: Optional[str] = None
     camera_movement: str = ""
     character_animation: str = ""
     emotion: str = ""
@@ -81,49 +81,159 @@ class SceneBreakdown(BaseModel):
     music_notes: Optional[str] = None
 
 
-class YouTubeUploadMetadata(BaseModel):
-    title: str
-    description: str
-    tags: list[str]
-    privacyStatus: str = "private"
-    madeForKids: bool = False
-    categoryId: str = "22"
-    publishAt: Optional[str] = None
-    playlistId: Optional[str] = None
-    playlistTitle: Optional[str] = None
+class YouTubeVideoSettings(BaseModel):
+    category: str = "Film & Animation"
+    privacy: str = "private"
+    notify_subscribers: bool = True
+    embeddable: bool = True
+    license: str = "youtube"
+    made_for_kids: bool = False
+
+
+class YouTubeTitles(BaseModel):
+    primary: str
+    alternatives: list[str]
+
+
+class YouTubeThumbnailElement(BaseModel):
+    text: str
+    elements: list[str]
+
+
+class YouTubeSchedule(BaseModel):
+    best_time: str
+    best_days: list[str]
+
+
+class YouTubeReplyTemplates(BaseModel):
+    part_2: Optional[str] = None
+    scared: Optional[str] = None
+    theory: Optional[str] = None
+    compliment: Optional[str] = None
+    puppy: Optional[str] = None  # Specific to example, but can be generic "hero"
+
 
 class YouTubeEngagement(BaseModel):
-    pinnedComment: Optional[str] = None
+    pinned_comment: str
+    reply_templates: Optional[YouTubeReplyTemplates] = None
+
+
+class YouTubeCommunityPost(BaseModel):
+    timing: str
+    text: str
+
+
+class YouTubeCommunityPosts(BaseModel):
+    pre_launch: Optional[YouTubeCommunityPost] = None
+    post_launch: Optional[YouTubeCommunityPost] = None
+    milestone_100_views: Optional[YouTubeCommunityPost] = None
+    milestone_1000_views: Optional[YouTubeCommunityPost] = None
+    part_2_teaser: Optional[YouTubeCommunityPost] = None
+
+
+class YouTubeEndScreenElement(BaseModel):
+    type: str  # subscribe, best_for_viewer, playlist
+    position: str  # top_center, bottom_left, etc.
+    message: Optional[str] = None
+    start_time_seconds: int
+    end_time_seconds: int
+    playlist_name: Optional[str] = None
+
+
+class YouTubeEndScreen(BaseModel):
+    duration_seconds: int
+    elements: list[YouTubeEndScreenElement]
+    usage_note: Optional[str] = None
+
+
+class YouTubeAnalyticsTargetMetrics(BaseModel):
+    views: Optional[Union[int, dict]] = None
+    watch_time_percent: Optional[int] = None
+    likes: Optional[int] = None
+    comments: Optional[int] = None
+    shares: Optional[int] = None
+    ctr_percent: Optional[int] = None
+    avg_view_duration_seconds: Optional[int] = None
+    new_subscribers: Optional[int] = None
+    likes_ratio: Optional[int] = None
+    check_how: Optional[str] = None
+
+
+class YouTubeAnalyticsTargets(BaseModel):
+    first_hour: Optional[YouTubeAnalyticsTargetMetrics] = None
+    first_24_hours: Optional[YouTubeAnalyticsTargetMetrics] = None
+    first_week: Optional[YouTubeAnalyticsTargetMetrics] = None
+    red_flags: Optional[dict] = None  # Flexible dict for red flags
+
+
+class YouTubeCrossPlatform(BaseModel):
+    tiktok: Optional[dict] = None
+    instagram: Optional[dict] = None
+    twitter: Optional[dict] = None
+
+
+class YouTubeUploadMetadata(BaseModel):
+    # Flattening structure to match user request better or keeping nested?
+    # User request has `video_settings`, `titles` at top level of `youtube_upload`.
+    # `YouTubeUploadMetadata` in previous code was a mix.
+    # Let's redefine `YouTubeUpload` to match user's structure exactly.
+    pass
+
 
 class YouTubeUpload(BaseModel):
-    metadata: YouTubeUploadMetadata
+    video_settings: Optional[YouTubeVideoSettings] = None
+    titles: YouTubeTitles
+    description: str
+    tags: list[str]
+    thumbnail: Optional[YouTubeThumbnailElement] = None
+    schedule: Optional[YouTubeSchedule] = None
     engagement: Optional[YouTubeEngagement] = None
+    community_posts: Optional[YouTubeCommunityPosts] = None
+    end_screen: Optional[YouTubeEndScreen] = None
+    analytics_targets: Optional[YouTubeAnalyticsTargets] = None
+    cross_platform: Optional[YouTubeCrossPlatform] = None
+    playlists: list[str] = []
 
+
+# ============================================
+# FINAL ASSEMBLY SCHEMAS
+# ============================================
 
 class SoundtrackConfig(BaseModel):
     background_music: str
-    music_timing: str
-    sfx_mixing: str
+    music_timing: Optional[str] = None
+    sfx_mixing: Optional[str] = None
+
 
 class TransitionConfig(BaseModel):
     type: str
     duration: str
-    effects: str
+    effects: Optional[str] = None
+
 
 class ColorGradingConfig(BaseModel):
     overall_look: str
-    consistency: str
+    consistency: Optional[str] = None
+
 
 class TitleCardsConfig(BaseModel):
-    opening: str
-    closing: str
+    opening: Optional[str] = None
+    closing: Optional[str] = None
+
+
+class YouTubeOptimizationConfig(BaseModel):
+    format: str = "9:16 vertical for YouTube Shorts"
+    hook: Optional[str] = None
+    pacing: Optional[str] = None
+    ending: Optional[str] = None
+
 
 class FinalAssembly(BaseModel):
     total_clips: int
     soundtrack: SoundtrackConfig
     transitions: TransitionConfig
     color_grading: ColorGradingConfig
-    title_cards: TitleCardsConfig
+    title_cards: Optional[TitleCardsConfig] = None
     youtube_optimization: Optional[dict] = None
 
 
@@ -131,8 +241,8 @@ class TechnicalBreakdownOutput(BaseModel):
     """Output schema for technical breakdown (characters + scenes)."""
     characters: list[MasterCharacter]
     scenes: list[SceneBreakdown]
-    youtube_upload: Optional[YouTubeUpload] = None
-    final_assembly: Optional[FinalAssembly] = None
+    youtube_upload: Optional[YouTubeUpload] = None  # New detailed schema
+    final_assembly: Optional[FinalAssembly] = None    # New detailed schema
 
 
 class ScriptGenerator:
@@ -563,19 +673,41 @@ TARGET SCENES: {scene_count}
 Analyze the story and create EXACTLY {scene_count} scenes and establish 2 main characters.
 
 Create a structured breakdown with:
-1. MASTER CHARACTER PROMPTS: Define 2 main characters with detailed Text-to-Image prompts.
-2. SCENE BREAKDOWN: For each of the {scene_count} scenes, provide:
-   - scene_title: Brief title.
-   - voiceover_text: Narration/Script (2 sentences max).
-   - character_pose_prompt: [Style], [Lighting]. ([Character Name]: Brief Appearance). ACTION: [Action & Camera]. MUST REPEAT STYLE every time. Keep character appearance brief (e.g. "Boy: red hoodie").
-   - text_to_image_prompt: FULL detailed description for image generation.
-   - image_to_video_prompt: Dynamic movement for Grok (1-2 sentences).
-   - motion_description: Concise instruction (e.g. "Pan right").
-   - duration_in_seconds: 5-10.
-   - camera_angle: "wide", "medium", "close-up", etc.
-   - dialogue: '[CHARACTER]: (emotion) "Speech"'. Use null if no dialogue.
+3. YOUTUBE UPLOADER JSON: Generate the 'youtube_upload' object with:
+    - video_settings: {category, privacy: "public", made_for_kids: false}
+    - titles: {primary: "Clickbait Title", alternatives: [...]}
+    - description: Full YouTube description with Hook, Timestamps, and Hashtags.
+    - tags: [List of 20+ viral tags]
+    - thumbnail: {text: "Overlay Text", elements: ["visual 1", "visual 2"]}
+    - engagement: {pinned_comment: "Engagement question?", reply_templates: {...}}
+    - community_posts: {pre_launch: {...}, post_launch: {...}}
+    - analytics_targets: {first_24_hours: {views: 1000, ...}}
 
+4. FINAL ASSEMBLY: Generate 'final_assembly' object with:
+    - total_clips: {scene_count}
+    - soundtrack: {
+        background_music: "Description of overall vibe",
+        music_timing: "Theme A (scene 1-3) -> Theme B (scene 4-6)", 
+        sfx_mixing: "Instructions"
+      }
+    - transitions: {type: "mix/cut", duration: "0.5s", effects: "..."}
+    - color_grading: {overall_look: "...", consistency: "..."}
+    - title_cards: {opening: "Title Text", closing: "CTA Text"}
+    - youtube_optimization: {format: "9:16", hook: "...", pacing: "...", ending: "..."}
+    
 Return ONLY valid JSON in this exact format:
+{{
+  "characters": [...],
+  "scenes": [...],
+  "youtube_upload": {{...}},
+  "final_assembly": {{
+      "soundtrack": {{...}},
+      "transitions": {{...}},
+      "color_grading": {{...}},
+      "title_cards": {{...}},
+      "youtube_optimization": {{...}}
+  }}
+}}
 {{
   "characters": [
     {{
@@ -597,7 +729,17 @@ Return ONLY valid JSON in this exact format:
       "camera_angle": "medium",
       "dialogue": null
     }}
-  ]
+  ],
+  "youtube_upload": {{
+      "video_settings": {{...}},
+      "titles": {{...}},
+      "description": "...",
+      "tags": [...],
+      "thumbnail": {{...}},
+      "engagement": {{...}},
+      "community_posts": {{...}},
+      "analytics_targets": {{...}}
+  }}
 }}
 Return ONLY valid JSON.
 - For character_pose_prompt, keep it extremely brief: [Style]. ([Name]: visual). ACTION: [Action].
@@ -610,8 +752,8 @@ Return ONLY valid JSON.
         #     timeout=120.0,
         #     retries=5
         # )
-        # text = await self._call_llm(prompt, json_mode=True)
-        raise ValueError("AI generation is disabled. Please use 'Manual Script' mode.")
+        text = await self._call_llm(prompt, json_mode=True)
+        # raise ValueError("AI generation is disabled. Please use 'Manual Script' mode.")
         
         print(f"DEBUG: Raw technical breakdown text length: {len(text)}")
         
@@ -685,20 +827,24 @@ Return ONLY valid JSON.
                 print(f"\n📝 CLEANED TEXT (first 1000 chars):\n{clean_text[:1000]}\n")
                 raise e
 
-    def parse_json_script(self, json_content: str) -> TechnicalBreakdownOutput:
-        """Parse a JSON string directly into the breakdown model."""
+    def parse_json_script(self, json_content: Union[str, dict]) -> TechnicalBreakdownOutput:
+        """Parse a JSON string or dict directly into the breakdown model."""
         data = None
-        try:
-            # 1. Try Direct Parse (Best for valid JSON)
-            data = json.loads(json_content)
-        except json.JSONDecodeError:
+        
+        if isinstance(json_content, dict):
+             data = json_content
+        else:
             try:
-                # 2. Try Cleaning (For LLM output / markdown)
-                clean_text = self._clean_json_text(json_content)
-                data = json.loads(clean_text)
-            except Exception as e:
-                print(f"❌ JSON Parsing failed: {e}")
-                raise ValueError(f"Invalid JSON script: {e}")
+                # 1. Try Direct Parse (Best for valid JSON)
+                data = json.loads(json_content)
+            except json.JSONDecodeError:
+                try:
+                    # 2. Try Cleaning (For LLM output / markdown)
+                    clean_text = self._clean_json_text(json_content)
+                    data = json.loads(clean_text)
+                except Exception as e:
+                    print(f"❌ JSON Parsing failed: {e}")
+                    raise ValueError(f"Invalid JSON script: {e}")
             
         try:
             # Ensure fields exist
@@ -725,6 +871,14 @@ Return ONLY valid JSON.
                     if "static_image_prompt" in s and not s.get("text_to_image_prompt"):
                         s["text_to_image_prompt"] = s.pop("static_image_prompt")
                         
+                    # Handle duration string "6s" -> int 6
+                    if "duration" in s and "duration_in_seconds" not in s:
+                        try:
+                            dur_str = str(s["duration"]).lower().replace("s", "").strip()
+                            s["duration_in_seconds"] = int(float(dur_str))
+                        except:
+                            pass
+
                     s.setdefault("duration_in_seconds", 5)
                     s.setdefault("scene_number", len(scenes) + 1)
                     try:
@@ -745,7 +899,7 @@ Return ONLY valid JSON.
                     final_assembly = FinalAssembly(**data["final_assembly"])
                 except Exception as e:
                     print(f"⚠️ Skipping invalid final_assembly: {e}")
-                    
+
             return TechnicalBreakdownOutput(
                 characters=characters,
                 scenes=scenes,
@@ -812,6 +966,30 @@ CRITICAL RULES FOR SCENE EXTRACTION:
 5. Extract EVERY scene, even if there are 10, 12, or more scenes
 6. Copy text EXACTLY as written (preserve the original wording)
 
+### TASK 3: GENERATE YOUTUBE UPLOAD DATA
+Even if not in the script, you MUST generate a 'youtube_upload' object based on the script's content:
+- **video_settings**: {category: "Film & Animation", privacy: "public", made_for_kids: false}
+- **titles**: {primary: "Viral Clickbait Title", alternatives: ["Alt 1", "Alt 2"]}
+- **description**: Engaging description with Hook, Story Summary, and Hashtags.
+- **tags**: [List of 20+ viral tags related to the niche/story]
+- **thumbnail**: {text: "Compelling Overlay Text", elements: ["Visual Element 1", "Visual Element 2"]}
+- **engagement**: {pinned_comment: "Engagement question?", reply_templates: {...}}
+- **community_posts**: {pre_launch: {...}, post_launch: {...}}
+- **analytics_targets**: {first_24_hours: {views: 1000, ...}}
+
+### TASK 4: GENERATE FINAL ASSEMBLY DATA
+Even if not in the script, you MUST generate a 'final_assembly' object for post-production:
+- **total_clips**: Count of scenes extracted
+- **soundtrack**: {
+    background_music: "Description of music vibe (e.g. Dark Horror, Upbeat)",
+    music_timing: "Specific timing (e.g. 'Build up (Sc 1-3) -> Climax (Sc 10)')", 
+    sfx_mixing: "Audio mixing instructions"
+  }
+- **transitions**: {type: "mix/cut", duration: "0.5s", effects: "..."}
+- **color_grading**: {overall_look: "Visual style", consistency: "..."}
+- **title_cards**: {opening: "Title", closing: "CTA"}
+- **youtube_optimization**: {format: "9:16", hook: "...", pacing: "...", ending: "..."}
+
 ### OUTPUT FORMAT (STRICT JSON):
 Return ONLY this JSON structure, nothing else:
 
@@ -835,7 +1013,24 @@ Return ONLY this JSON structure, nothing else:
       "character_pose_prompt": "Same as text_to_image_prompt",
       "duration_in_seconds": 5
     }}
-  ]
+  ],
+  "youtube_upload": {{
+      "video_settings": {{...}},
+      "titles": {{...}},
+      "description": "...",
+      "tags": [...],
+      "thumbnail": {{...}},
+      "engagement": {{...}},
+      "community_posts": {{...}},
+      "analytics_targets": {{...}}
+  }},
+  "final_assembly": {{
+      "soundtrack": {{...}},
+      "transitions": {{...}},
+      "color_grading": {{...}},
+      "title_cards": {{...}},
+      "youtube_optimization": {{...}}
+  }}
 }}
 
 ### FINAL REMINDERS:
@@ -1453,35 +1648,34 @@ OUTPUT JSON FORMAT:
 
         return TechnicalBreakdownOutput(characters=characters, scenes=scenes)
 
-    async def generate_viral_thumbnail_prompt(self, script_context: str) -> str:
+    async def generate_viral_thumbnail_prompt(self, script_context: str, niche: str = "general") -> str:
         """
-        Generate a high-converting, viral YouTube thumbnail prompt style-aligned with Pixar/Disney 3D.
+        Generate a high-converting, viral YouTube thumbnail prompt aligned with the video's niche.
         """
-        print("🎨 Generating VIRAL thumbnail prompt...")
+        print(f"🎨 Generating VIRAL thumbnail prompt (Niche: {niche})...")
         
-        prompt = f"""Act as a YouTube Thumbnails Expert and 3D Art Director.
+        prompt = f"""Act as a YouTube Thumbnails Expert and Art Director.
         
         CONTEXT:
         {script_context[:2000]}...
         
+        NICHE: {niche}
+
         TASK:
         Create a SINGLE, detailed text-to-image prompt for a viral YouTube thumbnail.
         
-        STYLE:
-        High-quality Pixar/Disney 3D animation style. Vibrant colors, expressive faces, high contrast.
+        STYLE REQUIREMENTS:
+        - Match the niche: {niche}
+        - High-quality 3D or cinematic style (unless the niche suggests otherwise).
+        - Vibrant colors, expressive faces, high contrast.
         
-        REQUIREMENTS:
-        1. Main Subject: The most interesting character or element from the story.
-        2. Action: High energy, shock, or intense emotion (e.g. wide eyes, mouth open, running).
-        3. Composition: Rule of thirds, depth of field, 8k resolution.
-        4. Lighting: Cinematic lighting, rim lighting, volumetric fog.
-        5. Background: Detailed but slightly blurred to make subject pop.
+        COMPOSITION:
+        1. Main Subject: The most interesting character or element from the context.
+        2. Action: Intense emotion (e.g. shock, joy, curiosity).
+        3. Depth: Deep depth of field, 8k resolution, cinematic lighting.
         
         OUTPUT FORMAT:
-        Return ONLY the raw prompt string. No "Here is the prompt" or quotes.
-        
-        Example Output:
-        A cute 3D animated cat with wide eyes looking terrified at a glowing magical sword, Pixar style, 8k resolution, vibrant orange and teal lighting, volumetric fog, cinematic composition.
+        Return ONLY the raw prompt string. No quotes or intro.
         """
         
         try:
@@ -1501,23 +1695,23 @@ OUTPUT JSON FORMAT:
             print(f"   ❌ Failed to generate thumbnail prompt: {e}")
             return "A high quality 3D render of the main character, Pixar style, vibrant lighting, 8k resolution, cinematic composition."
 
-    async def generate_viral_metadata(self, script_context: str) -> dict:
+    async def generate_viral_metadata(self, script_context: str, niche: str = "general") -> dict:
         """
         Generate viral Title, Description, and Tags using LLM.
         """
-        print("📈 Generating viral metadata...")
+        print(f"📈 Generating viral metadata (Niche: {niche})...")
         
-        prompt = f"""Act as a Viral YouTube Strategist (MrBeast style).
+        prompt = f"""Act as a YouTube Growth Strategist specializing in the '{niche}' niche.
         
         CONTEXT:
         {script_context[:3000]}...
         
         TASK:
-        Generate the metadata to MAXIMIZE click-through rate (CTR).
+        Generate metadata to MAXIMIZE CTR for a video about {niche}.
         
-        1. TITLE: Under 60 chars. Shocking, curiosity gap, or high stakes. NO CLICKBAIT that lies.
-        2. DESCRIPTION: 3 lines. First line is the hook. Include keywords.
-        3. TAGS: 15 high-volume keywords.
+        1. TITLE: Under 60 chars. Must be HIGHLY RELEVANT to the context provided. Use curiosity or high stakes appropriately for the niche. DO NOT mention MrBeast or unrelated celebrities.
+        2. DESCRIPTION: 3 lines. First line is the hook. Include keywords for {niche}.
+        3. TAGS: 15 high-volume keywords specific to {niche} and this story.
         
         OUTPUT FORMAT (Strict JSON):
         {{

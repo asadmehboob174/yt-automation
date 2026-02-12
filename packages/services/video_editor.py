@@ -16,9 +16,15 @@ logger = logging.getLogger(__name__)
 class FFmpegVideoEditor:
     """High-speed video editing using FFmpeg filter graphs."""
     
+    
     def __init__(self, output_dir: Optional[Path] = None):
         self.output_dir = output_dir or Path(tempfile.mkdtemp())
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Support custom FFmpeg paths from .env
+        import os
+        self.ffmpeg_cmd = os.getenv("FFMPEG_PATH", "ffmpeg")
+        self.ffprobe_cmd = os.getenv("FFPROBE_PATH", "ffprobe")
     
     def stitch_clips(
         self,
@@ -43,7 +49,7 @@ class FFmpegVideoEditor:
             .input(str(concat_file), format="concat", safe=0)
             .output(str(output_path), c="copy")
             .overwrite_output()
-            .run(quiet=True)
+            .run(quiet=True, cmd=self.ffmpeg_cmd)
         )
         
         logger.info(f"✅ Stitched {len(clip_paths)} clips -> {output_path.name}")
@@ -82,7 +88,7 @@ class FFmpegVideoEditor:
         durations = []
         for clip in clip_paths:
             try:
-                probe = ffmpeg.probe(str(clip))
+                probe = ffmpeg.probe(str(clip), cmd=self.ffprobe_cmd)
                 dur = float(probe['format']['duration'])
                 valid_clips.append(clip)
                 durations.append(dur)
@@ -115,7 +121,7 @@ class FFmpegVideoEditor:
             # Audio: assume exists, map [i:a] -> [a{i}]
             # We must handle missing audio or mixed formats? 
             # For simplicity, we assume inputs have audio. If not, 'anullsrc' is needed.
-            inputs_probe = ffmpeg.probe(str(clip))
+            inputs_probe = ffmpeg.probe(str(clip), cmd=self.ffprobe_cmd)
             has_audio = any(s['codec_type'] == 'audio' for s in inputs_probe['streams'])
             if has_audio:
                 filter_parts.append(f"[{i}:a]aresample=44100[a{i}]")
@@ -222,7 +228,7 @@ class FFmpegVideoEditor:
             
         
         # COMMAND
-        cmd = ['ffmpeg', '-y'] + inputs + [
+        cmd = [self.ffmpeg_cmd, '-y'] + inputs + [
             '-filter_complex', ";".join(filter_parts),
             '-map', final_v_label,
             '-map', final_a_label,
@@ -271,7 +277,7 @@ class FFmpegVideoEditor:
             .filter_complex(zoompan_filter)
             .output(str(output_path), pix_fmt="yuv420p", c_a="copy")
             .overwrite_output()
-            .run(quiet=True)
+            .run(quiet=True, cmd=self.ffmpeg_cmd)
         )
         
         logger.info(f"✅ Applied Ken Burns effect -> {output_path.name}")
@@ -287,7 +293,7 @@ class FFmpegVideoEditor:
             .filter('setsar', 1)
             .output(str(output_path), c='libx264', preset='fast', crf=23, pix_fmt='yuv420p', ac='aac', audio_bitrate='192k')
             .overwrite_output()
-            .run(quiet=True)
+            .run(quiet=True, cmd=self.ffmpeg_cmd)
         )
 
     def burn_subtitles(
@@ -326,7 +332,7 @@ class FFmpegVideoEditor:
             .filter("subtitles", srt_path_str, force_style=force_style)
             .output(str(output_path))
             .overwrite_output()
-            .run(quiet=True)
+            .run(quiet=True, cmd=self.ffmpeg_cmd)
         )
         
         logger.info(f"✅ Burned subtitles (Style: {style}) -> {output_path.name}")
@@ -343,7 +349,7 @@ class FFmpegVideoEditor:
         output_path = output_path or self.output_dir / "transition.mp4"
         
         # Get duration of first clip
-        probe = ffmpeg.probe(str(clip_a))
+        probe = ffmpeg.probe(str(clip_a), cmd=self.ffprobe_cmd)
         duration_a = float(probe['streams'][0]['duration'])
         offset = duration_a - transition_duration
         
@@ -358,7 +364,7 @@ class FFmpegVideoEditor:
             )
             .output(str(output_path))
             .overwrite_output()
-            .run(quiet=True)
+            .run(quiet=True, cmd=self.ffmpeg_cmd)
         )
         
         logger.info(f"✅ Added transition -> {output_path.name}")
@@ -384,11 +390,11 @@ class FFmpegVideoEditor:
         output_path = output_path or self.output_dir / "with_music.mp4"
         
         # Check if video has audio stream
-        probe = ffmpeg.probe(str(video_path))
+        probe = ffmpeg.probe(str(video_path), cmd=self.ffprobe_cmd)
         has_audio = any(s['codec_type'] == 'audio' for s in probe['streams'])
         
         # Build command using subprocess for maximum control
-        cmd = ['ffmpeg', '-y', '-i', str(video_path), '-i', str(music_path)]
+        cmd = [self.ffmpeg_cmd, '-y', '-i', str(video_path), '-i', str(music_path)]
         
         if has_audio:
             # Normalize both inputs to 44.1kHz Stereo to prevent mixing errors
@@ -472,7 +478,7 @@ class FFmpegVideoEditor:
             .input(str(concat_file), format="concat", safe=0)
             .output(str(concat_output), c="copy")
             .overwrite_output()
-            .run(quiet=True)
+            .run(quiet=True, cmd=self.ffmpeg_cmd)
         )
         
         # Mix with background music if provided
@@ -490,7 +496,7 @@ class FFmpegVideoEditor:
                     map=['[aout]']
                 )
                 .overwrite_output()
-                .run(quiet=True)
+                .run(quiet=True, cmd=self.ffmpeg_cmd)
             )
         else:
             # Just copy the concatenated audio
@@ -523,7 +529,7 @@ class FFmpegVideoEditor:
                     shortest=None
                 )
                 .overwrite_output()
-                .run(quiet=True)
+                .run(quiet=True, cmd=self.ffmpeg_cmd)
             )
             
             return self.burn_subtitles(temp_output, subtitle_path, output_path)
@@ -540,7 +546,7 @@ class FFmpegVideoEditor:
                     shortest=None
                 )
                 .overwrite_output()
-                .run(quiet=True)
+                .run(quiet=True, cmd=self.ffmpeg_cmd)
             )
             
             logger.info(f"✅ Finalized video -> {output_path}")
@@ -606,7 +612,7 @@ class FFmpegVideoEditor:
         filter_str = ",".join(filters)
         
         cmd = [
-            "ffmpeg", "-y",
+            self.ffmpeg_cmd, "-y",
             "-i", str(video_path),
             "-vf", filter_str,
             "-c:a", "copy",
@@ -648,7 +654,7 @@ class FFmpegVideoEditor:
             .filter("drawtext", text=text_escaped, fontsize=font_size, fontcolor=font_color, x="(w-text_w)/2", y="(h-text_h)/2")
             .output(str(output_path))
             .overwrite_output()
-            .run(quiet=True)
+            .run(quiet=True, cmd=self.ffmpeg_cmd)
         )
         
         logger.info(f"🪧 Generated title card: '{text}'")

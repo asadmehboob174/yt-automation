@@ -634,7 +634,10 @@ async def generate_breakdown(request: GenerateBreakdownRequest):
                     )
         
         # Implement Thumbnail Prompt Generation
-        thumbnail_prompt = await generator.generate_viral_thumbnail_prompt(request.story_narrative)
+        thumbnail_prompt = await generator.generate_viral_thumbnail_prompt(
+            request.story_narrative,
+            niche=channel.nicheId if 'channel' in locals() and channel else "general"
+        )
         
         # DEBUG: Log what we're returning
         result = breakdown.model_dump()
@@ -1581,6 +1584,10 @@ async def stitch_videos(request: StitchVideosRequest):
         corrupt_indices = []
         corrupt_urls = []
         
+        # Support custom FFmpeg paths
+        ffmpeg_cmd = os.getenv("FFMPEG_PATH", "ffmpeg")
+        ffprobe_cmd = os.getenv("FFPROBE_PATH", "ffprobe")
+        
         for i, clip_path in enumerate(local_clips):
             is_valid = False
             head = b""
@@ -1598,8 +1605,16 @@ async def stitch_videos(request: StitchVideosRequest):
                      print(f"   ❌ Clip {i} {clip_path.name} is too small ({size} bytes)")
                 else:
                     # 3. FFPROBE CHECK
-                    ffprobe_lib.probe(str(clip_path))
-                    is_valid = True
+                    try:
+                        ffprobe_lib.probe(str(clip_path), cmd=ffprobe_cmd)
+                        is_valid = True
+                    except Exception as probe_err:
+                        print(f"      🔍 Probe fallack check: {probe_err}")
+                        # If ffprobe fails with "file not found", it's likely a system PATH issue
+                        if "winerror 2" in str(probe_err).lower():
+                             raise RuntimeError(f"FFprobe not found at '{ffprobe_cmd}'. Please install FFmpeg and add to PATH or set FFPROBE_PATH in .env")
+                        raise probe_err
+
             except Exception as e:
                 print(f"   ❌ Clip {i} {clip_path.name} validation failed: {e}")
                 print(f"      Size: {size} bytes. Head: {head[:50]}...")
@@ -1701,7 +1716,11 @@ async def stitch_videos(request: StitchVideosRequest):
         # 3. Get video duration and generate background music
         print(f"🎵 Generating ambient background music...")
         import ffmpeg as ffprobe_lib
-        probe = ffprobe_lib.probe(str(current_video_path))
+        
+        # Support custom FFmpeg paths
+        ffprobe_cmd = os.getenv("FFPROBE_PATH", "ffprobe")
+        
+        probe = ffprobe_lib.probe(str(current_video_path), cmd=ffprobe_cmd)
         video_duration = float(probe['streams'][0]['duration'])
         
         from services.music_generator import generate_background_music
@@ -2154,7 +2173,7 @@ async def upload_to_youtube(request: YouTubeUploadRequest):
     if request.generate_metadata and request.script_context:
         try:
             generator = ScriptGenerator()
-            metadata = await generator.generate_viral_metadata(request.script_context)
+            metadata = await generator.generate_viral_metadata(request.script_context, niche=request.niche_type)
             final_title = metadata.get("title", final_title)
             final_desc = metadata.get("description", final_desc)
             final_tags = metadata.get("tags", final_tags)
