@@ -1450,6 +1450,26 @@ async def generate_video(request: GenerateVideoRequest):
                 sfx=request.sound_effect.split(", ") if isinstance(request.sound_effect, str) else request.sound_effect
             )
 
+            # --- High Quality Stage: 4K Upscale ---
+            try:
+                from services.video_editor import FFmpegVideoEditor
+                editor = FFmpegVideoEditor()
+                
+                # Determine target resolution for 4K
+                # Long format: 3840x2160, Shorts: 2160x3840
+                target_res = (2160, 3840) if request.is_shorts else (3840, 2160)
+                
+                print(f"🚀 Starting 4K Upscale for scene {request.scene_index} ({target_res[0]}x{target_res[1]})...")
+                upscaled_path = editor.upscale_video(video_path, target_resolution=target_res)
+                
+                # Replace original path with upscaled path if successful
+                if upscaled_path.exists() and upscaled_path != video_path:
+                    # Original video_path will be cleaned up in finally block if it was different
+                    video_path = upscaled_path
+                    print(f"✨ 4K Upscale complete: {video_path.name}")
+            except Exception as e:
+                print(f"⚠️ 4K Upscale failed (falling back to original): {e}")
+
             # --- Success Path: Upload ---
             storage = R2Storage()
             video_key = f"videos/{request.niche_id}/scene_{request.scene_index}_{uuid.uuid4().hex[:8]}.mp4"
@@ -1530,12 +1550,16 @@ async def stitch_videos(request: StitchVideosRequest):
     from services.video_editor import FFmpegVideoEditor
     from services.cloud_storage import R2Storage
     
-    if not request.video_urls:
-        raise HTTPException(status_code=400, detail="No video URLs provided")
+    # Filter out empty or None URLs
+    video_urls = [url for url in request.video_urls if url and url.strip()]
     
-    print(f"🎬 Stitching {len(request.video_urls)} videos...")
+    if not video_urls:
+        raise HTTPException(status_code=400, detail="No valid video URLs provided")
+    
+    print(f"🎬 Stitching {len(video_urls)} videos...")
     
     local_clips = []
+    valid_clips = [] # Store clips that passed validation
     temp_dir = Path(tempfile.mkdtemp())
     
     try:
@@ -1543,8 +1567,8 @@ async def stitch_videos(request: StitchVideosRequest):
         storage_downloader = R2Storage()
         
         async with httpx.AsyncClient(timeout=120.0) as client:
-            for i, url in enumerate(request.video_urls):
-                print(f"📥 Downloading video {i+1}/{len(request.video_urls)}...")
+            for i, url in enumerate(video_urls):
+                print(f"📥 Downloading video {i+1}/{len(video_urls)}...")
                 try:
                     local_path = temp_dir / f"clip_{i:03d}.mp4"
                     
@@ -1572,8 +1596,8 @@ async def stitch_videos(request: StitchVideosRequest):
                     print(f"   ✅ Downloaded: {local_path.name}")
                     
                 except Exception as e:
-                    print(f"   ❌ Failed to download video {i+1}: {e}")
-                    raise HTTPException(status_code=500, detail=f"Failed to download video {i+1}: {e}")
+                    print(f"   ❌ Failed to download video {i+1}: {e}. Skipping.")
+                    continue
         
         if not local_clips:
             raise HTTPException(status_code=400, detail="No videos could be downloaded")
@@ -1621,26 +1645,23 @@ async def stitch_videos(request: StitchVideosRequest):
             
             if not is_valid:
                 corrupt_indices.append(i)
-                corrupt_urls.append(request.video_urls[i])
+                corrupt_urls.append(video_urls[i])
+                print(f"   ⚠️ Skipping corrupt clip {i}")
+            else:
+                valid_clips.append(clip_path)
 
-        if corrupt_indices:
-            print(f"⚠️ Found {len(corrupt_indices)} corrupt clips! Aborting stitch.")
+        if not valid_clips:
+            print(f"❌ No valid video clips remains after validation! Aborting stitch.")
             # Cleanup
             for p in local_clips:
                 try: p.unlink() 
                 except: pass
                 
-            # Return distinct error code for Frontend to handle
-            return JSONResponse(
-                status_code=422,
-                content={
-                    "detail": "Corrupt video clips detected",
-                    "code": "CORRUPT_CLIPS",
-                    "video_id": request.video_id, # Include video_id if available for repair
-                    "corrupt_indices": corrupt_indices,
-                    "corrupt_urls": corrupt_urls
-                }
-            )
+            raise HTTPException(status_code=422, detail="All provided video clips are corrupt or invalid.")
+
+        # Use only valid clips for stitching
+        final_clips_to_stitch = valid_clips
+        print(f"✅ Proceeding to stitch {len(final_clips_to_stitch)} valid clips (Skipped {len(corrupt_indices)} corrupt clips).")
 
         # 2. Stitch with FFmpeg
         # Fetch actual Channel Config to determine format accurately
@@ -1692,7 +1713,7 @@ async def stitch_videos(request: StitchVideosRequest):
         
         # We need to update VideoEditor to support target_resolution
         stitched_path = editor.stitch_clips_with_fade(
-            local_clips, 
+            final_clips_to_stitch, 
             stitched_path, 
             fade_duration=0.3,
             target_resolution=target_res
@@ -1881,7 +1902,8 @@ async def stitch_videos(request: StitchVideosRequest):
             "final_video_url": final_url,
             "final_video_key": final_key,
             "music_url": music_url,
-            "clips_stitched": len(local_clips),
+            "clips_stitched": len(final_clips_to_stitch),
+            "skipped_clips": len(corrupt_indices),
             "youtube_upload": youtube_info
         }
         

@@ -332,42 +332,68 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
             const finalVideoUrls: string[] = [];
 
             for (let i = 0; i < breakdown.scenes.length; i++) {
-                const scene = finalScenes[i];
+                let scene = useProjectStore.getState().scenes[i];
                 let currentVideoUrl = scene.videoUrl;
                 let isValid = false;
 
+                // Pass 1: Initial verify for existing URL
                 if (currentVideoUrl) {
-                    const verification = await api.post<{ valid: boolean, error?: string }>('/videos/verify', {
-                        video_url: currentVideoUrl
-                    });
-                    isValid = verification.valid;
+                    try {
+                        const verification = await api.post<{ valid: boolean }>('/videos/verify', { video_url: currentVideoUrl });
+                        isValid = verification.valid;
+                    } catch (e) {
+                        console.error(`Verification failed for scene ${i + 1}`, e);
+                    }
                 }
 
+                // Pass 2: Repair if invalid
                 if (!isValid) {
-                    updateProgress(`Regenerating missing/corrupt video for scene ${i + 1}...`);
-                    const sceneData = breakdown.scenes[i];
-                    const repairResult = await api.post<{ videoUrl: string, formattedPrompt: string }>('/scenes/generate-video', {
-                        scene_index: i,
-                        image_url: scene.imageUrl || '',
-                        prompt: ensureString(sceneData.image_to_video_prompt || sceneData.textToVideo || sceneData.prompt),
-                        dialogue: ensureString(sceneData.dialogue),
-                        niche_id: channelId,
-                        is_shorts: format === 'short',
-                        camera_angle: ensureString(sceneData.camera_angle || sceneData.cameraAngle),
-                        sound_effect: sceneData.sfx || sceneData.sound_effect,
-                        emotion: ensureString(sceneData.emotion)
-                    });
-                    currentVideoUrl = repairResult.videoUrl;
-                    useProjectStore.getState().updateScene(i, {
-                        videoUrl: currentVideoUrl,
-                        formattedPrompt: repairResult.formattedPrompt
-                    });
+                    updateProgress(`Repairing missing/corrupt video for scene ${i + 1}...`);
+                    try {
+                        const sceneData = breakdown.scenes[i];
+                        const repairResult = await api.post<{ videoUrl: string, formattedPrompt: string }>('/scenes/generate-video', {
+                            scene_index: i,
+                            image_url: scene.imageUrl || '',
+                            prompt: ensureString(sceneData.image_to_video_prompt || sceneData.textToVideo || sceneData.prompt),
+                            dialogue: ensureString(sceneData.dialogue),
+                            niche_id: channelId,
+                            is_shorts: format === 'short',
+                            camera_angle: ensureString(sceneData.camera_angle || sceneData.cameraAngle),
+                            sound_effect: sceneData.sfx || sceneData.sound_effect,
+                            emotion: ensureString(sceneData.emotion)
+                        });
+                        currentVideoUrl = repairResult.videoUrl;
+
+                        // RE-VERIFY immediately after repair
+                        if (currentVideoUrl) {
+                            const reVerify = await api.post<{ valid: boolean }>('/videos/verify', { video_url: currentVideoUrl });
+                            isValid = reVerify.valid;
+                            useProjectStore.getState().updateScene(i, {
+                                videoUrl: currentVideoUrl,
+                                isValidVideo: isValid,
+                                formattedPrompt: repairResult.formattedPrompt
+                            });
+                        }
+                    } catch (e) {
+                        console.error(`Repair failed for scene ${i + 1}`, e);
+                    }
+                } else {
+                    // Update store with valid status if not already set
+                    useProjectStore.getState().updateScene(i, { isValidVideo: true });
                 }
 
-                finalVideoUrls.push(currentVideoUrl || '');
+                if (isValid && currentVideoUrl) {
+                    finalVideoUrls.push(currentVideoUrl);
+                }
             }
 
             updateStep(4, 'done');
+            updateProgress('All videos verified. Checking final count...');
+
+            if (finalVideoUrls.length < breakdown.scenes.length) {
+                const missingCount = breakdown.scenes.length - finalVideoUrls.length;
+                throw new Error(`Automation failed: ${missingCount} videos remain missing or invalid after repair attempts.`);
+            }
 
             if (get().cancelled) return null;
 

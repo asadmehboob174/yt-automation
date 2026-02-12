@@ -29,7 +29,8 @@ import {
     ImagePlus,
     Video,
     Youtube,
-    FileJson
+    FileJson,
+    AlertCircle
 } from 'lucide-react';
 import { useProjectStore } from '@/lib/stores/project-store';
 import { useAutomationStore } from '@/lib/stores/automation-store';
@@ -1056,6 +1057,7 @@ function Step4SceneVideos() {
 
             updateScene(index, { 
                 videoUrl: result.videoUrl,
+                isValidVideo: true,
                 formattedPrompt: result.formattedPrompt 
             });
             toast.success(`Scene ${index + 1} video generated!`);
@@ -1080,50 +1082,61 @@ function Step4SceneVideos() {
 
     const handleGenerateAll = async () => {
         setGeneratingAll(true);
-        const failedScenes: number[] = [];
+        
+        const verifyAllVideos = async (currentScenes: typeof scenes) => {
+            const invalidIndices: number[] = [];
+            for (let i = 0; i < currentScenes.length; i++) {
+                const scene = currentScenes[i];
+                if (!scene.videoUrl) {
+                    invalidIndices.push(i);
+                    updateScene(i, { isValidVideo: false });
+                    continue;
+                }
+                try {
+                    const verification = await api.post<{ valid: boolean }>('/videos/verify', {
+                        video_url: scene.videoUrl
+                    });
+                    updateScene(i, { isValidVideo: verification.valid });
+                    if (!verification.valid) invalidIndices.push(i);
+                } catch (e) {
+                    console.error(`Verification failed for scene ${i + 1}`, e);
+                    updateScene(i, { isValidVideo: false });
+                    invalidIndices.push(i);
+                }
+            }
+            return invalidIndices;
+        };
 
-        // First pass: Generate all videos
+        // Pass 1: Initial generation for missing videos
         for (let i = 0; i < scenes.length; i++) {
             if (!scenes[i].videoUrl) {
-                const success = await handleGenerateVideo(i);
-                if (!success) {
-                    failedScenes.push(i);
-                }
+                await handleGenerateVideo(i);
             }
         }
 
-        // Verification pass: Check for any scenes that still don't have videos
-        const currentScenes = useProjectStore.getState().scenes;
-        const missingVideos = currentScenes
-            .map((s, i) => ({ index: i, hasVideo: !!s.videoUrl }))
-            .filter(s => !s.hasVideo);
-
-        if (missingVideos.length > 0) {
-            toast.warning(`${missingVideos.length} videos missing. Running retry pass...`);
-
-            // Retry pass for any still-missing videos
-            for (const missing of missingVideos) {
-                if (!failedScenes.includes(missing.index)) {
-                    await handleGenerateVideo(missing.index);
-                }
+        // Pass 2: Identification & Retry
+        let invalidIndices = await verifyAllVideos(useProjectStore.getState().scenes);
+        if (invalidIndices.length > 0) {
+            toast.warning(`${invalidIndices.length} videos invalid or missing. Retrying...`);
+            for (const idx of invalidIndices) {
+                await handleGenerateVideo(idx);
             }
         }
 
-        // Final verification
-        const finalScenes = useProjectStore.getState().scenes;
-        const allSuccess = finalScenes.every(s => s.videoUrl);
+        // Pass 3: Final Verification (Non-optional)
+        const finalInvalid = await verifyAllVideos(useProjectStore.getState().scenes);
 
-        if (allSuccess) {
-            toast.success('All videos generated successfully!');
+        if (finalInvalid.length === 0) {
+            toast.success('All videos verified successfully! Moving to final tab...');
+            setTimeout(() => setStep(5), 1500); 
         } else {
-            const stillMissing = finalScenes.filter(s => !s.videoUrl).length;
-            toast.error(`${stillMissing} videos could not be generated. Please retry manually.`);
+            toast.error(`${finalInvalid.length} videos are still invalid. Please check scenes: ${finalInvalid.map(i => i + 1).join(', ')}`);
         }
 
         setGeneratingAll(false);
     };
 
-    const allGenerated = scenes.every((s) => s.videoUrl);
+    const allValidated = scenes.every((s) => s.videoUrl && s.isValidVideo);
 
     return (
         <div className="space-y-6">
@@ -1134,13 +1147,13 @@ function Step4SceneVideos() {
                         Animate scene images using Grok
                     </p>
                 </div>
-                <Button onClick={handleGenerateAll} disabled={generatingAll || allGenerated}>
+                <Button onClick={handleGenerateAll} disabled={generatingAll || allValidated}>
                     {generatingAll ? (
                         <Loader2 className="h-4 w-4 mr-2 animate-spin" />
                     ) : (
                         <Film className="h-4 w-4 mr-2" />
                     )}
-                    Generate All Videos
+                    {allValidated ? 'All Videos Verified' : 'Generate/Verify All Videos'}
                 </Button>
             </div>
 
@@ -1155,11 +1168,16 @@ function Step4SceneVideos() {
                                 )}
                             </div>
                             {/* Video */}
-                            <div className="w-32 h-32 rounded-lg border bg-muted flex items-center justify-center overflow-hidden flex-shrink-0">
+                            <div className={`w-32 h-32 rounded-lg border bg-muted flex items-center justify-center overflow-hidden flex-shrink-0 relative ${scene.videoUrl && scene.isValidVideo === false ? 'border-red-500' : ''}`}>
                                 {scene.videoUrl ? (
                                     <video src={scene.videoUrl} className="w-full h-full object-cover" controls />
                                 ) : (
                                     <Play className="h-8 w-8 text-muted-foreground" />
+                                )}
+                                {scene.videoUrl && scene.isValidVideo === false && (
+                                    <div className="absolute top-1 right-1 bg-red-500 rounded-full p-1" title="Corrupt or invalid video detected">
+                                        <AlertCircle className="h-3 w-3 text-white" />
+                                    </div>
                                 )}
                             </div>
                             <div className="flex-1 space-y-2">
@@ -1210,7 +1228,7 @@ function Step4SceneVideos() {
                     <ChevronLeft className="h-4 w-4 mr-2" />
                     Back
                 </Button>
-                <Button onClick={() => setStep(5)} disabled={!allGenerated}>
+                <Button onClick={() => setStep(5)} disabled={!allValidated}>
                     Next: Final Video
                     <ChevronRight className="h-4 w-4 ml-2" />
                 </Button>
@@ -1235,7 +1253,7 @@ function Step5Final() {
         setIsStitching(true);
         try {
             const result = await api.post<{ status: string; final_video_url: string; clips_stitched: number }>('/videos/stitch', {
-                video_urls: scenes.map((s) => s.videoUrl),
+                video_urls: scenes.map((s) => s.videoUrl).filter(url => !!url),
                 niche_id: channelId,
                 title: breakdown?.title || 'Stitched Video',
                 music: musicOption,

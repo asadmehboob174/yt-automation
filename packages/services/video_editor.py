@@ -659,3 +659,42 @@ class FFmpegVideoEditor:
         
         logger.info(f"🪧 Generated title card: '{text}'")
         return output_path
+
+    def upscale_video(
+        self,
+        input_path: Path,
+        output_path: Optional[Path] = None,
+        target_resolution: tuple[int, int] = (3840, 2160)
+    ) -> Path:
+        """Upscale video to 4K resolution using high-quality Lanczos scaling."""
+        output_path = output_path or self.output_dir / f"upscaled_{input_path.name}"
+        target_w, target_h = target_resolution
+        
+        import subprocess
+        
+        # High-quality 4K upscaling command
+        # Using lanczos for sharp upscaling
+        # Using libx264 with high bitrate for 4K content
+        cmd = [
+            self.ffmpeg_cmd, '-y',
+            '-i', str(input_path),
+            '-vf', f'scale={target_w}:{target_h}:flags=lanczos',
+            '-c:v', 'libx264',
+            '-preset', 'slow',
+            '-crf', '18', # High quality for 4K
+            '-pix_fmt', 'yuv420p',
+            '-c:a', 'copy', # Keep original audio
+            str(output_path)
+        ]
+        
+        logger.info(f"🚀 Upscaling {input_path.name} to {target_w}x{target_h} (4K)...")
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+            logger.info(f"✅ Upscaled to 4K -> {output_path.name}")
+            return output_path
+        except subprocess.CalledProcessError as e:
+            logger.error(f"❌ Upscale failed: {e.stderr.decode('utf-8')}")
+            # If upscale fails, fallback to original
+            import shutil
+            shutil.copy(input_path, output_path)
+            return output_path

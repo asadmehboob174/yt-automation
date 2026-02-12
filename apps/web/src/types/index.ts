@@ -43,6 +43,7 @@ export interface Scene {
     shotType?: string;  // e.g., "Medium Shot", "Close-up"
     imageUrl?: string;
     videoUrl?: string;
+    isValidVideo?: boolean;
     // New structured fields
     grokVideoPrompt?: {
         mainAction: string;
