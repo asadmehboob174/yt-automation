@@ -39,6 +39,8 @@ export interface Scene {
     title?: string;
     textToImage: string;
     textToVideo: string;
+    textToVideoPrompt: string;   // grok_video_prompt.text_to_video_prompt (audio source)
+    textToVideoUrl?: string;     // generated text-to-video clip URL
     dialogue?: string;
     shotType?: string;  // e.g., "Medium Shot", "Close-up"
     imageUrl?: string;

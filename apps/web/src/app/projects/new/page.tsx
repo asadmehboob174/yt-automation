@@ -30,7 +30,8 @@ import {
     Video,
     Youtube,
     FileJson,
-    AlertCircle
+    AlertCircle,
+    Volume2
 } from 'lucide-react';
 import { useProjectStore } from '@/lib/stores/project-store';
 import { useAutomationStore } from '@/lib/stores/automation-store';
@@ -127,7 +128,8 @@ const parseJsonScript = (jsonScript: string): ScriptBreakdown => {
     const mappedScenes: any[] = parsed.scenes.map((s: any, idx: number) => ({
         index: idx,
         textToImage: s.text_to_image_prompt || s.static_image_prompt || s.text_to_image || s.image_prompt || s.textToImage || s.prompt || "",
-        textToVideo: s.grok_video_prompt?.full_prompt || s.grokVideoPrompt?.fullPrompt || s.image_to_video_prompt || s.motion_description || s.text_to_video_prompt || s.video_prompt || s.motion_prompt || s.textToVideo || s.motion || "",
+        textToVideo: s.grok_video_prompt?.image_to_video_prompt || s.grokVideoPrompt?.image_to_video_prompt || s.image_to_video_prompt || s.grok_video_prompt?.full_prompt || s.grokVideoPrompt?.fullPrompt || s.motion_description || s.video_prompt || s.motion_prompt || s.textToVideo || s.motion || "",
+        textToVideoPrompt: s.grok_video_prompt?.text_to_video_prompt || s.grokVideoPrompt?.text_to_video_prompt || s.text_to_video_prompt || "",
         characterPose: s.character_pose_prompt || s.character_pose || s.characterPose || s.pose || "",
         backgroundDesc: s.background_description || s.background_desc || s.backgroundDesc || s.background || "",
         shotType: s.camera_angle || s.camera_movement || s.shot_type || s.shotType || s.shot_type_prompt || "medium shot",
@@ -142,6 +144,7 @@ const parseJsonScript = (jsonScript: string): ScriptBreakdown => {
             vfx: s.grok_video_prompt?.vfx || s.grokVideoPrompt?.vfx || s.vfx,
             lightingChanges: s.grok_video_prompt?.lighting_changes || s.grokVideoPrompt?.lightingChanges || s.lighting,
             fullPrompt: s.grok_video_prompt?.full_prompt || s.grokVideoPrompt?.fullPrompt || s.full_prompt,
+            textToVideoPrompt: s.grok_video_prompt?.text_to_video_prompt || s.grokVideoPrompt?.text_to_video_prompt || "",
         },
         sfx: s.sfx || (s.sound_effect ? [s.sound_effect] : []),
         musicNotes: s.music_notes || s.musicNotes || "",
@@ -916,8 +919,8 @@ function Step3SceneImages() {
                                     </div>
                                 </div>
 
-                                {/* Row 2: Video (Only if running or has video) */}
-                                {(isRunning || scene.videoUrl) && (
+                                {/* Row 2: Video (Only if running, has video, or has prompt ready) */}
+                                {(isRunning || scene.videoUrl || scene.textToVideo) && (
                                     <div className="flex gap-4 p-4 bg-muted/20">
                                         <div className="w-40 h-40 rounded-lg border bg-muted flex items-center justify-center overflow-hidden flex-shrink-0 relative group">
                                             {scene.videoUrl ? (
@@ -926,7 +929,8 @@ function Step3SceneImages() {
                                                 <div className="flex flex-col items-center gap-2">
                                                     <Loader2 className={`h-10 w-10 text-muted-foreground ${scene.imageUrl && isRunning ? 'animate-spin' : ''}`} />
                                                     <span className="text-[10px] text-muted-foreground uppercase font-bold text-center px-2">
-                                                        {scene.imageUrl ? 'Generating Video...' : 'Waiting for Image'}
+                                                        {scene.imageUrl && isRunning ? 'Generating Video...' : 
+                                                         scene.imageUrl ? 'Ready to Generate' : 'Waiting for Image'}
                                                     </span>
                                                 </div>
                                             )}
@@ -954,6 +958,29 @@ function Step3SceneImages() {
                                                     </div>
                                                 </div>
                                             )}
+                                        </div>
+                                    </div>
+                                )}
+
+                                {/* Row 3: Text-to-Video Description (Audio Source) */}
+                                {scene.textToVideoPrompt && (
+                                    <div className="flex gap-4 p-4 bg-muted/20 border-t border-border/30">
+                                        <div className="w-40 h-40 rounded-lg border bg-muted flex items-center justify-center overflow-hidden flex-shrink-0">
+                                            <div className="flex flex-col items-center gap-2">
+                                                <Volume2 className="h-10 w-10 text-orange-400/60" />
+                                                <span className="text-[10px] text-muted-foreground uppercase font-bold text-center px-2">Audio Source</span>
+                                            </div>
+                                        </div>
+                                        <div className="flex-1 space-y-2 py-2">
+                                            <div className="flex items-center gap-2">
+                                                <Badge variant="secondary" className="text-[10px] h-5 bg-orange-500/20 text-orange-400 border-orange-500/30">TEXT-TO-VIDEO</Badge>
+                                            </div>
+                                            <div className="space-y-1">
+                                                <p className="text-[10px] uppercase font-bold text-muted-foreground/70">Text-to-Video Description (Audio Source)</p>
+                                                <p className="text-sm leading-relaxed italic text-muted-foreground">
+                                                    {scene.textToVideoPrompt}
+                                                </p>
+                                            </div>
                                         </div>
                                     </div>
                                 )}
@@ -1030,7 +1057,8 @@ function Step4SceneVideos() {
 
     const handleGenerateVideo = async (index: number, retryCount = 0): Promise<boolean> => {
         const MAX_RETRIES = 3;
-        const scene = scenes[index];
+        const freshScenes = useProjectStore.getState().scenes;
+        const scene = freshScenes[index];
 
         if (!scene.imageUrl) {
             toast.error(`Scene ${index + 1} has no image URL. Please generate the image in Step 3 first.`);
@@ -1040,40 +1068,58 @@ function Step4SceneVideos() {
         setGeneratingIndex(index);
 
         try {
-            const result = await api.post<{ videoUrl: string, formattedPrompt: string }>('/scenes/generate-video', {
+            // Standardize T2V prompt: use dedicated T2V prompt or fallback to full I2V prompt
+            let t2vPrompt = scene.textToVideoPrompt;
+            if (!t2vPrompt && scene.textToVideo) {
+                t2vPrompt = scene.textToVideo;
+            }
+
+            console.log(`[handleGenerateVideo] Requesting generation for Scene ${index}:`, {
+                i2v: scene.textToVideo,
+                t2v: t2vPrompt
+            });
+
+            const result = await api.post<{ 
+                videoUrl: string; 
+                formattedPrompt: string; 
+                textToVideoUrl?: string; 
+            }>('/scenes/generate-video', {
                 scene_index: index,
                 image_url: scene.imageUrl,
                 prompt: scene.textToVideo,
+                text_to_video_prompt: t2vPrompt,
                 dialogue: scene.dialogue,
                 camera_angle: scene.shotType,
                 niche_id: channelId,
                 is_shorts: format === 'short',
             });
 
-            // Validate the response has a proper video URL
-            if (!result.videoUrl || result.videoUrl.trim() === '') {
+            if (!result.videoUrl) {
                 throw new Error('Empty video URL returned');
             }
 
+            // Update scene with results (camelCase fields)
             updateScene(index, { 
                 videoUrl: result.videoUrl,
+                textToVideoUrl: result.textToVideoUrl, 
                 isValidVideo: true,
                 formattedPrompt: result.formattedPrompt 
             });
-            toast.success(`Scene ${index + 1} video generated!`);
+
+            toast.success(`Scene ${index + 1} videos generated successfully!`);
             return true;
         } catch (error) {
             const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+            console.error(`[handleGenerateVideo] Error:`, error);
 
             if (retryCount < MAX_RETRIES) {
-                const delay = Math.pow(2, retryCount) * 1000; // Exponential backoff: 1s, 2s, 4s
-                toast.warning(`Scene ${index + 1} failed, retrying in ${delay / 1000}s... (Attempt ${retryCount + 1}/${MAX_RETRIES})`);
+                const delay = Math.pow(2, retryCount) * 1000;
+                toast.warning(`Retry ${retryCount + 1}/${MAX_RETRIES} for Scene ${index + 1} in ${delay / 1000}s...`);
                 await new Promise(resolve => setTimeout(resolve, delay));
-                setGeneratingIndex(null);
                 return handleGenerateVideo(index, retryCount + 1);
             }
 
-            toast.error(`Failed to generate video for Scene ${index + 1} after ${MAX_RETRIES} attempts: ${errorMsg}`);
+            toast.error(`Scene ${index + 1} generation failed: ${errorMsg}`);
             return false;
         } finally {
             setGeneratingIndex(null);
@@ -1167,7 +1213,7 @@ function Step4SceneVideos() {
                                     <img src={scene.imageUrl} alt={`Scene ${index + 1}`} className="w-full h-full object-cover" />
                                 )}
                             </div>
-                            {/* Video */}
+                            {/* Video (Image-to-Video) */}
                             <div className={`w-32 h-32 rounded-lg border bg-muted flex items-center justify-center overflow-hidden flex-shrink-0 relative ${scene.videoUrl && scene.isValidVideo === false ? 'border-red-500' : ''}`}>
                                 {scene.videoUrl ? (
                                     <video src={scene.videoUrl} className="w-full h-full object-cover" controls />
@@ -1180,6 +1226,17 @@ function Step4SceneVideos() {
                                     </div>
                                 )}
                             </div>
+                            {/* Text-to-Video (Audio Source) */}
+                            {scene.textToVideoPrompt && (
+                                <div className="w-32 h-32 rounded-lg border border-orange-500/30 bg-muted flex items-center justify-center overflow-hidden flex-shrink-0 relative">
+                                    {scene.textToVideoUrl ? (
+                                        <video src={scene.textToVideoUrl} className="w-full h-full object-cover" controls />
+                                    ) : (
+                                        <Volume2 className="h-8 w-8 text-orange-400/60" />
+                                    )}
+                                    <span className="absolute bottom-0 left-0 right-0 bg-orange-500/80 text-[8px] text-white uppercase font-bold text-center py-0.5">Audio Source</span>
+                                </div>
+                            )}
                             <div className="flex-1 space-y-2">
                                 <div className="flex items-center gap-2">
                                     <h3 className="font-semibold">Scene {index + 1}{scene.title && `: ${scene.title}`}</h3>
@@ -1254,6 +1311,7 @@ function Step5Final() {
         try {
             const result = await api.post<{ status: string; final_video_url: string; clips_stitched: number }>('/videos/stitch', {
                 video_urls: scenes.map((s) => s.videoUrl).filter(url => !!url),
+                text_to_video_urls: scenes.map((s) => s.textToVideoUrl || ''),
                 niche_id: channelId,
                 title: breakdown?.title || 'Stitched Video',
                 music: musicOption,

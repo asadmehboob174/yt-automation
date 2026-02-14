@@ -285,12 +285,13 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
                                 for (let attempt = 0; attempt < 3; attempt++) {
                                     if (get().cancelled) return;
                                     try {
-                                        // SANITIZE PAYLOAD
                                         const sceneData = breakdown.scenes[index];
-                                        const videoResult = await api.post<{ videoUrl: string }>('/scenes/generate-video', {
+                                        const i2vPrompt = ensureString(sceneData.image_to_video_prompt || sceneData.textToVideo || sceneData.prompt);
+                                        const videoResult = await api.post<{ videoUrl: string, formattedPrompt?: string, textToVideoUrl?: string }>('/scenes/generate-video', {
                                             scene_index: index,
                                             image_url: imageUrl,
-                                            prompt: ensureString(sceneData.image_to_video_prompt || sceneData.textToVideo || sceneData.prompt),
+                                            prompt: i2vPrompt,
+                                            text_to_video_prompt: i2vPrompt, // Same prompt for T2V
                                             dialogue: ensureString(sceneData.dialogue),
                                             niche_id: channelId,
                                             is_shorts: format === 'short',
@@ -298,7 +299,12 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
                                             sound_effect: sceneData.sfx || sceneData.sound_effect,
                                             emotion: ensureString(sceneData.emotion)
                                         });
-                                        useProjectStore.getState().updateScene(index, { videoUrl: videoResult.videoUrl });
+                                        useProjectStore.getState().updateScene(index, {
+                                            videoUrl: videoResult.videoUrl,
+                                            textToVideoUrl: videoResult.textToVideoUrl,
+                                            isValidVideo: true,
+                                            formattedPrompt: videoResult.formattedPrompt
+                                        });
                                         videoSuccess = true;
                                         break;
                                     } catch (e) {
@@ -351,10 +357,12 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
                     updateProgress(`Repairing missing/corrupt video for scene ${i + 1}...`);
                     try {
                         const sceneData = breakdown.scenes[i];
-                        const repairResult = await api.post<{ videoUrl: string, formattedPrompt: string }>('/scenes/generate-video', {
+                        const i2vPrompt = ensureString(sceneData.image_to_video_prompt || sceneData.textToVideo || sceneData.prompt);
+                        const repairResult = await api.post<{ videoUrl: string, formattedPrompt: string, textToVideoUrl?: string }>('/scenes/generate-video', {
                             scene_index: i,
                             image_url: scene.imageUrl || '',
-                            prompt: ensureString(sceneData.image_to_video_prompt || sceneData.textToVideo || sceneData.prompt),
+                            prompt: i2vPrompt,
+                            text_to_video_prompt: i2vPrompt, // Same prompt for T2V
                             dialogue: ensureString(sceneData.dialogue),
                             niche_id: channelId,
                             is_shorts: format === 'short',

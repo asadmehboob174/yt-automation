@@ -552,6 +552,60 @@ class FFmpegVideoEditor:
             logger.info(f"✅ Finalized video -> {output_path}")
             return Path(output_path)
     
+    def swap_audio(
+        self,
+        video_path: Path,
+        audio_source_path: Path,
+        output_path: Optional[Path] = None
+    ) -> Path:
+        """
+        Replace audio in video_path with audio from audio_source_path.
+        Used to combine visuals from image-to-video with audio from text-to-video.
+        """
+        import subprocess
+        output_path = output_path or self.output_dir / "audio_swapped.mp4"
+        
+        # Step 1: Extract audio from the source video (text-to-video clip)
+        temp_audio = self.output_dir / "extracted_audio.aac"
+        extract_cmd = [
+            self.ffmpeg_cmd, '-y',
+            '-i', str(audio_source_path),
+            '-vn',              # No video
+            '-acodec', 'aac',   # Encode to AAC
+            '-b:a', '192k',
+            str(temp_audio)
+        ]
+        
+        logger.info(f"🔊 Extracting audio from {audio_source_path.name}...")
+        try:
+            subprocess.run(extract_cmd, check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            logger.error(f"❌ Audio extraction failed: {e.stderr.decode('utf-8')}")
+            raise e
+        
+        # Step 2: Mux video from video_path + audio from temp_audio
+        mux_cmd = [
+            self.ffmpeg_cmd, '-y',
+            '-i', str(video_path),      # Video source (image-to-video)
+            '-i', str(temp_audio),       # Audio source (from text-to-video)
+            '-c:v', 'copy',              # Copy video stream as-is
+            '-c:a', 'aac',
+            '-b:a', '192k',
+            '-map', '0:v:0',            # Video from first input
+            '-map', '1:a:0',            # Audio from second input
+            '-shortest',                 # Match shortest stream
+            str(output_path)
+        ]
+        
+        logger.info(f"🔄 Swapping audio: video={video_path.name} + audio={audio_source_path.name}...")
+        try:
+            subprocess.run(mux_cmd, check=True, capture_output=True)
+            logger.info(f"✅ Audio swapped -> {output_path.name}")
+            return output_path
+        except subprocess.CalledProcessError as e:
+            logger.error(f"❌ Audio swap failed: {e.stderr.decode('utf-8')}")
+            raise e
+    
     def stitch_clips_with_transitions(
         self,
         clip_paths: list[Path],

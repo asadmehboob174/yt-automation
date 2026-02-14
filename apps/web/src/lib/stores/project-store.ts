@@ -92,8 +92,10 @@ export const useProjectStore = create<ProjectState>()(
                     title: s.title || s.scene_title || '',
                     // Map text-to-image prompt
                     textToImage: s.textToImage || s.text_to_image_prompt || s.character_pose_prompt || '',
-                    // Map text-to-video/motion prompt
-                    textToVideo: (s.grok_video_prompt as any)?.full_prompt || (s.grokVideoPrompt as any)?.fullPrompt || (s.textToVideo as string) || (s.image_to_video_prompt as string) || (s.motion_description as string) || '',
+                    // Map text-to-video/motion prompt (image-to-video description)
+                    textToVideo: (s.grok_video_prompt as any)?.image_to_video_prompt || (s.grokVideoPrompt as any)?.image_to_video_prompt || (s.grok_video_prompt as any)?.full_prompt || (s.grokVideoPrompt as any)?.fullPrompt || (s.textToVideo as string) || (s.image_to_video_prompt as string) || (s.motion_description as string) || '',
+                    // Map text-to-video prompt (audio source)
+                    textToVideoPrompt: (s.grok_video_prompt as any)?.text_to_video_prompt || (s.grokVideoPrompt as any)?.text_to_video_prompt || (s.textToVideoPrompt as string) || (s.text_to_video_prompt as string) || '',
                     // Map dialogue - DEFAULT TO EMPTY STRING
                     dialogue: (s.dialogue as string) || (s.voiceover_text as string) || '',
                     // Map shot type

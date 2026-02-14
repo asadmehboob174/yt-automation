@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Union, Dict, List
 import os
 import sys
 import asyncio
@@ -478,13 +478,36 @@ class GenerateSceneImageRequest(BaseModel):
     character_images: list[dict]  # list of {name, imageUrl}
     is_shorts: bool = False
 
-class GenerateVideoRequest(BaseModel):
+from fastapi.exceptions import RequestValidationError
+from fastapi.requests import Request
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    print(f"❌ Validation Error for {request.url}")
+    print(f"   Body: {await request.body()}")
+    print(f"   Errors: {exc.errors()}")
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors(), "body": str(exc.body)},
+    )
+
+class VideoGenerationRequest(BaseModel):
     scene_index: int
-    imageUrl: str
-    prompt: str
-    dialogue: Optional[str] = None
+    image_url: str
+    prompt: str  # This is the Image-to-Video prompt
+    text_to_video_prompt: Optional[str] = None  # New: Text-to-Video prompt (Audio source)
+    dialogue: Optional[Union[str, Dict[str, str]]] = None
     camera_angle: Optional[str] = "Medium Shot"
-    niche_id: str
+    niche_id: Optional[str] = None
+    style_suffix: Optional[str] = None
+    is_shorts: bool = False
+    sound_effect: Optional[Union[str, List[str]]] = None
+    emotion: Optional[str] = None
+
+class VideoGenerationResponse(BaseModel):
+    video_url: str
+    formatted_prompt: str
+    text_to_video_url: Optional[str] = None
 
 @app.post("/scripts/generate")
 async def generate_script(request: GenerateScriptRequest):
@@ -1331,7 +1354,19 @@ def smart_coerce(val: any) -> str:
 
 
 @app.post("/scenes/generate-video")
-async def generate_video(request: GenerateVideoRequest):
+async def generate_video(request: VideoGenerationRequest):
+    # Fallback: use same I2V prompt for T2V if no dedicated T2V prompt provided
+    if not request.text_to_video_prompt and request.prompt:
+        request.text_to_video_prompt = request.prompt
+        print(f"⚠️ Auto-populated T2V prompt from I2V prompt (same prompt for both)")
+
+    print(f"\n{'='*50}")
+    print(f"🎥 Generate Video Request Received (Scene {request.scene_index})")
+    print(f"   I2V Prompt: {request.prompt[:60]}...")
+    print(f"   T2V Prompt: {request.text_to_video_prompt}")
+    print(f"   Dialogue: {request.dialogue}")
+    print(f"{'='*50}\n")
+
     """Generate video from image using Grok Playwright automation."""
     try:
         from services.grok_agent import GrokAnimator
@@ -1381,43 +1416,59 @@ async def generate_video(request: GenerateVideoRequest):
             aspect_ratio = "9:16" if request.is_shorts else "16:9"
             print(f"   📐 Aspect Ratio: {aspect_ratio} (shorts={request.is_shorts})")
             
-            from services.grok_agent import GrokAnimator, PromptBuilder, ModerationError
+            from services.grok_agent import GrokAnimator, PromptBuilder, ModerationError, generate_full_scene_sequence
             animator = GrokAnimator()
             from services.script_generator import ScriptGenerator
             gen = ScriptGenerator()
             
-            async def generate_and_verify(prompt: str) -> Path:
-                """Inner helper to generate and immediately verify integrity."""
-                path = await animator.animate(
+            async def generate_and_verify_sequence(prompt: str) -> dict:
+                """Inner helper to generate both I2V and T2V sequentially and verify."""
+                # Use Atomic Sequence
+                results = await generate_full_scene_sequence(
                     image_path=image_path,
-                    motion_prompt=prompt,
-                    style_suffix="Cinematic, Pixar-style 3D animation",
-                    duration=10,
+                    character_pose="the character in the image",
                     camera_angle=request.camera_angle or "Medium Shot",
-                    aspect_ratio=aspect_ratio,
+                    style_suffix="Cinematic, Pixar-style 3D animation",
+                    motion_description=prompt,
+                    t2v_prompt=request.text_to_video_prompt,
                     dialogue=request.dialogue,
                     sound_effect=request.sound_effect,
-                    emotion=request.emotion or "neutrally"
+                    emotion=request.emotion or "neutrally",
+                    duration="6s",
+                    aspect=aspect_ratio
                 )
-                # Strict Integrity check
-                file_size = os.path.getsize(path)
-                is_html = False
-                if file_size > 0:
-                    with open(path, "rb") as f:
-                        head = f.read(200)
-                        if b"<!DOCTYPE html>" in head or b"<html" in head:
-                            is_html = True
-                            
-                if is_html or file_size < 100000:
-                    status_reason = "Grok Moderation (HTML Error Page)" if is_html else f"Corrupt/Too Small ({file_size}b)"
-                    print(f"⚠️ {status_reason} detected. Grok refused the prompt.")
-                    if path.exists(): os.unlink(path)
-                    raise ModerationError(f"Generated video is content-moderated or corrupt HTML ({file_size} bytes).")
-                return path
+                
+                # Check I2V Integrity
+                i2v_p = results["video_path"]
+                if not i2v_p or not i2v_p.exists() or i2v_p.stat().st_size < 1000:
+                     raise ModerationError("I2V Generation failed or empty file")
+                
+                with open(i2v_p, "rb") as f:
+                    if b"<!DOCTYPE html>" in f.read(200):
+                         if i2v_p.exists(): os.unlink(i2v_p)
+                         raise ModerationError("I2V Moderation detected (HTML response)")
+
+                # Check T2V Integrity (if present)
+                t2v_p = results["t2v_path"]
+                if t2v_p:
+                    if not t2v_p.exists() or t2v_p.stat().st_size < 1000:
+                         print("⚠️ T2V Generation failed or empty file")
+                         results["t2v_path"] = None 
+                    else:
+                         with open(t2v_p, "rb") as f:
+                            if b"<!DOCTYPE html>" in f.read(200):
+                                 print("⚠️ T2V Moderation detected")
+                                 try: os.unlink(t2v_p)
+                                 except: pass
+                                 results["t2v_path"] = None
+                                 
+                return results
 
             try:
                 # ATTEMPT 1
-                video_path = await generate_and_verify(request.prompt)
+                gen_results = await generate_and_verify_sequence(request.prompt)
+                video_path = gen_results["video_path"]
+                t2v_path = gen_results["t2v_path"]
                 sent_prompt = request.prompt
             except ModerationError as e:
                 # AUTO-HEAL
@@ -1427,7 +1478,9 @@ async def generate_video(request: GenerateVideoRequest):
                 if new_prompt != request.prompt:
                     print(f"♻️ Retrying with 'Safe Mode' prompt: {new_prompt}")
                     # ATTEMPT 2 (Final Retry)
-                    video_path = await generate_and_verify(new_prompt)
+                    gen_results = await generate_and_verify_sequence(new_prompt)
+                    video_path = gen_results["video_path"]
+                    t2v_path = gen_results["t2v_path"]
                     sent_prompt = new_prompt
                 else:
                     print("❌ Safety System: Rewrite failed or returned identical prompt. Giving up.")
@@ -1436,8 +1489,7 @@ async def generate_video(request: GenerateVideoRequest):
                 print(f"❌ Critical error in animation flow: {e}")
                 raise e
             
-            # Recalculate formatted prompt based on what was ACTUALLY sent (if it was rewritten)
-            # or just use the PromptBuilder to get the final "Director's Script" version of whatever we sent
+            # Recalculate formatted prompt
             formatted_prompt = PromptBuilder.build(
                 character_pose="",
                 camera_angle=request.camera_angle or "",
@@ -1450,26 +1502,6 @@ async def generate_video(request: GenerateVideoRequest):
                 sfx=request.sound_effect.split(", ") if isinstance(request.sound_effect, str) else request.sound_effect
             )
 
-            # --- High Quality Stage: 4K Upscale ---
-            try:
-                from services.video_editor import FFmpegVideoEditor
-                editor = FFmpegVideoEditor()
-                
-                # Determine target resolution for 4K
-                # Long format: 3840x2160, Shorts: 2160x3840
-                target_res = (2160, 3840) if request.is_shorts else (3840, 2160)
-                
-                print(f"🚀 Starting 4K Upscale for scene {request.scene_index} ({target_res[0]}x{target_res[1]})...")
-                upscaled_path = editor.upscale_video(video_path, target_resolution=target_res)
-                
-                # Replace original path with upscaled path if successful
-                if upscaled_path.exists() and upscaled_path != video_path:
-                    # Original video_path will be cleaned up in finally block if it was different
-                    video_path = upscaled_path
-                    print(f"✨ 4K Upscale complete: {video_path.name}")
-            except Exception as e:
-                print(f"⚠️ 4K Upscale failed (falling back to original): {e}")
-
             # --- Success Path: Upload ---
             storage = R2Storage()
             video_key = f"videos/{request.niche_id}/scene_{request.scene_index}_{uuid.uuid4().hex[:8]}.mp4"
@@ -1480,8 +1512,27 @@ async def generate_video(request: GenerateVideoRequest):
             storage.upload_asset(video_bytes, video_key, content_type="video/mp4")
             video_url = storage.get_url(video_key)
             
-            print(f"✅ Video generated and uploaded: {video_url}")
-            return {"videoUrl": video_url, "formattedPrompt": formatted_prompt}
+            print(f"✅ I2V Video uploaded: {video_url}")
+
+            # Upload T2V if exists
+            text_to_video_url = None
+            if t2v_path and t2v_path.exists():
+                t2v_key = f"videos/{request.niche_id}/t2v_scene_{request.scene_index}_{uuid.uuid4().hex[:8]}.mp4"
+                with open(t2v_path, "rb") as f:
+                    storage.upload_asset(f.read(), t2v_key, content_type="video/mp4")
+                
+                text_to_video_url = storage.get_url(t2v_key)
+                print(f"✅ T2V Video uploaded: {text_to_video_url}")
+                
+                # Cleanup T2V
+                try: os.unlink(t2v_path)
+                except: pass
+
+            return {
+                "videoUrl": video_url,
+                "formattedPrompt": formatted_prompt,
+                "textToVideoUrl": text_to_video_url
+            }
             
         finally:
             # Clean up temp image and local video
@@ -1514,11 +1565,104 @@ async def generate_video(request: GenerateVideoRequest):
 
 
 # ============================================
+# Text-to-Video Generation (Audio Source)
+# ============================================
+class GenerateTextToVideoRequest(BaseModel):
+    scene_index: int
+    prompt: str  # text_to_video_prompt
+    niche_id: str
+    is_shorts: bool = False
+
+
+@app.post("/scenes/generate-text-to-video")
+async def generate_text_to_video(request: GenerateTextToVideoRequest):
+    """Generate video from text-only prompt (no image). Used as audio source."""
+    try:
+        from services.grok_agent import generate_text_to_video_clip, ModerationError
+        from services.cloud_storage import R2Storage
+        import uuid
+        from pathlib import Path
+
+        print(f"🎵 [T2V] Generating text-to-video for scene {request.scene_index}")
+        print(f"   Prompt: {request.prompt[:80]}...")
+
+        aspect_ratio = "9:16" if request.is_shorts else "16:9"
+
+        # Generate the text-to-video clip
+        video_path = await generate_text_to_video_clip(
+            prompt=request.prompt,
+            duration="6s",
+            aspect=aspect_ratio,
+        )
+
+        # Verify the video is valid
+        file_size = os.path.getsize(video_path)
+        is_html = False
+        if file_size > 0:
+            with open(video_path, "rb") as f:
+                head = f.read(200)
+                if b"<!DOCTYPE html>" in head or b"<html" in head:
+                    is_html = True
+
+        if is_html or file_size < 100000:
+            status_reason = "HTML Error Page" if is_html else f"Corrupt/Too Small ({file_size}b)"
+            print(f"⚠️ [T2V] {status_reason}")
+            if video_path.exists(): os.unlink(video_path)
+            raise ModerationError(f"Generated text-to-video is corrupt ({file_size} bytes).")
+
+        # 4K Upscale
+        # 4K Upscale
+        # try:
+        #     from services.video_editor import FFmpegVideoEditor
+        #     editor = FFmpegVideoEditor()
+        #     target_res = (2160, 3840) if request.is_shorts else (3840, 2160)
+        #     print(f"🚀 [T2V] 4K Upscale ({target_res[0]}x{target_res[1]})...")
+        #     upscaled_path = editor.upscale_video(video_path, target_resolution=target_res)
+        #     if upscaled_path.exists() and upscaled_path != video_path:
+        #         video_path = upscaled_path
+        #         print(f"✨ [T2V] 4K Upscale complete")
+        # except Exception as e:
+        #     print(f"⚠️ [T2V] 4K Upscale failed (using original): {e}")
+
+        # Upload to R2
+        storage = R2Storage()
+        video_key = f"videos/{request.niche_id}/t2v_scene_{request.scene_index}_{uuid.uuid4().hex[:8]}.mp4"
+
+        with open(video_path, "rb") as f:
+            video_bytes = f.read()
+
+        storage.upload_asset(video_bytes, video_key, content_type="video/mp4")
+        video_url = storage.get_url(video_key)
+
+        print(f"✅ [T2V] Text-to-video uploaded: {video_url}")
+
+        # Cleanup
+        try:
+            if video_path.exists():
+                os.unlink(video_path)
+        except: pass
+
+        return {"videoUrl": video_url, "prompt": request.prompt}
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"❌ [T2V] Error: {e}")
+        from services.grok_agent import ModerationError
+        if isinstance(e, HTTPException):
+            raise e
+        elif isinstance(e, ModerationError):
+            raise HTTPException(status_code=403, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================
 # SIMPLE VIDEO STITCH (Bypass Inngest)
 # ============================================
 
 class StitchVideosRequest(BaseModel):
     video_urls: list[str]
+    text_to_video_urls: Optional[list[str]] = None  # Text-to-video clips (audio source)
     niche_id: str
     title: str = "Stitched Video"
     niche_type: str = "general"
@@ -1662,6 +1806,54 @@ async def stitch_videos(request: StitchVideosRequest):
         # Use only valid clips for stitching
         final_clips_to_stitch = valid_clips
         print(f"✅ Proceeding to stitch {len(final_clips_to_stitch)} valid clips (Skipped {len(corrupt_indices)} corrupt clips).")
+
+        # 1.7 Audio Swap: Replace audio with text-to-video clips
+        t2v_urls = request.text_to_video_urls or []
+        if t2v_urls:
+            print(f"🔊 Audio swap: {len(t2v_urls)} text-to-video clips provided")
+            t2v_local = []
+            
+            # Download text-to-video clips
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                for i, url in enumerate(t2v_urls):
+                    if not url or not url.strip():
+                        t2v_local.append(None)
+                        continue
+                    try:
+                        t2v_path = temp_dir / f"t2v_clip_{i:03d}.mp4"
+                        if "videos/" in url:
+                            key_part = url.split("/videos/", 1)[1].split("?")[0]
+                            full_key = f"videos/{key_part}"
+                            storage_downloader.download(full_key, t2v_path)
+                        else:
+                            resp = await client.get(url, follow_redirects=True)
+                            resp.raise_for_status()
+                            t2v_path.write_bytes(resp.content)
+                        t2v_local.append(t2v_path)
+                        print(f"   ✅ Downloaded T2V clip {i}: {t2v_path.name}")
+                    except Exception as e:
+                        print(f"   ⚠️ Failed to download T2V clip {i}: {e}")
+                        t2v_local.append(None)
+
+            # Perform audio swap for each pair
+            swapped_clips = []
+            for i, clip_path in enumerate(final_clips_to_stitch):
+                t2v_path = t2v_local[i] if i < len(t2v_local) else None
+                if t2v_path and t2v_path.exists():
+                    try:
+                        swapped_path = temp_dir / f"swapped_{i:03d}.mp4"
+                        editor_swap = FFmpegVideoEditor(output_dir=temp_dir)
+                        editor_swap.swap_audio(clip_path, t2v_path, swapped_path)
+                        swapped_clips.append(swapped_path)
+                        print(f"   ✅ Audio swapped for clip {i}")
+                    except Exception as e:
+                        print(f"   ⚠️ Audio swap failed for clip {i}: {e}. Using original.")
+                        swapped_clips.append(clip_path)
+                else:
+                    swapped_clips.append(clip_path)
+            
+            final_clips_to_stitch = swapped_clips
+            print(f"✅ Audio swap complete. {len(final_clips_to_stitch)} clips ready.")
 
         # 2. Stitch with FFmpeg
         # Fetch actual Channel Config to determine format accurately
