@@ -94,8 +94,8 @@ class PromptBuilder:
 
         # 1. Base Motion / Timeline
         base_prompt = ""
-        if grok_video_prompt and grok_video_prompt.get("full_prompt"):
-            base_prompt = grok_video_prompt["full_prompt"]
+        if grok_video_prompt and grok_video_prompt.get("image_to_video_prompt"):
+            base_prompt = grok_video_prompt["image_to_video_prompt"]
         else:
             prompt_parts = []
             motion_core = motion_description
@@ -216,6 +216,10 @@ class VideoSettings:
             "button:has-text('9')", # Partial match fallback
             "svg:has-text('9:16')", # Sometimes it's an SVG text
             "button:has(svg[aria-label='9:16'])",
+            # Broader matches for text inside any clickable element
+            "text=9:16",
+            "div:text-is('9:16')",
+            "span:text-is('9:16')",
         ],
         "16:9": [
             "button[aria-label='16:9']",
@@ -229,6 +233,9 @@ class VideoSettings:
             "button:has-text('16')", # Partial match fallback
             "svg:has-text('16:9')",
             "button:has(svg[aria-label='16:9'])",
+            "text=16:9",
+            "div:text-is('16:9')",
+            "span:text-is('16:9')",
         ],
         "1:1": [
             "button[aria-label='1:1']",
@@ -671,6 +678,10 @@ async def generate_single_clip(
             except Exception as e:
                 logger.warning(f"⚠️ Error during mode toggle: {e}")
 
+            # Step 0.5: Configure video settings FIRST (Aspect Ratio/Duration)
+            # This must happen before we start typing/uploading to ensure the session is ready
+            await VideoSettings.configure(page, duration=duration, aspect=aspect)
+
             # Step 1: Find and fill the prompt input
             prompt_selectors = [
                 "textarea[placeholder*='imagine']",
@@ -812,8 +823,8 @@ async def generate_single_clip(
             
             # Step 4: Configure video settings if available
             
-            # Step 4: Configure video settings if available
-            await VideoSettings.configure(page, duration=duration, aspect=aspect)
+            # Step 4: Configure video settings (Moved to start)
+            pass
             
             # Step 5: Click generate/submit button (arrow icon on right)
             submit_selectors = [
@@ -888,14 +899,17 @@ async def generate_single_clip(
             # So we'll inject a check into the wait loop
             
             # METHOD 1: Download Button (High Quality / Original File)
-            # This is preferred because the <video> tag often contains compressed/stream versions.
             download_selectors = [
                 "button[aria-label='Download']",
                 "button[aria-label='Download video']",
                 "button:has-text('Download')",
-                "a[download]",
                 "[data-testid='download-button']",
-                "button:has(svg[viewBox*='0 0 24 24']):has-text('Download')", # More specific fallback
+                # Generic SVG Icon matchers (Lucide/Feather/Heroicons common paths)
+                "button:has(svg polyline[points*='21 15'])",  # Common 'download' icon bottom bracket
+                "button:has(svg path[d*='M21 15v4'])",        # Common 'download' icon bottom bracket
+                "button:has(svg line[y2='3'])",                # Common 'download' arrow
+                "button:has(svg line[y2='21'])",               # Common 'download' arrow
+                "button:has(svg):has-text('')", # Last resort: Any icon-only button that appears post-generation? Risk of false positive but better than failure.
             ]
 
             # Smart Wait: Race between URL change AND Video element appearance
@@ -912,7 +926,9 @@ async def generate_single_clip(
                         "Thinking...",
                         "Drawing...",
                         "[role='progressbar']",
-                        ".animate-pulse"
+                        ".animate-pulse",
+                        "button:has-text('Cancel Video')",
+                        "text=Cancel Video"
                     ]
                     
                     for i in range(150): # Check every 2s for 5 minutes
@@ -926,9 +942,10 @@ async def generate_single_clip(
                         still_generating = False
                         for ind in generating_indicators:
                             try:
-                                # Use both text and selector checks
+                                # Check if it looks like a selector
+                                is_selector = any(c in ind for c in ["[", ".", ":", "="])
                                 count = 0
-                                if "[" in ind or "." in ind:
+                                if is_selector:
                                     count = await page.locator(ind).count()
                                 else:
                                     count = await page.get_by_text(ind, exact=False).count()
@@ -936,8 +953,10 @@ async def generate_single_clip(
                                 if count > 0:
                                     still_generating = True
                                     if i % 10 == 0:
-                                        logger.info(f"⏳ Grok is still generating (indicator: {ind})...")
-                                    break
+                                        logger.info(f"⏳ Grok is still generating (indicator found: '{ind}')...")
+                                    # Double check visibility for some elements
+                                    if await page.locator(ind if is_selector else f"text={ind}").first.is_visible():
+                                        break
                             except: continue
                         
                         if still_generating:
@@ -961,39 +980,14 @@ async def generate_single_clip(
                         await asyncio.sleep(2)
                     raise TimeoutError("Neither video nor download button appeared ready after 5 mins")
 
-                # Race the two tasks
-                done, pending = await asyncio.wait(
-                    [
-                        asyncio.create_task(URLListener.wait_for_post_navigation(page, timeout=180000)),
-                        asyncio.create_task(wait_for_video_element())
-                    ],
-                    return_when=asyncio.FIRST_COMPLETED
-                )
+                # Start video wait (Primary Task)
+                # We do NOT race against URL changes anymore because SPA navigation happens 
+                # while generation is still active. Reloading the page (goto) breaks it.
+                await wait_for_video_element()
                 
-                # Cancel the loser
-                for task in pending:
-                    task.cancel()
-                    
-                # Check results safely
-                result = None
-                for t in done:
-                    if not t.cancelled():
-                        try:
-                            result = t.result()
-                        except Exception as e:
-                            logger.debug(f"Task exception in race: {e}")
-                            result = None
-                        break
-
-                if result == "element_found":
-                    logger.info("🎥 Video or Download element appeared! Proceeding directly...")
-                elif result and ("http" in result or "/post/" in result):
-                     # It was a URL change
-                    new_url = result
-                    logger.info(f"🔗 Navigation detected: {new_url}")
-                    if not page.is_closed():
-                        await page.goto(new_url)
-                        await asyncio.sleep(5) # Extra buffer for post-navigation load
+                # Check URL one last time for logging/metadata
+                if any(x in page.url for x in ["/post/", "/status/", "/project/"]):
+                    logger.info(f"🔗 Final URL: {page.url}")
 
             except Exception as e:
                 logger.info(f"⚠️ Wait condition warning: {e}. Checking for video anyway...")
@@ -1057,7 +1051,7 @@ async def generate_single_clip(
                                                 is_html = True
                                     except: pass
 
-                                    if file_size < 15000 or is_html: # < 15KB or HTML is suspicious
+                                    if file_size < 200000 or is_html: # < 200KB or HTML is suspicious (Videos are usually >1MB, but short clips can be small)
                                         logger.warning(f"⚠️ Downloaded file is invalid (Size: {file_size}b, HTML: {is_html}). Waiting and retrying...")
                                         try: output.unlink() 
                                         except: pass
