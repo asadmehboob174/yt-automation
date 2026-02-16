@@ -247,167 +247,114 @@ class VideoSettings:
     }
     
     @classmethod
-    async def configure(cls, page: Page, duration: str = "10s", aspect: str = "9:16"):
-        """Set duration and aspect ratio before generating."""
+    async def configure(cls, page: Page, duration: str = "6s", aspect: str = "9:16"):
+        """Set duration and aspect ratio with hard timeout."""
         logger.info(f"⚙️ Configuring video settings: duration={duration}, aspect={aspect}")
         
-        # Try duration selectors
-        for selector in cls.DURATION_SELECTORS.get(duration, []):
+        try:
+            # Wrap entire configuration in a timeout to prevent hanging
+            await asyncio.wait_for(cls._configure_internal(page, duration, aspect), timeout=8.0)
+        except asyncio.TimeoutError:
+            logger.warning("⚠️ Settings configuration timed out! Closing dropdown and proceeding...")
+            # Emergency close attempt
             try:
-                btn = page.locator(selector)
-                if await btn.count() > 0:
-                    await btn.first.click()
-                    logger.info(f"✅ Set duration: {duration}")
-                    break
-            except Exception:
-                continue
-        
-        # Try aspect selectors - these are the ratio buttons in Grok's UI
-        aspect_clicked = False
-        for selector in cls.ASPECT_SELECTORS.get(aspect, []):
-            try:
-                btn = page.locator(selector)
-                if await btn.count() > 0 and await btn.first.is_visible():
-                    try:
-                        await btn.first.click()
-                    except Exception:
-                        # JS-click fallback
-                        await page.evaluate("(sel) => document.querySelector(sel)?.click()", selector)
-                    logger.info(f"✅ Set aspect ratio: {aspect} via {selector}")
-                    aspect_clicked = True
-                    break
-            except Exception as e:
-                logger.debug(f"Aspect selector {selector} failed: {e}")
-                continue
-        
-        if not aspect_clicked:
-            # Attempt to find "Settings" or "Options" button which might hide the controls
-            logger.info("🔍 Aspect buttons not visible, checking for Settings/Options toggle...")
-            settings_selectors = [
-                 "button[aria-label='Settings']",
-                 "button[aria-label='Options']",
-                 "button[aria-label='Video settings']",
-                 "button[aria-label='Settings toggle']",
-                 "button:has-text('Settings')",
-                 "button:has-text('Options')",
-                 "[data-testid='settings-button']",
-                 # New: Ellipsis button is often used for options
-                 "button:has(svg.lucide-ellipsis)",
-                 "button:has(svg.lucide-more-horizontal)",
-                 "button:has(.lucide-settings)",
-                 "button svg:has-text('...')",
-                 ".lucide-more-vertical",
-                 # The 'Film' icon button sometimes holds the aspect ratio
-                 "button:has(svg path[d*='M2 6a2 2 0 0 1 2-2h16'])" # Common film icon path
-            ]
-            
-            settings_toggled = False
-            for sel in settings_selectors:
-                try:
-                    # Look for settings buttons that are NOT in the sidebar (aria-label='Options' is repeated in sidebar)
-                    locators = page.locator(sel)
-                    count = await locators.count()
-                    for i in range(count):
-                        btn = locators.nth(i)
-                        
-                        # Heuristic: main content buttons are usually below the fold or have specific parents
-                        # For now, let's try to click ANY that isn't obviously a sidebar item
-                        classes = await btn.get_attribute("class") or ""
-                        if "sidebar" in classes.lower() or "menu" in classes.lower():
-                            continue
-                            
-                        # Attempt to click even if Playwright thinks it's not visible
-                        try:
-                            await btn.click(timeout=1500)
-                            settings_toggled = True
-                            logger.info(f"📂 Toggled Settings/Options menu via: {sel} (item {i})")
-                        except:
-                            # Use a separate string to avoid backslash in f-string braces
-                            js_selector = sel.replace("'", "\\'")
-                            await page.evaluate(f"document.querySelectorAll('{js_selector}')[{i}].click()")
-                            settings_toggled = True
-                            logger.info(f"📂 JS-Toggled Settings/Options menu via: {sel} (item {i})")
-                        
-                        if settings_toggled:
-                            await asyncio.sleep(1.5) # Wait for animation
-                            break
-                    if settings_toggled: break
-                except: continue
+                await page.keyboard.press("Escape")
+                await page.mouse.click(10, 10)
+            except: pass
+        except Exception as e:
+            logger.warning(f"⚠️ Settings configuration failed: {e}")
 
-            if settings_toggled:
-                # Retry aspect selection
-                for selector in cls.ASPECT_SELECTORS.get(aspect, []):
-                    try:
-                        btn = page.locator(selector)
-                        if await btn.count() > 0 and await btn.is_visible():
-                            await btn.first.click()
-                            logger.info(f"✅ Set aspect ratio (after toggle): {aspect}")
-                            aspect_clicked = True
-                            break
-                    except Exception:
-                        continue
-            
-        if not aspect_clicked:
-            # ====== AGGRESSIVE DEBUG: Dump ALL buttons to terminal ======
-            print(f"\n{'='*60}")
-            print(f"⚠️ ASPECT RATIO BUTTON NOT FOUND: {aspect}")
-            print(f"{'='*60}")
-            try:
-                # Only dump if page is still open
-                if not page.is_closed():
-                    buttons = await page.locator("button").all()
-                    print(f"Total buttons on page: {len(buttons)}")
-                    for i, b in enumerate(buttons[:30]):
-                        try:
-                            label = await b.get_attribute("aria-label") or ""
-                            text = (await b.text_content() or "").strip()[:80]
-                            visible = await b.is_visible()
-                            classes = await b.get_attribute("class") or ""
-                            print(f"  Button[{i}]: aria='{label}' text='{text}' visible={visible} class='{classes[:60]}'")
-                        except:
-                            print(f"  Button[{i}]: <error reading>")
-                else:
-                    print("  (Page closed, cannot dump buttons)")
-            except Exception as e:
-                print(f"  Error listing buttons: {e}")
-            print(f"{'='*60}\n")
-            
-            # ====== LAST RESORT: Try to find and click by scanning all buttons ======
-            # Look for any button whose text or aria-label contains the aspect ratio number
-            aspect_numbers = aspect.replace(":", "")  # "916" or "169"
-            try:
-                if not page.is_closed():
-                    all_btns = await page.locator("button").all()
-                    for btn in all_btns:
-                        try:
-                            label = (await btn.get_attribute("aria-label") or "").lower()
-                            text = (await btn.text_content() or "").lower().strip()
-                            # Match on various formats: "9:16", "9/16", "916", "vertical", "portrait"
-                            targets = [aspect.lower(), aspect_numbers, "vertical" if aspect == "9:16" else "landscape"]
-                            for target in targets:
-                                if target in label or target in text:
-                                    if await btn.is_visible():
-                                        await btn.click()
-                                        print(f"✅ [LAST RESORT] Set aspect ratio via button text/label match: '{target}' in '{text or label}'")
-                                        aspect_clicked = True
-                                        break
-                            if aspect_clicked:
-                                break
-                        except:
-                            continue
-            except Exception as e:
-                print(f"  Last resort search failed: {e}")
-            
-            if not aspect_clicked:
-                # Save a diagnostic screenshot
+    @classmethod
+    async def _configure_internal(cls, page: Page, duration: str, aspect: str):
+        # ── Step 0: Open the "Video ▲" dropdown ──
+        dropdown_opened = False
+        video_dropdown_btn = None
+        
+        try:
+            # Find the bottom-bar dropdown toggle
+            # Prioritize buttons with "Video" or "Image" text that are VISIBLE
+            all_btns = await page.locator("button").all()
+            for btn in all_btns:
                 try:
-                    screenshot_path = Path(os.getcwd()) / f"grok_error_{random.randint(1000,99999)}.png"
-                    if not page.is_closed():
-                        await page.screenshot(path=str(screenshot_path))
-                        print(f"📸 Diagnostic screenshot saved: {screenshot_path}")
-                except:
-                    pass
-                logger.warning(f"⚠️ Could not find aspect ratio button for {aspect}.")
+                    if not await btn.is_visible(): continue
+                    text = (await btn.text_content() or "").strip().lower()
+                    if text in ("video", "image") and len(text) < 10:
+                        await btn.click()
+                        video_dropdown_btn = btn
+                        dropdown_opened = True
+                        logger.info(f"📂 Opened Video/Image dropdown: '{text}'")
+                        await asyncio.sleep(1.0)
+                        break
+                except: continue
+        except: pass
+        
+        if not dropdown_opened:
+            logger.info("🔍 Video dropdown not found, skipping settings...")
+            return
+
+        try:
+            # ── Step 1: Ensure Video Mode ──
+            # If toggle said "Image", we need to switch. If "Video", we are good.
+            # But we double check inside dropdown just in case.
+            try:
+                video_opt = page.locator("text='Generate a video'").first
+                if await video_opt.count() > 0 and await video_opt.is_visible():
+                    await video_opt.click()
+                    logger.info("✅ Switched to Video mode")
+                    await asyncio.sleep(0.5)
+                    # Re-open if clicking closed it
+                    if video_dropdown_btn:
+                        await video_dropdown_btn.click()
+                        await asyncio.sleep(0.5)
+            except: pass
+
+            # ── Step 2: Set Duration ──
+            duration_set = False
+            for selector in cls.DURATION_SELECTORS.get(duration, []):
+                try:
+                    btn = page.locator(selector).first
+                    if await btn.count() > 0 and await btn.is_visible():
+                        await btn.click(timeout=1000)
+                        logger.info(f"✅ Set duration: {duration}")
+                        duration_set = True
+                        break
+                except: continue
+            
+            if not duration_set: logger.warning(f"⚠️ Duration {duration} not found")
+
+            # ── Step 3: Set Aspect Ratio ──
+            # Try specific selectors first, then generic icon buttons
+            aspect_clicked = False
+            selectors = cls.ASPECT_SELECTORS.get(aspect, [])
+            
+            # Add generic "nth" child fallback for 9:16 (usually 4th or 5th icon)
+            # Assuming icons are in a row container
+            if aspect == "9:16":
+                selectors.append("button:has(svg):nth-child(4)") 
+            
+            for selector in selectors:
+                try:
+                    btn = page.locator(selector).first
+                    if await btn.count() > 0 and await btn.is_visible():
+                        await btn.click(timeout=1000)
+                        logger.info(f"✅ Set aspect ratio: {aspect}")
+                        aspect_clicked = True
+                        break
+                except: continue
+            
+            if not aspect_clicked: logger.warning(f"⚠️ Aspect {aspect} not found")
+
+        finally:
+            # ── Step 4: Close Dropdown ──
+            try:
+                if video_dropdown_btn and await video_dropdown_btn.is_visible():
+                    await video_dropdown_btn.click()
+                else:
+                    await page.keyboard.press("Escape")
+                await asyncio.sleep(0.5)
+            except:
+                await page.mouse.click(10, 10)
+
 
     
     @staticmethod
@@ -545,7 +492,7 @@ async def generate_single_clip(
     sound_effect: Optional[str] = None,
     character_name: str = "Character",
     emotion: str = "neutrally",
-    duration: str = "10s",
+    duration: str = "6s",
     aspect: str = "9:16",
     external_page: Optional[Page] = None,
     grok_video_prompt: Optional[dict] = None,
@@ -606,84 +553,17 @@ async def generate_single_clip(
                     await page.goto("https://grok.com/imagine", wait_until="networkidle")
                     await asyncio.sleep(3)
 
-            # Build 5-layer prompt
-            prompt = PromptBuilder.build(
-                character_pose, camera_angle, style_suffix,
-                motion_description, dialogue,
-                character_name=character_name, emotion=emotion, sound_effect=sound_effect,
-                grok_video_prompt=grok_video_prompt,
-                sfx=sfx,
-                music_notes=music_notes
-            )
-            # LOG FULL PROMPT (User Request)
-            print(f"\n{'*'*60}")
-            print(f"🚀 FULL GROK PROMPT:\n{prompt}")
-            print(f"{'*'*60}\n")
-            logger.info(f"📝 Prompt length: {len(prompt)} chars")
-            
-            if not image_path.exists():
-                raise FileNotFoundError(f"Image text file not found at {image_path}")
+            # Initialize target for drag-and-drop fallback
+            target_element = None
 
-            # Step 0: Ensure 'Video' Mode (Critical Fix)
-            # Screenshot shows "Image ▼" dropdown at bottom-right, need to switch to "Video"
-            logger.info("🔄 Checking for Mode Toggle (Image/Video dropdown)...")
-            
-            mode_btn_selectors = [
-                "button:has-text('Image')",  # Current mode shows "Image" - need to switch
-                "button[aria-label='Model select']",  # Legacy selector
-                "button:has-text('Video')",  # Already in video mode
-            ]
-            
-            target_element = None # Keep track for drag-and-drop
-            try:
-                mode_switched = False
-                for selector in mode_btn_selectors:
-                    mode_btn = page.locator(selector).first
-                    if await mode_btn.count() > 0 and await mode_btn.is_visible():
-                        btn_text = await mode_btn.text_content()
-                        logger.info(f"ℹ️ Found mode button: '{btn_text}' via {selector}")
-                        
-                        if "Video" in btn_text:
-                            logger.info("✅ Already in Video mode")
-                            mode_switched = True
-                            break
-                        elif "Image" in btn_text:
-                            logger.info("🖱️ Currently in Image mode, switching to Video...")
-                            await mode_btn.click()
-                            await asyncio.sleep(1)  # Wait for dropdown to fully open
-                            
-                            # Look for "Video" option in dropdown menu
-                            video_option_selectors = [
-                                "[role='menuitem'] >> text='Video'",
-                                "div[role='menuitem']:has(span:text-is('Video'))",
-                                "[data-radix-collection-item] >> text='Video'",
-                                "div[role='menuitem']:has-text('Video')",
-                                "div.cursor-pointer:has-text('Generate a video')",
-                            ]
-                            
-                            for video_sel in video_option_selectors:
-                                try:
-                                    video_opt = page.locator(video_sel).first
-                                    if await video_opt.count() > 0 and await video_opt.is_visible():
-                                        await video_opt.click()
-                                        logger.info(f"✅ Selected Video mode via {video_sel}")
-                                        mode_switched = True
-                                        await asyncio.sleep(1)
-                                        break
-                                except: pass
-                            if mode_switched: break
-                
-                if not mode_switched:
-                    logger.warning("⚠️ Could not confirm Video mode toggle via dropdown, continuing anyway...")
-            except Exception as e:
-                logger.warning(f"⚠️ Error during mode toggle: {e}")
-
-            # Step 0.5: Configure video settings FIRST (Aspect Ratio/Duration)
-            # This must happen before we start typing/uploading to ensure the session is ready
+            # Step 1: Configure video settings (duration, aspect ratio)
+            # MUST happen BEFORE image upload, because image upload auto-starts generation
             await VideoSettings.configure(page, duration=duration, aspect=aspect)
 
-            # Step 1: Find and fill the prompt input
+            # Step 2: Find and fill the prompt input
             prompt_selectors = [
+                "textarea[placeholder*='customize video']",
+                "textarea[placeholder*='Type to customize']",
                 "textarea[placeholder*='imagine']",
                 "textarea[placeholder*='Imagine']",
                 "textarea[aria-label*='imagine']",
@@ -817,17 +697,14 @@ async def generate_single_clip(
                 logger.warning("⚠️ All image upload methods failed, proceeding with text-only generation")
 
             # Wait for upload processing (thumbnail appearance)
+            # Image upload auto-starts generation in Grok's new UI
             await asyncio.sleep(5)
             
-            # Step 3: Mode switch handled in Step 0 now.
-            
-            # Step 4: Configure video settings if available
-            
-            # Step 4: Configure video settings (Moved to start)
-            pass
-            
             # Step 5: Click generate/submit button (arrow icon on right)
+            pass
             submit_selectors = [
+                "button[aria-label='Make video']",
+                "button:has-text('Make video')",
                 "button[aria-label='Send message']",
                 "button[aria-label='Send']",
                 "button[aria-label='Submit']",
@@ -899,17 +776,26 @@ async def generate_single_clip(
             # So we'll inject a check into the wait loop
             
             # METHOD 1: Download Button (High Quality / Original File)
+            # This is preferred because the <video> tag often contains compressed/stream versions.
+            # New Grok UI (Feb 2026): Download is a small icon-only button (↓)
+            # next to the input bar, to the right of the "Make video" button.
             download_selectors = [
-                "button[aria-label='Download']",
+                 # Merged selectors from both versions
                 "button[aria-label='Download video']",
+                "button[aria-label='Download Video']",
+                "button:has-text('Download video')",
+                "button:has-text('Download Video')",
+                "button[aria-label='Download']",
                 "button:has-text('Download')",
                 "[data-testid='download-button']",
-                # Generic SVG Icon matchers (Lucide/Feather/Heroicons common paths)
-                "button:has(svg polyline[points*='21 15'])",  # Common 'download' icon bottom bracket
-                "button:has(svg path[d*='M21 15v4'])",        # Common 'download' icon bottom bracket
-                "button:has(svg line[y2='3'])",                # Common 'download' arrow
-                "button:has(svg line[y2='21'])",               # Common 'download' arrow
-                "button:has(svg):has-text('')", # Last resort: Any icon-only button that appears post-generation? Risk of false positive but better than failure.
+                "a[download]",
+                # Generic SVG Icon matchers
+                "button:has(svg polyline[points*='21 15'])", 
+                "button:has(svg path[d*='M21 15v4'])",
+                "button:has(svg line[y2='3'])",
+                "button:has(svg line[y2='21'])",
+                "button:has(svg):has-text('')", 
+                "button:has(svg[viewBox*='0 0 24 24']):has-text('Download')",
             ]
 
             # Smart Wait: Race between URL change AND Video element appearance
@@ -973,6 +859,14 @@ async def generate_single_clip(
                                         src = await el.get_attribute("src")
                                         if not src or len(src) < 5: continue
                                     
+                                    # CRITICAL: Verify this is NOT a "Download image" button
+                                    if selector in download_selectors:
+                                        label = (await el.get_attribute("aria-label") or "").lower()
+                                        text = (await el.text_content() or "").lower()
+                                        if "image" in label or "image" in text:
+                                            # Skip this button, it's NOT the video
+                                            continue
+                                    
                                     logger.info(f"✨ Found ready element via selector: {selector}")
                                     return "element_found"
                             except Exception:
@@ -1002,17 +896,37 @@ async def generate_single_clip(
             if page.is_closed():
                 raise RuntimeError("Browser closed before download could start")
 
+            # Dismiss any stale Video Options popup that may have appeared during generation
+            try:
+                cancel_btn = page.locator("button:has-text('Cancel Video')")
+                if await cancel_btn.count() > 0 and await cancel_btn.is_visible():
+                    logger.info("⚠️ Dismissing stale Video Options popup...")
+                    await page.keyboard.press("Escape")
+                    await asyncio.sleep(1)
+            except:
+                pass
+
             button_download_success = False
             try:
+
                 # TRY BUTTONS WITH RETRIES (to handle "not ready on backend" case)
                 for selector in download_selectors:
                     if page.is_closed(): break
                     
-                    for attempt in range(3): # Try each button up to 3 times with delays
+                    for attempt in range(3): # Try each button up to 3 times
                         if page.is_closed(): break
                         try:
                             el = page.locator(selector).first
                             if await el.count() > 0:
+                                # CRITICAL: Verify this is NOT a "Download image" button
+                                label = (await el.get_attribute("aria-label") or "").lower()
+                                text = (await el.text_content() or "").lower()
+                                if "image" in label or "image" in text:
+                                    # Only skip if we haven't tried the menu yet or if we have other options.
+                                    # If it's a video generation, "Download image" is WRONG.
+                                    logger.debug(f"⏭️ Skipping suspected image-download button: {selector} ('{text or label}')")
+                                    continue
+
                                 if attempt == 0:
                                     logger.info(f"🎯 Found download button: {selector}")
                                 else:
@@ -1021,11 +935,20 @@ async def generate_single_clip(
                                 # Set up the download listener BEFORE clicking
                                 try:
                                     async with page.expect_download(timeout=30000) as dl:
-                                        # Try normal click first
+                                        # Check disabled state
+                                        if await el.get_attribute("disabled") is not None:
+                                            logger.info(f"⏳ Button {selector} is disabled, waiting...")
+                                            try:
+                                                await el.expect_attribute("disabled", None, timeout=30000)
+                                                logger.info(f"✅ Button {selector} enabled")
+                                            except:
+                                                logger.warning(f"⚠️ Button {selector} timed out")
+                                                continue
+
+                                        # Click
                                         try:
-                                            await el.click(timeout=3000)
+                                            await el.click(timeout=10000)
                                         except:
-                                            # If intercepted, use JS force click
                                             await page.evaluate(f"document.querySelector(`{selector}`).click()")
                                     
                                     # Wait for the download to start
@@ -1042,23 +965,41 @@ async def generate_single_clip(
                                 if output.exists():
                                     file_size = output.stat().st_size
                                     
-                                    # Verify it's not HTML
-                                    is_html = False
+                                    # Verify it's not HTML or Image
+                                    is_invalid = False
+                                    header = b""
                                     try:
                                         with open(output, "rb") as f:
                                             header = f.read(100)
                                             if b"<!DOCTYPE html>" in header or b"<html" in header:
-                                                is_html = True
-                                    except: pass
+                                                logger.warning(f"⚠️ Downloaded file is HTML (Size: {file_size}b).")
+                                                is_invalid = True
+                                            elif header.startswith(b"\x89PNG") or header.startswith(b"\xff\xd8\xff"):
+                                                logger.warning(f"⚠️ Downloaded file is an IMAGE (PNG/JPG) (Size: {file_size}b). Selector '{selector}' likely clicked 'Download Image'.")
+                                                is_invalid = True
+                                    except Exception as e:
+                                        logger.warning(f"⚠️ Failed to read file header: {e}")
 
+<<<<<<< Updated upstream
                                     if file_size < 200000 or is_html: # < 200KB or HTML is suspicious (Videos are usually >1MB, but short clips can be small)
                                         logger.warning(f"⚠️ Downloaded file is invalid (Size: {file_size}b, HTML: {is_html}). Waiting and retrying...")
+=======
+                                    if file_size < 15000 or is_invalid: # < 15KB or Invalid Content
+                                        logger.warning(f"⚠️ File validation failed. Waiting and retrying...")
+>>>>>>> Stashed changes
                                         try: output.unlink() 
                                         except: pass
                                         await asyncio.sleep(8) # Wait for backend sync
                                         continue
                                     
-                                    logger.info(f"✅ Successfully downloaded video using {selector}: {output}")
+                                    logger.info(f"✅ Successfully downloaded video using {selector}: {output} (Size: {file_size}b)")
+                                    # Rename to ensure .mp4 extension if needed
+                                    if output.suffix != ".mp4":
+                                        new_output = output.with_suffix(".mp4")
+                                        output.rename(new_output)
+                                        output = new_output
+                                        logger.info(f"🔄 Renamed to: {output}")
+
                                     button_download_success = True
                                     return output
                         except Exception as e:
@@ -1358,7 +1299,9 @@ class GrokAnimator:
                     # Take screenshot if headful (debugging)
                     try:
                         timestamp = int(asyncio.get_event_loop().time())
-                        await page.screenshot(path=f"grok_error_{timestamp}.png")
+                        scr_path = f"grok_error_{timestamp}.png"
+                        await page.screenshot(path=scr_path)
+                        logger.info(f"📸 Diagnostic screenshot saved: {scr_path}")
                     except:
                         pass
                     if attempt < MAX_RETRIES - 1:
@@ -1370,8 +1313,25 @@ class GrokAnimator:
                         raise e
                 finally:
                     # Close browser after EACH clip (Reverting speed boost per user request)
-                    await browser.close()
-                    await pw.stop()
+                    print("\n🛑 STARTING BROWSER CLEANUP...")
+                    logger.info("🛑 Closing Grok Chrome Window...")
+                    try:
+                        if 'browser' in locals() and browser: 
+                            try:
+                                # Use a small timeout for closing to prevent hangs
+                                await asyncio.wait_for(browser.close(), timeout=10.0)
+                            except Exception as be:
+                                logger.warning(f"⚠️ Browser close timed out or failed: {be}")
+                        
+                        if 'pw' in locals() and pw:
+                            try:
+                                await asyncio.wait_for(pw.stop(), timeout=5.0)
+                            except Exception as pe:
+                                logger.warning(f"⚠️ Playwright stop timed out or failed: {pe}")
+                                
+                        logger.info("✅ Grok Chrome Window Closed")
+                    except Exception as fe:
+                        logger.warning(f"⚠️ General cleanup error: {fe}")
     
     async def animate_batch(
         self,

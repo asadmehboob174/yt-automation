@@ -202,6 +202,86 @@ async def trigger_storage_cleanup(
         raise HTTPException(status_code=500, detail=f"Cleanup failed: {str(e)}")
 
 
+@app.post("/tools/swap-audio")
+async def swap_audio_tool(
+    video1: UploadFile = File(...),
+    video2: UploadFile = File(...)
+):
+    """
+    Swap audio streams between two video files.
+    """
+    try:
+        from services.video_editor import FFmpegVideoEditor
+        
+        editor = FFmpegVideoEditor()
+        storage = R2Storage()
+        
+        # 1. Save uploads
+        print(f"DEBUG: Receiving uploads. V1: {video1.filename}, V2: {video2.filename}")
+        v1_path = editor.output_dir / f"{uuid.uuid4()}_{video1.filename}"
+        v2_path = editor.output_dir / f"{uuid.uuid4()}_{video2.filename}"
+        
+        content1 = await video1.read()
+        content2 = await video2.read()
+        print(f"DEBUG: Saved V1 ({len(content1)} bytes) to {v1_path}")
+        print(f"DEBUG: Saved V2 ({len(content2)} bytes) to {v2_path}")
+
+        with open(v1_path, "wb") as f:
+            f.write(content1)
+        with open(v2_path, "wb") as f:
+            f.write(content2)
+            
+        # 2. Swap
+        print(f"DEBUG: calling swap_audio_streams...")
+        out1_path, out2_path = editor.swap_audio_streams(v1_path, v2_path)
+        
+        if out1_path.exists():
+            print(f"DEBUG: Out1 created at {out1_path}, size: {out1_path.stat().st_size} bytes")
+        else:
+            print(f"DEBUG: Out1 MISSING at {out1_path}")
+
+        if out2_path.exists():
+            print(f"DEBUG: Out2 created at {out2_path}, size: {out2_path.stat().st_size} bytes")
+        else:
+            print(f"DEBUG: Out2 MISSING at {out2_path}")
+
+        # 3. Upload results
+        # Use simple filenames for keys
+        timestamp = uuid.uuid4().hex[:8]
+        key1 = f"tools/swapped_{timestamp}_1.mp4"
+        key2 = f"tools/swapped_{timestamp}_2.mp4"
+        
+        print(f"DEBUG: Uploading to keys: {key1}, {key2}")
+        storage.upload(out1_path, remote_key=key1)
+        storage.upload(out2_path, remote_key=key2)
+        
+        # 4. Get URLs
+        url1 = storage.get_url(key1)
+        url2 = storage.get_url(key2)
+        print(f"DEBUG: Generated URLs: \n  {url1}\n  {url2}")
+        
+        # Cleanup temp files
+        def safe_delete(p):
+            try:
+                if p.exists(): p.unlink()
+            except: pass
+            
+        safe_delete(v1_path)
+        safe_delete(v2_path)
+        safe_delete(out1_path)
+        safe_delete(out2_path)
+        
+        return {
+            "video1_url": url1,
+            "video2_url": url2
+        }
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # --- Notifications ---
 
 class EmailNotification(BaseModel):
@@ -1309,6 +1389,7 @@ class GenerateVideoRequest(BaseModel):
     prompt: str | dict | None = "" # Add default to prevent 422
     niche_id: str
     dialogue: str | dict | None = "" # Add default to prevent 422
+    text_to_audio_prompt: str | None = None # New field for scene audio
     camera_angle: str | dict | None = None
     is_shorts: bool = False
     sound_effect: str | list | None = None
@@ -1451,24 +1532,83 @@ async def generate_video(request: GenerateVideoRequest):
             )
 
             # --- High Quality Stage: 4K Upscale ---
-            try:
+            # NOTE: Disabled per user request
+            # try:
+            #     from services.video_editor import FFmpegVideoEditor
+            #     editor = FFmpegVideoEditor()
+            #     
+            #     # Determine target resolution for 4K
+            #     # Long format: 3840x2160, Shorts: 2160x3840
+            #     target_res = (2160, 3840) if request.is_shorts else (3840, 2160)
+            #     
+            #     print(f"🚀 Starting 4K Upscale for scene {request.scene_index} ({target_res[0]}x{target_res[1]})...")
+            #     upscaled_path = editor.upscale_video(video_path, target_resolution=target_res)
+            #     
+            #     # Replace original path with upscaled path if successful
+            #     if upscaled_path.exists() and upscaled_path != video_path:
+            #         # Original video_path will be cleaned up in finally block if it was different
+            #         video_path = upscaled_path
+
+            # --- Scene Audio Generation (New) ---
+            if request.text_to_audio_prompt:
+                print(f"🔊 generating audio for scene {request.scene_index} -> '{request.text_to_audio_prompt[:30]}...'")
+                from services.audio_engine import AudioEngine
                 from services.video_editor import FFmpegVideoEditor
-                editor = FFmpegVideoEditor()
                 
-                # Determine target resolution for 4K
-                # Long format: 3840x2160, Shorts: 2160x3840
-                target_res = (2160, 3840) if request.is_shorts else (3840, 2160)
+                audio_engine = AudioEngine()
+                video_editor = FFmpegVideoEditor()
                 
-                print(f"🚀 Starting 4K Upscale for scene {request.scene_index} ({target_res[0]}x{target_res[1]})...")
-                upscaled_path = editor.upscale_video(video_path, target_resolution=target_res)
+                # Check if prompt is meaningful dialogue or just SFX
+                # Heuristic: If prompt has no words outside brackets [], it's likely SFX/Atmosphere
+                # If it has words, use TTS.
+                text = request.text_to_audio_prompt
+                import re
+                # Remove content in brackets to see if there's spoken text
+                clean_text = re.sub(r'\[.*?\]', '', text).strip()
                 
-                # Replace original path with upscaled path if successful
-                if upscaled_path.exists() and upscaled_path != video_path:
-                    # Original video_path will be cleaned up in finally block if it was different
-                    video_path = upscaled_path
-                    print(f"✨ 4K Upscale complete: {video_path.name}")
-            except Exception as e:
-                print(f"⚠️ 4K Upscale failed (falling back to original): {e}")
+                if clean_text:
+                    # Case A: Dialogue exists -> Use TTS
+                    print(f"   🗣️ Dialogue detected: '{clean_text}'")
+                    # Use a default voice or one from request (not yet in request, could add later)
+                    # For now, default to standard narrative voice
+                    tts_path = await audio_engine.generate_narration(clean_text, provider="edge-tts")
+                    
+                    # Merge this audio into the video
+                    # 1. Start with original video audio (or silence)
+                    # 2. Add TTS audio
+                    # Since we want to supporting "original audio" + "new audio", we should mix.
+                    # BUT `replace_audio_track` REPLACES it. 
+                    # For this feature, we likely want to REPLACE the video audio with the TTS, 
+                    # because the "original audio" from Grok/Hunyuan is usually silence or garbage.
+                    # If user wants "original audio" they wouldn't provide a text_to_audio_prompt for dialogue.
+                    
+                    # If prompt was ONLY brackets (e.g. [breathing]), clean_text is empty -> we skip TTS.
+                    
+                    print(f"   video_path: {video_path}")
+                    print(f"   tts_path: {tts_path}")
+                    
+                    # Create mixed video
+                    mixed_video = video_path.parent / f"{video_path.stem}_with_audio.mp4"
+                    
+                    # If video has no audio stream, this adds it.
+                    # If video has audio, we might want to keep it? 
+                    # User said: "if no [prompt] then use original audio".
+                    # Implication: If prompt EXISTS, we use generated audio.
+                    
+                    # We use ffmpeg to replace/add audio
+                    final_scene_path = video_editor.replace_audio_track(video_path, tts_path, mixed_video)
+                    video_path = final_scene_path
+                    print(f"   ✅ Audio added to scene {request.scene_index}")
+
+                else:
+                    print(f"   🎵 SFX-only prompt detected: '{text}'. Keeping original audio (no TTS generated).")
+                    # In future: Call SFX generation model here.
+            else:
+                 print(f"   🔇 No audio prompt for scene {request.scene_index}. Keeping original audio.")
+
+            #         print(f"✨ 4K Upscale complete: {video_path.name}")
+            # except Exception as e:
+            #     print(f"⚠️ 4K Upscale failed (falling back to original): {e}")
 
             # --- Success Path: Upload ---
             storage = R2Storage()
@@ -1531,6 +1671,7 @@ class StitchVideosRequest(BaseModel):
     video_id: Optional[str] = None # Database ID for the video job (to allow easy repair)
     youtube_upload: Optional[dict] = None
     final_assembly: Optional[dict] = None
+    audio_config: Optional[dict] = None # { mute_source_audio: bool, provider: str, voice_id: str, voice_sample_key: str }
 
 @app.post("/videos/stitch")
 async def stitch_videos(request: StitchVideosRequest):
@@ -1712,16 +1853,106 @@ async def stitch_videos(request: StitchVideosRequest):
         stitched_path = temp_dir / "stitched_no_music.mp4"
         
         # We need to update VideoEditor to support target_resolution
+        audio_config = request.audio_config or {}
+        mute_source = audio_config.get("mute_source_audio", False)
+        remove_speakers = audio_config.get("remove_speakers", False) # New flag from frontend
+        
+        # If "Deep Remove Vocals" is selected, we MUST NOT mute the source during stitching
+        # because we need the audio to process it.
+        stitch_mute = mute_source
+        if remove_speakers:
+            print("🔊 Smart Vocal Removal requested: Preserving source audio for processing...")
+            stitch_mute = False
+        
         stitched_path = editor.stitch_clips_with_fade(
             final_clips_to_stitch, 
             stitched_path, 
             fade_duration=0.3,
-            target_resolution=target_res
+            target_resolution=target_res,
+            mute_audio=stitch_mute
         )
         print(f"   ✅ Stitched video created: {stitched_path}")
         
+        # --- SMART VOCAL REMOVAL (Demucs) ---
+        if remove_speakers and not mute_source:
+             print(f"🧬 Performing Smart Vocal Removal (Demucs)...")
+             try:
+                 from services.audio_engine import AudioEngine
+                 engine = AudioEngine()
+                 
+                 # 1. Extract audio from stitched video
+                 full_audio = engine.extract_audio_from_clip(stitched_path)
+                 
+                 # 2. Separate (remove vocals)
+                 bg_audio = engine.remove_vocals(full_audio)
+                 
+                 # 3. Replace video audio with the instrumental version
+                 clean_video = temp_dir / "stitched_clean.mp4"
+                 stitched_path = editor.replace_audio_track(stitched_path, bg_audio, clean_video)
+                 print(f"   ✅ Replaced audio with instrumental track.")
+                 
+             except Exception as e:
+                 print(f"   ⚠️ Smart Vocal Removal failed: {e}. Falling back to original audio.")
+
         current_video_path = stitched_path
         
+        # --- AUDIO GENERATION (TTS / Cloning) ---
+        audio_provider = audio_config.get("provider")
+        voice_id = audio_config.get("voice_id")
+        voice_sample_key = audio_config.get("voice_sample_key")
+        
+        fresh_audio_paths = []
+        if audio_provider:
+            print(f"🎙️ Generating fresh Voiceover using {audio_provider}...")
+            from services.audio_engine import AudioEngine
+            engine = AudioEngine()
+            
+            # Download reference audio if XTTS
+            ref_audio_path = None
+            if audio_provider == "xtts" and voice_sample_key:
+                 from services.cloud_storage import R2Storage
+                 storage_downloader = R2Storage()
+                 ref_audio_path = temp_dir / "ref_voice_sample.wav"
+                 try:
+                     print(f"   📥 Downloading voice sample: {voice_sample_key}")
+                     storage_downloader.download(voice_sample_key, ref_audio_path)
+                 except Exception as e:
+                     print(f"   ⚠️ Failed to download voice sample for XTTS: {e}")
+            
+            # We need the script text for each scene. 
+            # Ideally the frontend sends the *text* to be spoken for each clip, but here we only have URLs.
+            # However, the frontend sends request.script (full text) usually.
+            # Or we can iterate if we had scene-level data. But StitchVideosRequest is "Simple".
+            # If we don't have per-scene text, we might just generate one long audio track from request.script?
+            # Or assume the frontend passed a way to map?
+            # Wait, `StitchVideosRequest` has `script: Optional[str]`. This is usually the full text.
+            # If we want per-scene sync, we need per-scene text.
+            # BUT, the user usually only changes this on the "Final" tab where they see the full script?
+            # Actually, `Step5Final` has access to `scenes`.
+            # If we want to support this properly, `StitchVideosRequest` needs `scene_texts` list or we use `script` as one block.
+            # Using `script` as one block is risky for sync.
+            # Let's check `StitchVideosRequest` again. It has `script`.
+            # For now, if we use TTS here, we'll generate one audio track from `request.script` and let it run over the video?
+            # Or we just support it if we can map it.
+            # BETTER: The frontend should send `scenes` with text.
+            # BUT `StitchVideosRequest` is designed to be simple.
+            # Let's stick to generating from `request.script` (full text) as a single narration track for now.
+            # This handles the "Voiceover for the whole video" use case.
+            
+            # if request.script:
+            #      try:
+            #         full_audio_path = await engine.generate_narration(
+            #             text=request.script,
+            #             voice_id=voice_id or "en-US-AriaNeural",
+            #             provider=audio_provider,
+            #             reference_audio=ref_audio_path,
+            #             output_path=temp_dir / "full_narration.mp3"
+            #         )
+            #         fresh_audio_paths.append(full_audio_path)
+            #         print(f"   ✅ Generated full narration: {full_audio_path.name}")
+            #      except Exception as e:
+            #         print(f"   ❌ TTS Generation failed: {e}")
+
         # --- FINAL ASSEMBLY (Color Grading) ---
         if request.final_assembly and request.final_assembly.get("color_grading"):
             print(f"🎨 Applying Color Grading...")
@@ -1810,12 +2041,51 @@ async def stitch_videos(request: StitchVideosRequest):
         # 4. Mix background music with video (low volume: 30%)
         final_path = temp_dir / "final_with_music.mp4"
         
-        if music_path:
+        # Determine audio mix strategy
+        # A. Fresh TTS + BGM (Documentary Style)
+        if fresh_audio_paths:
+            print("🎛️ Mixing Fresh TTS Audio + BGM...")
+            mixed_audio = temp_dir / "final_audio_mix.mp3"
+            
+            if music_path:
+                # Mix narration with BGM (ducking handled by mix_audio usually?)
+                # Editor.mix_audio handles list of narration + bgm
+                mixed_audio = editor.mix_audio(fresh_audio_paths, music_path, mixed_audio)
+            else:
+                # Just narration
+                 import shutil
+                 shutil.copy(fresh_audio_paths[0], mixed_audio)
+            
+            # Combine with video (which might be silent if mute_source was True)
+            # Finalize expects separate audio path
+            # We can use editor.finalize logic here or just a direct ffmpeg merge
+            # Let's use editor.finalize if we can import it? 
+            # finalize takes (video, audio, subtitle, output)
+            
+            # Since we are in main, editor is instantiated.
+            # But duplicate logic is messy. editor.finalize matches lengths.
+            # Let's use editor.finalize. We need to create dummy subtitle path if none?
+            # Or wait, finalize handles optional subtitles.
+            
+            final_path = editor.finalize(current_video_path, mixed_audio, None, final_path)
+            
+        # B. Original Audio + BGM (Story Style)
+        elif music_path:
             print(f"🔊 Mixing background music at 30% volume...")
-            editor.add_background_music(current_video_path, music_path, final_path, music_volume=0.30)
+            if mute_source:
+                 # If source muted and no fresh audio, it's just BGM
+                 # add_background_music might preserve original audio track even if empty?
+                 # If we used `mute_audio=True` in stitch, the video track has `anullsrc` text?
+                 # Actually `stitch_clips_with_fade` adds `anullsrc`.
+                 # So `add_background_music` will mix BGM with that silence.
+                 editor.add_background_music(current_video_path, music_path, final_path, music_volume=0.30)
+            else:
+                 editor.add_background_music(current_video_path, music_path, final_path, music_volume=0.30)
             print(f"   ✅ Background music mixed")
+            
+        # C. No New Audio
         else:
-            print(f"   ℹ️ No background music to mix. Using original video.")
+            print(f"   ℹ️ No background music/TTS to mix. Using stitched video.")
             import shutil
             shutil.copy(current_video_path, final_path)
         
@@ -2174,6 +2444,60 @@ class YouTubeUploadRequest(BaseModel):
     generate_metadata: bool = False # If true, use AI to generate title/desc/tags
     script_context: Optional[str] = None # Required if generate_metadata is True
 
+
+class ClonePreviewRequest(BaseModel):
+    text: str
+    provider: str = "xtts" # xtts, elevenlabs
+    voice_id: Optional[str] = None
+    voice_sample_url: Optional[str] = None
+
+@app.post("/audio/clone-preview")
+async def clone_audio_preview(request: ClonePreviewRequest):
+    """Generate a short preview of the cloned voice."""
+    import tempfile
+    from pathlib import Path
+    from services.audio_engine import AudioEngine
+    from services.cloud_storage import R2Storage
+    import httpx
+    import uuid
+
+    engine = AudioEngine()
+    storage = R2Storage()
+    
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        ref_path = None
+        
+        # Download sample if needed
+        if request.provider == "xtts" and request.voice_sample_url:
+            ref_path = tmp_path / "sample.wav"
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(request.voice_sample_url)
+                if resp.status_code == 200:
+                    with open(ref_path, "wb") as f:
+                        f.write(resp.content)
+                        
+        output_path = tmp_path / f"preview_{uuid.uuid4().hex}.mp3"
+        try:
+            await engine.generate_narration(
+                text=request.text,
+                voice_id=request.voice_id or "en-US-AriaNeural",
+                provider=request.provider,
+                reference_audio=ref_path,
+                output_path=output_path
+            )
+            
+            # Upload
+            key = f"previews/audio/{output_path.name}"
+            with open(output_path, "rb") as f:
+                storage.upload_asset(f.read(), key, "audio/mpeg")
+                
+            return {"url": storage.get_url(key)}
+            
+        except Exception as e:
+            print(f"Preview generation failed: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+            
 
 @app.post("/upload/youtube")
 async def upload_to_youtube(request: YouTubeUploadRequest):

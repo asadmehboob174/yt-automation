@@ -54,6 +54,7 @@ export interface Scene {
         lightingChanges?: string;
         fullPrompt?: string;
     };
+    textToAudioPrompt?: string; // New field for scene-specific audio/sfx
     sfx?: string[];
     musicNotes?: string;
     formattedPrompt?: string;

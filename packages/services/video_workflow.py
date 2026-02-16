@@ -630,14 +630,65 @@ async def render_final_video(
     is_shorts = "shorts" in channel_config.get("nicheId", "").lower() or "shorts" in channel_config.get("styleSuffix", "").lower()
     target_res = (1080, 1920) if is_shorts else (1920, 1080)
     
+    # Extract Audio Config
+    audio_cfg = channel_config.get("audio", {})
+    mute_source = audio_cfg.get("mute_source_audio", False)
+    audio_provider = audio_cfg.get("provider") # 'elevenlabs', 'xtts', 'edge-tts'
+    voice_id = audio_cfg.get("voice_id")
+    voice_sample_key = audio_cfg.get("voice_sample_key")
+    
     # 3. Stitching
-    logger.info(f"🧵 Stitching {len(local_clips)} clips...")
+    logger.info(f"🧵 Stitching {len(local_clips)} clips (Mute Source: {mute_source})...")
     stitched_path = editor.stitch_clips_with_transitions(
         local_clips, 
         "/tmp/stitched.mp4",
         target_resolution=target_res,
-        transition_duration=0.5
+        transition_duration=0.5,
+        mute_audio=mute_source
     )
+    
+    # 3.5 Generate Custom TTS if requested
+    # If audio_provider is set, we ignore previous audio_keys and generate fresh
+    if audio_provider and (video_type == "story" or video_type == "documentary"):
+        from .audio_engine import AudioEngine
+        engine = AudioEngine()
+        logger.info(f"🎙️ Generating fresh Voiceover using {audio_provider}...")
+        
+        # Download reference audio if XTTS
+        ref_audio_path = None
+        if audio_provider == "xtts" and voice_sample_key:
+             ref_audio_path = Path("/tmp/ref_voice.wav")
+             try:
+                 storage.download(voice_sample_key, ref_audio_path)
+             except Exception as e:
+                 logger.warning(f"⚠️ Failed to download voice sample for XTTS: {e}")
+                 
+        fresh_audio_paths = []
+        for i, scene in enumerate(script.get("scenes", [])):
+            text = scene.get("voiceover_text") or scene.get("dialogue")
+            if isinstance(text, dict): text = " ".join(text.values())
+            
+            if text:
+                try:
+                    p = await engine.generate_narration(
+                        text=text,
+                        voice_id=voice_id or "en-US-AriaNeural",
+                        provider=audio_provider,
+                        reference_audio=ref_audio_path,
+                        output_path=Path(f"/tmp/gen_audio_{i}.mp3")
+                    )
+                    fresh_audio_paths.append(p)
+                except Exception as e:
+                    logger.error(f"❌ Failed to generate audio for scene {i}: {e}")
+        
+        # Override audio_keys logic implies we have local files now
+        # We will essentially force 'documentary' style mixing below
+        # but with these new files
+        local_audio = fresh_audio_paths
+        has_fresh_audio = True
+    else:
+        has_fresh_audio = False
+        local_audio = [] # Will be populated if documentary mode standard
     
     # 4. Color Grading
     if assembly and assembly.get("color_grading"):
@@ -683,7 +734,35 @@ async def render_final_video(
     # 6. Final Mix
     final_audio_path = stitched_path # Default if no audio added
     
-    if video_type == "documentary" and audio_keys:
+    # If we generated fresh audio, treat it like documentary mode (VO + BGM)
+    if has_fresh_audio:
+        logger.info("🎛️ Mixing Fresh TTS Audio with Background Music...")
+        
+        # Generate Subtitles
+        # For fresh audio, we should regenerate SRT to match exact timing if possible?
+        # Standard subtitle engine uses script word count estimation usually, which is fine.
+        subtitle_scenes = []
+        for s in script.get("scenes", []):
+             sc = s.copy()
+             if not sc.get("voiceover_text") and sc.get("dialogue"):
+                 sc["voiceover_text"] = sc["dialogue"]
+             subtitle_scenes.append(sc)
+             
+        srt_path = subtitle_engine.generate_from_script(subtitle_scenes, "/tmp/subtitles.srt")
+        
+        # Mix VO + BGM
+        if local_audio:
+            final_audio_path = editor.mix_audio(local_audio, bg_music_local, "/tmp/final_audio_mix.mp3")
+        elif bg_music_local: 
+            final_audio_path = bg_music_local
+            
+        # Finalize
+        final_path = editor.finalize(stitched_path, final_audio_path, srt_path, "/tmp/final_video.mp4")
+        
+        # Cleanup
+        for f in local_audio: Path(f).unlink(missing_ok=True)
+        
+    elif video_type == "documentary" and audio_keys:
         # Documentary: Download VO and Mix
         local_audio = [storage.download(k, f"/tmp/audio_{i}.mp3") for i, k in enumerate(audio_keys)]
         
@@ -700,18 +779,29 @@ async def render_final_video(
         for f in local_audio: Path(f).unlink(missing_ok=True)
             
     else:
-        # Story Mode: Audio already in clips (except title cards)
+        # Story Mode (Original Audio): Audio already in stitched clips
         # We need to mix BGM with the *video's existing audio*
         
         if bg_music_local:
-            final_audio_path = editor.add_background_music(
-                stitched_path,
-                bg_music_local,
-                "/tmp/final_video_w_music.mp4",
-                music_volume=0.15
-            )
+            if mute_source:
+                 # If source is muted and no fresh audio, it's just BGM
+                 final_audio_path = bg_music_local
+            else:
+                final_audio_path = editor.add_background_music(
+                    stitched_path,
+                    bg_music_local,
+                    "/tmp/final_video_w_music.mp4",
+                    music_volume=0.15
+                )
         else:
-            final_audio_path = stitched_path
+            if mute_source:
+                # Silent video? create silent audio track
+                # editor.finalize will handle it? No, finalize expects audio path.
+                # If mute_source and no BGM, we effectively have no audio track.
+                # We can generate 1s of silence or just rely on stitched_path having silent track (from anullsrc)
+                final_audio_path = stitched_path # It has anullsrc audio track now
+            else:
+                final_audio_path = stitched_path
             
         # Subtitles for Story
         subtitle_scenes = []

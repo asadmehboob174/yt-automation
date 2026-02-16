@@ -287,7 +287,7 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
                                     try {
                                         // SANITIZE PAYLOAD
                                         const sceneData = breakdown.scenes[index];
-                                        const videoResult = await api.post<{ videoUrl: string }>('/scenes/generate-video', {
+                                        const videoResult = await api.post<{ videoUrl: string, formattedPrompt: string }>('/scenes/generate-video', {
                                             scene_index: index,
                                             image_url: imageUrl,
                                             prompt: ensureString(sceneData.image_to_video_prompt || sceneData.textToVideo || sceneData.prompt),
@@ -296,9 +296,14 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
                                             is_shorts: format === 'short',
                                             camera_angle: ensureString(sceneData.camera_angle || sceneData.cameraAngle),
                                             sound_effect: sceneData.sfx || sceneData.sound_effect,
-                                            emotion: ensureString(sceneData.emotion)
+                                            emotion: ensureString(sceneData.emotion),
+                                            text_to_audio_prompt: ensureString(sceneData.text_to_audio_prompt || sceneData.textToAudioPrompt)
                                         });
-                                        useProjectStore.getState().updateScene(index, { videoUrl: videoResult.videoUrl });
+                                        useProjectStore.getState().updateScene(index, {
+                                            videoUrl: videoResult.videoUrl,
+                                            isValidVideo: true,
+                                            formattedPrompt: videoResult.formattedPrompt
+                                        });
                                         videoSuccess = true;
                                         break;
                                     } catch (e) {
@@ -360,7 +365,8 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
                             is_shorts: format === 'short',
                             camera_angle: ensureString(sceneData.camera_angle || sceneData.cameraAngle),
                             sound_effect: sceneData.sfx || sceneData.sound_effect,
-                            emotion: ensureString(sceneData.emotion)
+                            emotion: ensureString(sceneData.emotion),
+                            text_to_audio_prompt: ensureString(sceneData.text_to_audio_prompt || sceneData.textToAudioPrompt)
                         });
                         currentVideoUrl = repairResult.videoUrl;
 
@@ -435,6 +441,13 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
                 thumbnail_url: useProjectStore.getState().thumbnailUrl,
                 youtube_upload: (breakdown as any).youtube_upload,
                 final_assembly: (breakdown as any).final_assembly,
+                audio_config: {
+                    provider: 'xtts',
+                    mute_source_audio: false, // Smart separation requires source audio
+                    remove_speakers: true, // "Keep Background Music" ON
+                    voice_id: undefined, // XTTS doesn't use ID usually
+                    voice_sample_key: undefined // Fallback to EdgeTTS if no sample? Or user needs to set default?
+                }
             });
             updateStep(6, 'done');
 

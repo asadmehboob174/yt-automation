@@ -7,7 +7,9 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
+import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Switch } from '@/components/ui/switch';
 import { Progress } from '@/components/ui/progress';
 import { Badge } from '@/components/ui/badge';
 import { Separator } from '@/components/ui/separator';
@@ -30,7 +32,8 @@ import {
     Video,
     Youtube,
     FileJson,
-    AlertCircle
+    AlertCircle,
+    Pause
 } from 'lucide-react';
 import { useProjectStore } from '@/lib/stores/project-store';
 import { useAutomationStore } from '@/lib/stores/automation-store';
@@ -45,6 +48,19 @@ const STEPS = [
     { number: 3, title: 'Scene Images', icon: ImagePlus },
     { number: 4, title: 'Scene Videos', icon: Video },
     { number: 5, title: 'Final', icon: Film },
+];
+
+const GHIBLI_TRACKS = [
+    { value: "ghibli", label: "Ghibli / Folk (Ishikari Lore)", url: "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Ishikari%20Lore.mp3" },
+    { value: "cozy_piano", label: "Cozy Piano (Gymnopedie)", url: "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Gymnopedie%20No%201.mp3" },
+    { value: "magic_forest", label: "Magical Forest (Enchanted)", url: "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Enchanted%20Valley.mp3" },
+    { value: "winter_waltz", label: "Winter Waltz (Frost)", url: "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Frost%20Waltz%20(Alternate).mp3" },
+    { value: "playful", label: "Playful / Quirky (Onion)", url: "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Onion%20Capers.mp3" },
+    { value: "cute_lemon", label: "Cute / Wholesome (Lemon)", url: "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Easy%20Lemon.mp3" },
+    { value: "kiki_jazz", label: "Cozy Jazz (Kiki's Vibe)", url: "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Sweet%20Vermouth.mp3" },
+    { value: "gentle_rain", label: "Gentle Rain / Soul", url: "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Clean%20Soul.mp3" },
+    { value: "uplifting_strings", label: "Uplifting Strings", url: "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Somewhere%20Sunny.mp3" },
+    { value: "nostalgia", label: "Nostalgic / Emotional", url: "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Touching%20Moments%20Two%20-%20Higher.mp3" },
 ];
 
 // Helper to format timeline (0-2s) or (0:02-0:04) to [00:00-00:02]
@@ -127,7 +143,7 @@ const parseJsonScript = (jsonScript: string): ScriptBreakdown => {
     const mappedScenes: any[] = parsed.scenes.map((s: any, idx: number) => ({
         index: idx,
         textToImage: s.text_to_image_prompt || s.static_image_prompt || s.text_to_image || s.image_prompt || s.textToImage || s.prompt || "",
-        textToVideo: s.grok_video_prompt?.full_prompt || s.grokVideoPrompt?.fullPrompt || s.image_to_video_prompt || s.motion_description || s.text_to_video_prompt || s.video_prompt || s.motion_prompt || s.textToVideo || s.motion || "",
+        textToVideo: s.grok_video_prompt?.image_to_video_prompt || s.grok_video_prompt?.full_prompt || s.grokVideoPrompt?.fullPrompt || s.image_to_video_prompt || s.motion_description || s.text_to_video_prompt || s.video_prompt || s.motion_prompt || s.textToVideo || s.motion || "",
         characterPose: s.character_pose_prompt || s.character_pose || s.characterPose || s.pose || "",
         backgroundDesc: s.background_description || s.background_desc || s.backgroundDesc || s.background || "",
         shotType: s.camera_angle || s.camera_movement || s.shot_type || s.shotType || s.shot_type_prompt || "medium shot",
@@ -144,6 +160,7 @@ const parseJsonScript = (jsonScript: string): ScriptBreakdown => {
             fullPrompt: s.grok_video_prompt?.full_prompt || s.grokVideoPrompt?.fullPrompt || s.full_prompt,
         },
         sfx: s.sfx || (s.sound_effect ? [s.sound_effect] : []),
+        textToAudioPrompt: s.text_to_audio_prompt || s.textToAudioPrompt || "",
         musicNotes: s.music_notes || s.musicNotes || "",
         // Legacy fields
         dialogue: s.dialogue || "",
@@ -868,7 +885,10 @@ function Step3SceneImages() {
             </div>
 
             <div className="grid gap-4">
-                {scenes.map((scene, index) => (
+                {scenes.map((scene, index) => {
+                     // Debug log for Scene 1 (Index 0)
+                     if (index === 0) console.log(`Step3 Render Scene 0:`, { videoUrl: scene.videoUrl, isRunning, step: 3 });
+                     return (
                     <Card key={index} className="overflow-hidden">
                         <CardContent className="p-0">
                             <div className="flex flex-col">
@@ -960,7 +980,8 @@ function Step3SceneImages() {
                             </div>
                         </CardContent>
                     </Card>
-                ))}
+                    );
+                })}
             </div>
 
             {/* YouTube Thumbnail Card */}
@@ -1048,6 +1069,7 @@ function Step4SceneVideos() {
                 camera_angle: scene.shotType,
                 niche_id: channelId,
                 is_shorts: format === 'short',
+                text_to_audio_prompt: scene.textToAudioPrompt,
             });
 
             // Validate the response has a proper video URL
@@ -1228,7 +1250,7 @@ function Step4SceneVideos() {
                     <ChevronLeft className="h-4 w-4 mr-2" />
                     Back
                 </Button>
-                <Button onClick={() => setStep(5)} disabled={!allValidated}>
+                <Button onClick={() => setStep(5)}>
                     Next: Final Video
                     <ChevronRight className="h-4 w-4 ml-2" />
                 </Button>
@@ -1238,7 +1260,6 @@ function Step4SceneVideos() {
 }
 
 // ============ STEP 5: Final Render ============
-// ============ STEP 5: Final Render ============
 function Step5Final() {
     const { 
         scenes, channelId, finalVideoUrl, setFinalVideoUrl, 
@@ -1246,11 +1267,138 @@ function Step5Final() {
     } = useProjectStore();
     const [isStitching, setIsStitching] = useState(false);
     const [isUploading, setIsUploading] = useState(false);
-    const [musicOption, setMusicOption] = useState('upbeat');
+    const [musicOption, setMusicOption] = useState("upbeat");
     const [generateMetadata, setGenerateMetadata] = useState(true);
+
+    // Audio / Voiceover State
+    const [audioSource, setAudioSource] = useState<"original" | "voiceover">("original");
+    const [provider, setProvider] = useState<"xtts" | "elevenlabs">("xtts");
+    const [voiceId, setVoiceId] = useState("");
+    const [voiceSampleUrl, setVoiceSampleUrl] = useState(""); // For XTTS reference
+    const [isUploadingSample, setIsUploadingSample] = useState(false);
+    const [removeSpeakers, setRemoveSpeakers] = useState(false); // New state for Demucs
+    const [previewUrl, setPreviewUrl] = useState("");
+    const [isPreviewingVoice, setIsPreviewingVoice] = useState(false);
+
+    // Music Player State
+    const [musicCategory, setMusicCategory] = useState<'standard' | 'ghibli'>('standard');
+    const [isPlaying, setIsPlaying] = useState(false);
+    const audioRef = useRef<HTMLAudioElement | null>(null);
+
+    // Stop audio when component unmounts or changes
+    useEffect(() => {
+        return () => {
+            if (audioRef.current) {
+                audioRef.current.pause();
+                audioRef.current = null;
+            }
+        };
+    }, []);
+
+    const stopPreview = () => {
+        if (audioRef.current) {
+            audioRef.current.pause();
+            audioRef.current = null;
+            setIsPlaying(false);
+        }
+    };
+
+    const togglePreview = () => {
+        if (isPlaying) {
+            stopPreview();
+        } else {
+            // Find track URL
+            const track = GHIBLI_TRACKS.find(t => t.value === musicOption);
+            if (!track) {
+                toast.error("No preview available for this track");
+                return;
+            }
+            
+            // Create new audio instance
+            const audio = new Audio(track.url);
+            audio.volume = 0.5;
+            audio.loop = false;
+            
+            audio.onended = () => setIsPlaying(false);
+            audio.onerror = () => {
+                toast.error("Failed to play preview");
+                setIsPlaying(false);
+            };
+            
+            audioRef.current = audio;
+            audio.play().catch(e => {
+                console.error("Play error:", e);
+                toast.error("Could not play audio");
+            });
+            setIsPlaying(true);
+        }
+    };
+
+    const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+
+        setIsUploadingSample(true);
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('asset_type', 'voice_sample'); 
+
+        try {
+            // Use api.upload instead of api.post
+            const res = await api.upload<{ url: string, key: string }>(`/channels/${channelId}/upload`, formData);
+            setVoiceSampleUrl(res.url); // We might want to store 'key' if needed, but URL is fine for now
+            toast.success("Voice sample uploaded!");
+        } catch (error) {
+            toast.error("Failed to upload sample");
+        } finally {
+            setIsUploadingSample(false);
+        }
+    };
+
+    const handleVoicePreview = async () => {
+        if (!breakdown?.scenes?.[0]?.dialogue && !breakdown?.description) {
+            toast.error("No text available to preview");
+            return;
+        }
+        
+        const previewText = breakdown?.scenes?.[0]?.dialogue || "This is a preview of the voice.";
+        
+        setIsPreviewingVoice(true);
+        stopPreview();
+        try {
+            const res = await api.post<{ url: string }>('/audio/clone-preview', {
+                text: previewText.substring(0, 100), // Short preview
+                provider,
+                voice_id: voiceId,
+                voice_sample_url: voiceSampleUrl
+            });
+            
+            setPreviewUrl(res.url);
+            
+            // Play it
+            const audio = new Audio(res.url);
+            audio.play();
+            
+        } catch (e) {
+            toast.error("Failed to generate voice preview");
+        } finally {
+            setIsPreviewingVoice(false);
+        }
+    };
 
     const handleStitch = async () => {
         setIsStitching(true);
+        stopPreview(); // Stop music when stitching starts
+        
+        // Build Audio Config
+        const audioConfig = {
+            mute_source_audio: audioSource === "voiceover",
+            remove_speakers: removeSpeakers, // Include logic flag
+            provider: audioSource === "voiceover" ? provider : undefined,
+            voice_id: voiceId,
+            voice_sample_key: voiceSampleUrl 
+        };
+
         try {
             const result = await api.post<{ status: string; final_video_url: string; clips_stitched: number }>('/videos/stitch', {
                 video_urls: scenes.map((s) => s.videoUrl).filter(url => !!url),
@@ -1258,6 +1406,14 @@ function Step5Final() {
                 title: breakdown?.title || 'Stitched Video',
                 music: musicOption,
                 is_shorts: format === 'short',
+                script: breakdown?.scenes.map(s => s.dialogue).join("\n\n"), // Pass full script for TTS
+                audio_config: {
+                    mute_source_audio: audioSource === "voiceover",
+                    remove_speakers: removeSpeakers, // Pass it
+                    provider: audioSource === "voiceover" ? provider : null,
+                    voice_id: voiceId,
+                    voice_sample_key: voiceSampleUrl 
+                }
             });
             setFinalVideoUrl(result.final_video_url);
             toast.success('Video stitched successfully!');
@@ -1304,26 +1460,217 @@ function Step5Final() {
 
             {/* Options */}
             <div className="grid gap-4 sm:grid-cols-2">
-                <div className="space-y-2">
-                    <Label>Background Music</Label>
-                    <Select value={musicOption} onValueChange={setMusicOption}>
-                        <SelectTrigger>
-                            <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                            <SelectItem value="upbeat">Upbeat / Happy</SelectItem>
-                            <SelectItem value="epic">Epic / Cinematic</SelectItem>
-                            <SelectItem value="calm">Calm / Ambient</SelectItem>
-                            <SelectItem value="horror">Horror / Suspense</SelectItem>
-                            <SelectItem value="dramatic">Dramatic / Intense</SelectItem>
-                            <SelectItem value="hiphop">Hip-Hop / Urban</SelectItem>
-                            <SelectItem value="jazz">Jazz / Lounge</SelectItem>
-                            <SelectItem value="piano">Piano / Romantic</SelectItem>
-                            <SelectItem value="rock">Rock / Energetic</SelectItem>
-                            <SelectItem value="auto">Auto-Select (AI)</SelectItem>
-                            <SelectItem value="none">No Music</SelectItem>
-                        </SelectContent>
-                    </Select>
+                <div className="space-y-4">
+                    <Label className="text-base">Background Music Configuration</Label>
+                    
+                    {/* Category Toggle */}
+                    <div className="flex p-1 bg-muted rounded-lg w-fit">
+                        <button
+                            onClick={() => {
+                                setMusicCategory('standard');
+                                if (GHIBLI_TRACKS.some(t => t.value === musicOption)) {
+                                     setMusicOption('upbeat'); // Reset to default standard if switching back
+                                }
+                            }}
+                            className={`px-4 py-1.5 text-sm font-medium rounded-md transition-all ${
+                                musicCategory === 'standard' 
+                                    ? 'bg-background shadow text-foreground' 
+                                    : 'text-muted-foreground hover:text-foreground'
+                            }`}
+                        >
+                            Standard
+                        </button>
+                        <button
+                            onClick={() => setMusicCategory('ghibli')}
+                            className={`px-4 py-1.5 text-sm font-medium rounded-md transition-all ${
+                                musicCategory === 'ghibli' 
+                                    ? 'bg-blue-100 text-blue-700 shadow'
+                                    : 'text-muted-foreground hover:text-foreground'
+                            }`}
+                        >
+                            ✨ Ghibli / Cozy
+                        </button>
+                    </div>
+
+                    <div className="flex gap-2 items-end">
+                        <div className="flex-1 space-y-2">
+                             <Label className="text-xs text-muted-foreground uppercase font-semibold">
+                                {musicCategory === 'standard' ? 'Standard Options' : 'Ghibli Collection'}
+                             </Label>
+                             
+                             {musicCategory === 'standard' ? (
+                                <Select value={musicOption} onValueChange={(val) => {
+                                    setMusicOption(val);
+                                    stopPreview();
+                                }}>
+                                    <SelectTrigger>
+                                        <SelectValue placeholder="Select mood..." />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                        <SelectItem value="upbeat">Upbeat / Happy</SelectItem>
+                                        <SelectItem value="epic">Epic / Cinematic</SelectItem>
+                                        <SelectItem value="calm">Calm / Ambient</SelectItem>
+                                        <SelectItem value="horror">Horror / Suspense</SelectItem>
+                                        <SelectItem value="dramatic">Dramatic / Intense</SelectItem>
+                                        <SelectItem value="hiphop">Hip-Hop / Urban</SelectItem>
+                                        <SelectItem value="jazz">Jazz / Lounge</SelectItem>
+                                        <SelectItem value="piano">Piano / Romantic</SelectItem>
+                                        <SelectItem value="rock">Rock / Energetic</SelectItem>
+                                        <SelectItem value="auto">Auto-Select (AI)</SelectItem>
+                                        <SelectItem value="none">No Music</SelectItem>
+                                    </SelectContent>
+                                </Select>
+                             ) : (
+                                <Select value={musicOption} onValueChange={(val) => {
+                                    setMusicOption(val);
+                                    stopPreview();
+                                }}>
+                                    <SelectTrigger className="border-blue-200 bg-blue-50/50">
+                                        <SelectValue placeholder="Select cozy track..." />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                        {GHIBLI_TRACKS.map((track) => (
+                                            <SelectItem key={track.value} value={track.value}>
+                                                {track.label}
+                                            </SelectItem>
+                                        ))}
+                                    </SelectContent>
+                                </Select>
+                             )}
+                        </div>
+
+                        {/* Preview Button (Only for Ghibli/Cozy tracks or if we mapped standard ones too) */}
+                        {musicCategory === 'ghibli' && (
+                            <Button
+                                size="icon"
+                                variant={isPlaying ? "destructive" : "outline"}
+                                className="mb-[2px]"
+                                onClick={togglePreview}
+                                title={isPlaying ? "Stop Preview" : "Preview Track"}
+                            >
+                                {isPlaying ? (
+                                    <Pause className="h-4 w-4" />
+                                ) : (
+                                    <Play className="h-4 w-4" />
+                                )}
+                            </Button>
+                        )}
+                    </div>
+                </div>
+
+                {/* Column 2: Voiceover & Audio Configuration */}
+                <div className="space-y-4">
+                    <Label className="text-base">Voiceover & Audio Configuration</Label>
+
+                    {/* Audio Source Selection */}
+                    <div className="flex bg-muted rounded-lg p-1 w-full relative">
+                         <button
+                            onClick={() => setAudioSource('original')}
+                            className={`flex-1 px-4 py-1.5 text-sm font-medium rounded-md transition-all ${
+                                audioSource === 'original' 
+                                    ? 'bg-background shadow text-foreground' 
+                                    : 'text-muted-foreground hover:text-foreground'
+                            }`}
+                        >
+                            Original Audio
+                        </button>
+                        <button
+                            onClick={() => setAudioSource('voiceover')}
+                            className={`flex-1 px-4 py-1.5 text-sm font-medium rounded-md transition-all ${
+                                audioSource === 'voiceover' 
+                                    ? 'bg-primary text-primary-foreground shadow' 
+                                    : 'text-muted-foreground hover:text-foreground'
+                            }`}
+                        >
+                           ✨ AI Voiceover
+                        </button>
+                    </div>
+
+                    {/* Voiceover Settings */}
+                    {audioSource === 'voiceover' && (
+                        <div className="space-y-3 p-3 border rounded-lg bg-slate-50/50">
+                             
+                             {/* Smart Vocal Removal */}
+                             <div className="flex flex-row items-center justify-between rounded-lg border p-2 shadow-sm bg-background">
+                                <div className="space-y-0.5">
+                                    <Label className="text-xs font-semibold">Keep Background Music</Label>
+                                    <p className="text-[10px] text-muted-foreground leading-tight">
+                                        Use AI to remove original vocals but keep music (slower)
+                                    </p>
+                                </div>
+                                <Switch
+                                    checked={removeSpeakers}
+                                    onCheckedChange={setRemoveSpeakers}
+                                    className="scale-75" 
+                                />
+                             </div>
+
+                             {/* Provider */}
+                             <div className="space-y-1">
+                                <Label className="text-xs text-muted-foreground uppercase">Provider</Label>
+                                <Select value={provider} onValueChange={(val: any) => setProvider(val)}>
+                                    <SelectTrigger>
+                                        <SelectValue placeholder="Select provider" />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                        <SelectItem value="xtts">XTTS (Free / Clone)</SelectItem>
+                                        <SelectItem value="elevenlabs">ElevenLabs (Paid / High Quality)</SelectItem>
+                                    </SelectContent>
+                                </Select>
+                             </div>
+
+                             {/* Voice ID */}
+                             <div className="space-y-1">
+                                <Label className="text-xs text-muted-foreground uppercase">
+                                    {provider === 'xtts' ? 'Voice Checkpoint (Optional)' : 'Voice ID'}
+                                </Label>
+                                <Input 
+                                    value={voiceId} 
+                                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setVoiceId(e.target.value)}
+                                    placeholder={provider === 'xtts' ? "Default (Leave empty)" : "e.g. 21m00Tcm4TlvDq8ikWAM"}
+                                    className="h-8 text-sm"
+                                />
+                             </div>
+
+                             {/* XTTS Reference Audio */}
+                             {provider === 'xtts' && (
+                                 <div className="space-y-1">
+                                    <Label className="text-xs text-muted-foreground uppercase">Reference Audio (Cloning)</Label>
+                                    <div className="flex gap-2">
+                                        <Input 
+                                            type="file" 
+                                            accept="audio/*" 
+                                            onChange={handleFileUpload}
+                                            disabled={isUploadingSample}
+                                            className="text-xs file:mr-2 file:py-1 file:px-2 file:rounded-full file:border-0 file:text-xs file:font-semibold file:bg-violet-50 file:text-violet-700 hover:file:bg-violet-100 h-9"
+                                        />
+                                    </div>
+                                    {voiceSampleUrl && (
+                                        <p className="text-[10px] text-green-600 flex items-center">
+                                            <CheckCircle2 className="h-3 w-3 mr-1" />
+                                            Sample uploaded
+                                        </p>
+                                    )}
+                                 </div>
+                             )}
+
+                             {/* Preview */}
+                             <Button 
+                                variant="secondary" 
+                                size="sm" 
+                                className="w-full h-8 text-xs"
+                                onClick={handleVoicePreview}
+                                disabled={isPreviewingVoice || (provider === 'xtts' && !voiceSampleUrl && !voiceId)}
+                             >
+                                 {isPreviewingVoice ? (
+                                     <Loader2 className="h-3 w-3 mr-2 animate-spin" />
+                                 ) : (
+                                     <Play className="h-3 w-3 mr-2" />
+                                 )}
+                                 Preview Voice (10s)
+                             </Button>
+                        </div>
+                    )}
                 </div>
             </div>
 

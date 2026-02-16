@@ -26,15 +26,108 @@ class AudioEngine:
     async def generate_narration(
         self,
         text: str,
+        voice_id: str = "en-US-AriaNeural",
+        provider: str = "edge-tts", # edge-tts, elevenlabs, xtts
+        reference_audio: Optional[Path] = None,
         output_path: Optional[Path] = None
     ) -> Path:
-        """Generate TTS narration using Edge-TTS."""
-        output_path = output_path or self.output_dir / "narration.mp3"
+        """Generate narration using specified provider."""
+        output_path = output_path or self.output_dir / f"narration_{provider}.mp3"
         
-        communicate = edge_tts.Communicate(text, self.voice_id)
-        await communicate.save(str(output_path))
+        try:
+            if provider == "elevenlabs":
+                return await self._generate_elevenlabs(text, voice_id, output_path)
+            elif provider == "xtts":
+                return await self._generate_xtts(text, reference_audio, output_path)
+            else:
+                # Default to Edge TTS
+                communicate = edge_tts.Communicate(text, voice_id)
+                await communicate.save(str(output_path))
+        except Exception as e:
+            logger.error(f"TTS Provider {provider} failed: {e}. Fallback to EdgeTTS.")
+            # Fallback
+            communicate = edge_tts.Communicate(text, "en-US-AriaNeural")
+            await communicate.save(str(output_path))
+            
+        logger.info(f"✅ Generated narration ({provider}) -> {output_path.name}")
+        return output_path
+
+    async def _generate_elevenlabs(self, text: str, voice_id: str, output_path: Path) -> Path:
+        """Generate using ElevenLabs API."""
+        import os
+        import httpx
         
-        logger.info(f"✅ Generated narration -> {output_path.name}")
+        api_key = os.getenv("ELEVENLABS_API_KEY")
+        if not api_key:
+            logger.warning("ELEVENLABS_API_KEY missing, falling back...")
+            raise ValueError("ELEVENLABS_API_KEY not found")
+            
+        # Using V1 endpoint for simplicity, V2 requires more payload structure
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+        headers = {
+            "Accept": "audio/mpeg",
+            "Content-Type": "application/json",
+            "xi-api-key": api_key
+        }
+        data = {
+            "text": text,
+            "model_id": "eleven_monolingual_v1",
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}
+        }
+        
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(url, json=data, headers=headers, timeout=60.0)
+            resp.raise_for_status()
+            with open(output_path, "wb") as f:
+                f.write(resp.content)
+                
+        return output_path
+
+    async def _generate_xtts(self, text: str, reference_audio: Optional[Path], output_path: Path) -> Path:
+        """
+        Generate using Coqui XTTS via HuggingFace Spaces (Free).
+        Uses simple API call to a public space.
+        """
+        from gradio_client import Client
+        import shutil
+        
+        if not reference_audio or not reference_audio.exists():
+             raise ValueError("Reference audio required for XTTS cloning")
+             
+        logger.info(f"🧬 Cloning voice using XTTS (Cloud) with ref: {reference_audio.name}")
+        
+        # Connect to a stable XTTS space
+        # 'coqui/xtts' is the official one, often busy. 
+        # We try to use it with a timeout, or handle queue.
+        client = Client("coqui/xtts") 
+        
+        # API parameters for coqui/xtts standard demo:
+        # 1. Text (str)
+        # 2. Language (str)
+        # 3. Reference Audio (filepath)
+        # 4. Mic Audio (filepath/null)
+        # 5. Use Mic (bool)
+        # 6. Cleanup (bool)
+        # 7. No Auto-Detect (bool)
+        # 8. Agree (bool)
+        
+        result = client.predict(
+                text,	
+                "en",	
+                str(reference_audio),	
+                None,	
+                False,	
+                False,	
+                False,	
+                True,	
+                api_name="/predict" # Explicit API name is safer
+        )
+        
+        # Result format for this space is typically (text_output, audio_filepath)
+        # We need the second element
+        generated_wav = result[1] 
+        
+        shutil.copy(generated_wav, output_path)
         return output_path
     
     def mix_with_sidechain_compression(
@@ -237,4 +330,67 @@ class AudioEngine:
         subprocess.run(cmd, check=True, capture_output=True)
         logger.info(f"✅ Created dynamic soundtrack ({len(processed_segments)} segments) -> {output_path.name}")
         
+        return output_path
+
+    def remove_vocals(
+        self,
+        input_path: Path,
+        output_path: Optional[Path] = None
+    ) -> Path:
+        """
+        Use Demucs to separate audio and remove vocals.
+        Keeps drums, bass, and other.
+        """
+        import shlex
+        
+        output_path = output_path or self.output_dir / f"{input_path.stem}_no_vocals.mp3"
+        
+        # Create a temp dir for demucs output
+        demucs_out = self.output_dir / "demucs_out"
+        demucs_out.mkdir(parents=True, exist_ok=True)
+        
+        logger.info(f"🧬 Separating audio (removing vocals) -> {input_path.name}")
+        
+        # Command: demucs --two-stems=vocals -n htdemucs -o {out_dir} {input_path}
+        cmd = [
+            "demucs",
+            "--two-stems", "vocals",
+            "-n", "htdemucs", 
+            "-o", str(demucs_out),
+            str(input_path)
+        ]
+        
+        try:
+            # Run Demucs
+            subprocess.run(cmd, check=True, capture_output=False)
+        except subprocess.CalledProcessError as e:
+            logger.error(f"❌ Demucs failed: {e}")
+            raise RuntimeError("Failed to separate audio")
+        except FileNotFoundError:
+             logger.error("❌ Demucs not found. Please pip install demucs")
+             raise RuntimeError("Demucs not installed")
+            
+        # The output file should be at:
+        # demucs_out/htdemucs/{input_filename_without_ext}/no_vocals.wav
+        track_name = input_path.stem
+        target_file = demucs_out / "htdemucs" / track_name / "no_vocals.wav"
+        
+        if not target_file.exists():
+            # Fallback check
+            found = list(demucs_out.rglob("no_vocals.wav"))
+            if found:
+                target_file = found[0]
+            else:
+                 raise FileNotFoundError(f"Demucs output not found at {target_file}")
+        
+        # Convert to mp3 and move to output_path
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-i", str(target_file),
+            "-c:a", "libmp3lame",
+            "-b:a", "192k",
+            str(output_path)
+        ], check=True, capture_output=True)
+        
+        logger.info(f"✅ Vocals removed -> {output_path.name}")
         return output_path

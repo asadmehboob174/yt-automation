@@ -60,7 +60,8 @@ class FFmpegVideoEditor:
         clip_paths: list[Path],
         output_path: Optional[Path] = None,
         fade_duration: float = 0.4,
-        target_resolution: tuple[int, int] = (1920, 1080)
+        target_resolution: tuple[int, int] = (1920, 1080),
+        mute_audio: bool = False
     ) -> Path:
         """
         Stitch clips with smooth cross-dissolve (Mix) transitions and optional SFX.
@@ -76,11 +77,11 @@ class FFmpegVideoEditor:
         
         # Check for SFX
         sfx_path = Path(__file__).parent / "assets" / "sfx" / "whoosh.mp3"
-        has_sfx = sfx_path.exists()
+        has_sfx = sfx_path.exists() and not mute_audio
         
         # If single clip, just scale
         if len(clip_paths) == 1:
-            self._scale_single(clip_paths[0], output_path, target_w, target_h)
+            self._scale_single(clip_paths[0], output_path, target_w, target_h, mute_audio=mute_audio)
             return output_path
         
         # 1. Validate inputs and get durations
@@ -119,14 +120,18 @@ class FFmpegVideoEditor:
                 f"crop={target_w}:{target_h},setsar=1[v{i}]"
             )
             # Audio: assume exists, map [i:a] -> [a{i}]
-            # We must handle missing audio or mixed formats? 
-            # For simplicity, we assume inputs have audio. If not, 'anullsrc' is needed.
-            inputs_probe = ffmpeg.probe(str(clip), cmd=self.ffprobe_cmd)
-            has_audio = any(s['codec_type'] == 'audio' for s in inputs_probe['streams'])
-            if has_audio:
-                filter_parts.append(f"[{i}:a]aresample=44100[a{i}]")
-            else:
+            if mute_audio:
                 filter_parts.append(f"anullsrc=r=44100:cl=stereo[a{i}]")
+            else:
+                try:
+                    inputs_probe = ffmpeg.probe(str(clip), cmd=self.ffprobe_cmd)
+                    has_audio = any(s['codec_type'] == 'audio' for s in inputs_probe['streams'])
+                    if has_audio:
+                        filter_parts.append(f"[{i}:a]aresample=44100[a{i}]")
+                    else:
+                        filter_parts.append(f"anullsrc=r=44100:cl=stereo[a{i}]")
+                except:
+                     filter_parts.append(f"anullsrc=r=44100:cl=stereo[a{i}]")
 
         # 3. Chain XFades
         # Loop: [v0][v1]xfade=...[v01]; [v01][v2]xfade...
@@ -283,15 +288,134 @@ class FFmpegVideoEditor:
         logger.info(f"✅ Applied Ken Burns effect -> {output_path.name}")
         return output_path
     
-    def _scale_single(self, input_path: Path, output_path: Path, width: int, height: int):
+        return output_path
+    
+    def replace_audio_track(
+        self,
+        video_path: Path,
+        audio_path: Path,
+        output_path: Optional[Path] = None
+    ) -> Path:
+        """Replace the audio track of a video file with a new audio file."""
+        import subprocess
+        
+        output_path = output_path or self.output_dir / f"{video_path.stem}_new_audio.mp4"
+        
+        # ffmpeg -i video -i audio -c:v copy -c:a aac -map 0:v -map 1:a output
+        cmd = [
+            self.ffmpeg_cmd, "-y",
+            "-i", str(video_path),
+            "-i", str(audio_path),
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-map", "0:v",
+            "-map", "1:a",
+            "-shortest", # Stop when shortest stream ends (usually video)
+            str(output_path)
+        ]
+        
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+            logger.info(f"✅ Replaced audio track -> {output_path.name}")
+            return output_path
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to replace audio: {e}")
+            raise
+
+    def swap_audio_streams(
+        self,
+        video1_path: Path,
+        video2_path: Path,
+        output_dir: Optional[Path] = None
+    ) -> tuple[Path, Path]:
+        """
+        Swaps audio streams between two videos.
+        Returns paths to (video1_visual_audio2, video2_visual_audio1).
+        ALWAYS re-encodes video to ensure valid timestamps and compatibility.
+        explicitly selects v:0 and a:0 to avoid issues with cover art/thumbnails.
+        """
+        output_dir = output_dir or self.output_dir
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        out1 = output_dir / f"swap_v1_{video1_path.stem}_a2_{video2_path.stem}.mp4"
+        out2 = output_dir / f"swap_v2_{video2_path.stem}_a1_{video1_path.stem}.mp4"
+
+        # Swap 1: Video 1 + Audio 2
+        print(f"DEBUG: Swapping 1 (Re-encode): {video1_path} + {video2_path} -> {out1}")
+        try:
+            # Explicitly select first index streams to avoid cover art processing
+            v1_stream = ffmpeg.input(str(video1_path))['v:0']
+            a2_stream = ffmpeg.input(str(video2_path))['a:0']
+            
+            out, err = (
+                ffmpeg
+                .output(
+                    v1_stream, 
+                    a2_stream, 
+                    str(out1), 
+                    vcodec='libx264',
+                    acodec='aac',
+                    preset='ultrafast',
+                    pix_fmt='yuv420p', # Ensure compatibility
+                    shortest=None # Use None for boolean flags in ffmpeg-python
+                )
+                .overwrite_output()
+                .run(capture_stdout=True, capture_stderr=True, cmd=self.ffmpeg_cmd)
+            )
+            print(f"DEBUG: Swap 1 success. Stderr: {err.decode()[-300:] if err else 'None'}")
+        except ffmpeg.Error as e:
+             # Just print error and re-raise or let it be empty (failed)
+             print(f"DEBUG: Swap 1 FAILED. Error: {e.stderr.decode() if e.stderr else str(e)}")
+             raise e
+
+        # Swap 2: Video 2 + Audio 1
+        print(f"DEBUG: Swapping 2 (Re-encode): {video2_path} + {video1_path} -> {out2}")
+        try:
+            v2_stream = ffmpeg.input(str(video2_path))['v:0']
+            a1_stream = ffmpeg.input(str(video1_path))['a:0']
+            
+            out, err = (
+                ffmpeg
+                .output(
+                    v2_stream, 
+                    a1_stream, 
+                    str(out2), 
+                    vcodec='libx264',
+                    acodec='aac',
+                    preset='ultrafast',
+                    pix_fmt='yuv420p',
+                    shortest=None
+                )
+                .overwrite_output()
+                .run(capture_stdout=True, capture_stderr=True, cmd=self.ffmpeg_cmd)
+            )
+            print(f"DEBUG: Swap 2 success. Stderr: {err.decode()[-300:] if err else 'None'}")
+        except ffmpeg.Error as e:
+             print(f"DEBUG: Swap 2 FAILED. Error: {e.stderr.decode() if e.stderr else str(e)}")
+             raise e
+
+        return out1, out2
+
+    def _scale_single(self, input_path: Path, output_path: Path, width: int, height: int, mute_audio: bool = False):
         """Helper to scale a single video to target resolution."""
-        (
+        stream = (
             ffmpeg
             .input(str(input_path))
             .filter('scale', width, height, force_original_aspect_ratio='increase')
             .filter('crop', width, height)
             .filter('setsar', 1)
-            .output(str(output_path), c='libx264', preset='fast', crf=23, pix_fmt='yuv420p', ac='aac', audio_bitrate='192k')
+        )
+        
+        if mute_audio:
+            # Generate silence and map it
+            audio = ffmpeg.input('anullsrc=r=44100:cl=stereo', f='lavfi')
+            stream = ffmpeg.output(stream, audio, str(output_path), c='libx264', preset='fast', crf=23, pix_fmt='yuv420p', acodec='aac', audio_bitrate='192k', shortest=None)
+        else:
+             stream = ffmpeg.output(stream, str(output_path), c='libx264', preset='fast', crf=23, pix_fmt='yuv420p', acodec='aac', audio_bitrate='192k')
+             
+        (
+            stream
             .overwrite_output()
             .run(quiet=True, cmd=self.ffmpeg_cmd)
         )
@@ -469,17 +593,26 @@ class FFmpegVideoEditor:
         concat_file = self.output_dir / "audio_concat.txt"
         with open(concat_file, "w") as f:
             for audio in audio_paths:
-                f.write(f"file '{Path(audio).absolute()}'\\n")
+                # FFmpeg requires forward slashes or escaped backslashes in concat files
+                safe_path = Path(audio).absolute().as_posix()
+                f.write(f"file '{safe_path}'\n")
         
         concat_output = self.output_dir / "concat_audio.mp3"
         
-        (
-            ffmpeg
-            .input(str(concat_file), format="concat", safe=0)
-            .output(str(concat_output), c="copy")
-            .overwrite_output()
-            .run(quiet=True, cmd=self.ffmpeg_cmd)
-        )
+        try:
+            (
+                ffmpeg
+                .input(str(concat_file), format="concat", safe=0)
+                .output(str(concat_output), c="copy")
+                .overwrite_output()
+                .run(quiet=False, cmd=self.ffmpeg_cmd) # Enable logging
+            )
+        except subprocess.CalledProcessError as e:
+            logger.error(f"❌ FFmpeg mix_audio failed during concat. Error: {e}")
+            raise e
+        except Exception as e:
+            logger.error(f"❌ FFmpeg mix_audio failed: {e}")
+            raise e
         
         # Mix with background music if provided
         if bg_music_path:

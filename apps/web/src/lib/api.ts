@@ -86,6 +86,14 @@ export const ai = {
     return handleResponse<T>(response);
   },
 
+  async upload<T>(endpoint: string, formData: FormData): Promise<T> {
+    const response = await fetch(`${PYTHON_API_BASE}${endpoint}`, {
+      method: 'POST',
+      body: formData,
+    });
+    return handleResponse<T>(response);
+  },
+
   async put<T>(endpoint: string, data?: unknown): Promise<T> {
     const response = await fetch(`${PYTHON_API_BASE}${endpoint}`, {
       method: 'PUT',

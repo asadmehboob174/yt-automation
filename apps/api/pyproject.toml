@@ -42,6 +42,7 @@ dependencies = [
     # Validation
     "pydantic>=2.6.0",
     "fal-client>=0.2.1",
+    "demucs>=4.0.0",
 ]
 
 [build-system]

@@ -107,6 +107,48 @@ class MusicLibrary:
         "jazz": {
              "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Bass%20Walker.mp3",
              "filename": "bass_walker.mp3"
+        },
+
+        # --- Ghibli / Cozy (User Requested) ---
+        "ghibli": {
+            "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Ishikari%20Lore.mp3",
+            "filename": "ishikari_lore.mp3"
+        },
+        "cozy_piano": {
+            "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Gymnopedie%20No%201.mp3",
+            "filename": "gymnopedie_no_1.mp3"
+        },
+        "playful": {
+             "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Onion%20Capers.mp3",
+             "filename": "onion_capers.mp3"
+        },
+        "magic_forest": {
+             "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Enchanted%20Valley.mp3",
+             "filename": "enchanted_valley.mp3"
+        },
+        "winter_waltz": {
+             "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Frost%20Waltz%20(Alternate).mp3",
+             "filename": "frost_waltz.mp3"
+        },
+        "cute_lemon": {
+             "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Easy%20Lemon.mp3",
+             "filename": "easy_lemon.mp3"
+        },
+        "kiki_jazz": {
+             "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Sweet%20Vermouth.mp3",
+             "filename": "sweet_vermouth.mp3"
+        },
+        "nostalgia": {
+             "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Touching%20Moments%20Two%20-%20Higher.mp3",
+             "filename": "touching_moments.mp3"
+        },
+        "uplifting_strings": {
+             "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Somewhere%20Sunny.mp3",
+             "filename": "somewhere_sunny.mp3"
+        },
+        "gentle_rain": {
+             "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Clean%20Soul.mp3",
+             "filename": "clean_soul.mp3"
         }
     }
     
@@ -185,7 +227,29 @@ class MusicLibrary:
             "classical": "classical",
             "history": "epic",
             "motivational": "epic",
-            "inspiring": "cinematic"
+            "inspiring": "cinematic",
+            
+            # --- New Ghibli / Cozy Mappings ---
+            "whimsical": "playful",
+            "magical": "magic_forest",
+            "fantasy": "magic_forest",
+            "forest": "magic_forest",
+            "winter": "winter_waltz",
+            "snow": "winter_waltz",
+            "cozy": "cozy_piano",
+            "relaxing": "gentle_rain",
+            "lofi": "gentle_rain",
+            "soul": "gentle_rain",
+            "anime": "ghibli",
+            "folk": "ghibli",
+            "japan": "ghibli",
+            "kiki": "kiki_jazz",
+            "cafe": "kiki_jazz",
+            "coffee": "kiki_jazz",
+            "nostalgic": "nostalgia",
+            "uplifting": "uplifting_strings",
+            "cute": "cute_lemon", # Override old mapping
+            "kawaii": "cute_lemon"
         }
         
         # Normalize mood

@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { Home, Tv, PlusCircle, ListTodo, Settings, Film } from 'lucide-react';
+import { Home, Tv, PlusCircle, ListTodo, Settings, Film, Repeat } from 'lucide-react';
 import {
     Sidebar,
     SidebarContent,
@@ -21,6 +21,7 @@ const menuItems = [
     { title: 'Channels', icon: Tv, href: '/channels' },
     { title: 'New Video', icon: PlusCircle, href: '/projects/new' },
     { title: 'Script Queue', icon: ListTodo, href: '/queue' },
+    { title: 'Audio Exchange', icon: Repeat, href: '/audio-exchange' },
 ];
 
 export function AppSidebar() {
