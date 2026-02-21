@@ -29,9 +29,17 @@ interface ProjectState {
     thumbnailUrl: string | null;
     thumbnailPrompt: string | null;
 
+    // Audio Config (Global)
+    audioConfig: {
+        provider: 'edge-tts' | 'elevenlabs' | 'xtts';
+        voiceId?: string;
+        voiceSampleUrl?: string;
+    };
+
     // Actions
     setStep: (step: ProjectStep) => void;
     setSettings: (settings: { channelId: string; format: 'short' | 'long'; type: 'story' | 'documentary' }) => void;
+    setAudioConfig: (config: Partial<ProjectState['audioConfig']>) => void;
     setTopic: (topic: string) => void;
     setNarrative: (narrative: string) => void;
     setBreakdown: (breakdown: ScriptBreakdown) => void;
@@ -57,6 +65,9 @@ const initialState = {
     finalVideoUrl: null,
     thumbnailUrl: null,
     thumbnailPrompt: null,
+    audioConfig: {
+        provider: 'edge-tts' as const,
+    }
 };
 
 export const useProjectStore = create<ProjectState>()(
@@ -67,6 +78,10 @@ export const useProjectStore = create<ProjectState>()(
             setStep: (step) => set({ currentStep: step }),
 
             setSettings: (settings) => set(settings),
+
+            setAudioConfig: (config) => set((state) => ({
+                audioConfig: { ...state.audioConfig, ...config }
+            })),
 
             setTopic: (topic) => set({ topic }),
 
@@ -160,6 +175,7 @@ export const useProjectStore = create<ProjectState>()(
                 characters: state.characters,
                 scenes: state.scenes,
                 currentStep: state.currentStep,
+                audioConfig: state.audioConfig,
             }),
         }
     )

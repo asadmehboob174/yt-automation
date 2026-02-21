@@ -34,6 +34,9 @@ class AudioEngine:
         """Generate narration using specified provider."""
         output_path = output_path or self.output_dir / f"narration_{provider}.mp3"
         
+        # Pre-process prompt for better pacing/emotion
+        text = self._preprocess_prompt(text)
+        
         try:
             if provider == "elevenlabs":
                 return await self._generate_elevenlabs(text, voice_id, output_path)
@@ -44,13 +47,36 @@ class AudioEngine:
                 communicate = edge_tts.Communicate(text, voice_id)
                 await communicate.save(str(output_path))
         except Exception as e:
-            logger.error(f"TTS Provider {provider} failed: {e}. Fallback to EdgeTTS.")
+            import traceback
+            logger.error(f"❌ TTS Provider {provider} failed: {e}")
+            logger.error(traceback.format_exc())
             # Fallback
+            logger.info("⚠️ Falling back to EdgeTTS default (en-US-AriaNeural)")
             communicate = edge_tts.Communicate(text, "en-US-AriaNeural")
             await communicate.save(str(output_path))
             
         logger.info(f"✅ Generated narration ({provider}) -> {output_path.name}")
         return output_path
+
+    def _preprocess_prompt(self, text: str) -> str:
+        """
+        Clean up emotional tags and sound effect markers for better TTS pacing.
+        Example: "[breathing] Stop!" -> "... Stop!"
+        """
+        import re
+        
+        # 1. Convert tags in brackets to pauses (ellipses)
+        # [gasp], [breathing], [laugh] -> ...
+        text = re.sub(r'\[.*?\]', '...', text)
+        
+        # 2. Cleanup multiple ellipses (avoid too many dots)
+        text = re.sub(r'\.{4,}', '...', text)
+        
+        # 3. Add a leading pause if it starts with ellipses
+        if text.startswith('...'):
+            text = "... " + text.lstrip('.')
+            
+        return text.strip()
 
     async def _generate_elevenlabs(self, text: str, voice_id: str, output_path: Path) -> Path:
         """Generate using ElevenLabs API."""
@@ -97,11 +123,22 @@ class AudioEngine:
         logger.info(f"🧬 Cloning voice using XTTS (Cloud) with ref: {reference_audio.name}")
         
         # Connect to a stable XTTS space
-        # 'coqui/xtts' is the official one, often busy. 
-        # We try to use it with a timeout, or handle queue.
-        client = Client("coqui/xtts") 
+        # Trying a few known good ones for resilience
+        spaces = ["capleaf/VIZ-XTTS-2", "tony-f/XTTS-v2", "coqui/xtts"]
+        client = None
         
-        # API parameters for coqui/xtts standard demo:
+        for space_name in spaces:
+            try:
+                logger.info(f"🔄 Connecting to XTTS Space: {space_name}...")
+                client = Client(space_name)
+                # Test connectivity with a tiny check if possible, or just assume ok if Client() works
+                break
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to connect to {space_name}: {e}")
+        
+        if not client:
+             raise RuntimeError("Could not connect to any XTTS provider Space")        
+        # API parameters for XTTS-2 common demo:
         # 1. Text (str)
         # 2. Language (str)
         # 3. Reference Audio (filepath)

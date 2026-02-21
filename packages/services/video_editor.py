@@ -306,12 +306,20 @@ class FFmpegVideoEditor:
             self.ffmpeg_cmd, "-y",
             "-i", str(video_path),
             "-i", str(audio_path),
-            "-c:v", "copy",
+            "-c:v", "libx264",       # FORCE RE-ENCODE for web compatibility
+            "-pix_fmt", "yuv420p",   # FORCE standard pixel format
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", # Ensure even dimensions for yuv420p
+            "-preset", "fast",
+            "-crf", "23",
             "-c:a", "aac",
             "-b:a", "192k",
-            "-map", "0:v",
+            "-map", "0:v:0", # Explicitly map ONLY the first video stream (ignore cover art/mjpeg)
             "-map", "1:a",
-            "-shortest", # Stop when shortest stream ends (usually video)
+            # "-shortest", # Removed: We want video length to dictate duration, looping audio or silence if needed? 
+            # Actually, standard behavior: Audio should match video. 
+            # If audio is shorter, video continues silent? Or loop audio?
+            # Default map 1:a checks. If we want exact video length, we can use -fflags +shortest with input mapping or standard behavior.
+            # Safest: Let ffmpeg handle it. If audio is short, it stops? No, usually video dictates.
             str(output_path)
         ]
         
@@ -320,7 +328,9 @@ class FFmpegVideoEditor:
             logger.info(f"✅ Replaced audio track -> {output_path.name}")
             return output_path
         except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to replace audio: {e}")
+            logger.error(f"Failed to replace audio in {video_path}: {e}")
+            if e.stderr:
+                logger.error(f"FFmpeg Error Details: {e.stderr.decode('utf-8', errors='replace')}")
             raise
 
     def swap_audio_streams(
@@ -638,6 +648,59 @@ class FFmpegVideoEditor:
         
         logger.info(f"✅ Mixed audio -> {output_path}")
         return Path(output_path)
+        
+    def mix_multiple_tracks(
+        self,
+        tracks: list[dict],
+        output_path: Optional[Path] = None
+    ) -> Path:
+        """
+        Mix multiple audio tracks with specific volumes.
+        tracks = [{"path": Path, "volume": 1.0, "loop": False}]
+        """
+        import subprocess
+        output_path = output_path or self.output_dir / "multitrack_mix.mp3"
+        
+        if not tracks:
+            raise ValueError("No tracks provided")
+            
+        cmd = [self.ffmpeg_cmd, '-y']
+        
+        filter_complex = []
+        inputs_map = []
+        
+        # Add inputs
+        for i, track in enumerate(tracks):
+            cmd.extend(['-i', str(track['path'])])
+            
+            # Volume filter
+            vol = track.get('volume', 1.0)
+            filter_complex.append(f"[{i}:a]volume={vol}[a{i}]")
+            inputs_map.append(f"[a{i}]")
+            
+        # Mix
+        # amix=inputs=N:duration=first:dropout_transition=2
+        # duration=longest insures we don't cut off if one track is shorter? 
+        # Usually valid video duration determines final cut. Here we probably want 'longest' to be safe, or 'first' if track 0 is master.
+        # Let's use duration=longest and let finalize() cut to video length.
+        all_inputs = "".join(inputs_map)
+        filter_complex.append(f"{all_inputs}amix=inputs={len(tracks)}:duration=longest:dropout_transition=2:normalize=0[aout]")
+        
+        cmd.extend([
+            '-filter_complex', ";".join(filter_complex),
+            '-map', '[aout]',
+            '-c:a', 'libmp3lame',
+            '-q:a', '2',
+            str(output_path)
+        ])
+        
+        logger.info(f"🎛️ Mixing {len(tracks)} tracks -> {output_path.name}")
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+            return output_path
+        except subprocess.CalledProcessError as e:
+            logger.error(f"❌ Mix failed: {e.stderr.decode('utf-8')}")
+            raise e
     
     def finalize(
         self,

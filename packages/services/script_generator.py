@@ -24,6 +24,7 @@ class SceneOutput(BaseModel):
     dialogue: Optional[str] = None
     character_name: str = "Character"
     emotion: str = "neutrally"
+    text_to_audio_prompt: Optional[str] = None
 
     def get_full_image_prompt(self, style_suffix: str = "") -> str:
         """Combine fields for a complete image generation prompt."""
@@ -79,6 +80,7 @@ class SceneBreakdown(BaseModel):
     grok_video_prompt: Optional[GrokVideoPrompt] = None
     sfx: Optional[list[str]] = None
     music_notes: Optional[str] = None
+    text_to_audio_prompt: Optional[str] = None
 
 
 class YouTubeVideoSettings(BaseModel):

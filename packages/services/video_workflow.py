@@ -647,48 +647,91 @@ async def render_final_video(
         mute_audio=mute_source
     )
     
-    # 3.5 Generate Custom TTS if requested
-    # If audio_provider is set, we ignore previous audio_keys and generate fresh
-    if audio_provider and (video_type == "story" or video_type == "documentary"):
-        from .audio_engine import AudioEngine
-        engine = AudioEngine()
+    # 3.5 Generate Custom TTS / Rescripting
+    # Check if we should use 'Advanced Rescripting' (text_to_audio_prompt)
+    is_rescripting = any(s.get("text_to_audio_prompt") for s in script.get("scenes", []))
+    
+    if is_rescripting:
+        logger.info("🎤 Advanced Rescripting Detected: Using text_to_audio_prompt for audio generation.")
+        audio_provider = "xtts" # Force XTTS for cloning
+        has_fresh_audio = True
+    elif audio_provider and (video_type == "story" or video_type == "documentary"):
         logger.info(f"🎙️ Generating fresh Voiceover using {audio_provider}...")
+        has_fresh_audio = True
+    else:
+        has_fresh_audio = False
         
-        # Download reference audio if XTTS
+    # Track paths for cleanup
+    extracted_vocals_path = None
+    extracted_background_path = None
+
+    if has_fresh_audio:
+        from .audio_engine import AudioEngine
+        from .audio_separator import AudioSeparator
+        engine = AudioEngine()
+        separator = AudioSeparator()
+        
+        # In Rescripting Mode, we need a voice sample from the original clips
         ref_audio_path = None
-        if audio_provider == "xtts" and voice_sample_key:
+        
+        # Download explicit sample if provided in config
+        if voice_sample_key:
              ref_audio_path = Path("/tmp/ref_voice.wav")
              try:
                  storage.download(voice_sample_key, ref_audio_path)
              except Exception as e:
                  logger.warning(f"⚠️ Failed to download voice sample for XTTS: {e}")
-                 
+                 ref_audio_path = None
+
+        # FALLBACK: If no explicit sample, or we need background preservation, extract from clips
+        if (is_rescripting or has_fresh_audio) and not ref_audio_path:
+            logger.info("🎼 Extracting original audio for reference and background preservation...")
+            temp_stitched_audio = Path("/tmp/stitched_source.mp3")
+            (
+                ffmpeg
+                .input(str(stitched_path))
+                .output(str(temp_stitched_audio), acodec='libmp3lame', q=2)
+                .overwrite_output()
+                .run(quiet=True, cmd=editor.ffmpeg_cmd)
+            )
+            
+            # Separate to get vocals and background
+            if separator.client:
+                bg_sep, voc_sep = separator.separate_audio(temp_stitched_audio)
+                if voc_sep and voc_sep.exists():
+                    extracted_vocals_path = voc_sep
+                    logger.info(f"✅ Found voice reference for cloning: {extracted_vocals_path}")
+                if bg_sep and bg_sep.exists():
+                    extracted_background_path = bg_sep
+                    logger.info(f"✅ Extracted background audio (SFX/Music): {extracted_background_path}")
+            else:
+                logger.warning("⚠️ Audio Separator not available. Background preservation/cloning will be limited.")
+
         fresh_audio_paths = []
+        current_ref = ref_audio_path or extracted_vocals_path
+        
         for i, scene in enumerate(script.get("scenes", [])):
-            text = scene.get("voiceover_text") or scene.get("dialogue")
+            # Prioritize text_to_audio_prompt for rescripting
+            text = scene.get("text_to_audio_prompt") or scene.get("voiceover_text") or scene.get("dialogue")
             if isinstance(text, dict): text = " ".join(text.values())
             
             if text:
                 try:
+                    logger.info(f"🎙️ Generating audio for scene {i+1}...")
                     p = await engine.generate_narration(
                         text=text,
                         voice_id=voice_id or "en-US-AriaNeural",
                         provider=audio_provider,
-                        reference_audio=ref_audio_path,
+                        reference_audio=current_ref,
                         output_path=Path(f"/tmp/gen_audio_{i}.mp3")
                     )
                     fresh_audio_paths.append(p)
                 except Exception as e:
                     logger.error(f"❌ Failed to generate audio for scene {i}: {e}")
         
-        # Override audio_keys logic implies we have local files now
-        # We will essentially force 'documentary' style mixing below
-        # but with these new files
         local_audio = fresh_audio_paths
-        has_fresh_audio = True
     else:
-        has_fresh_audio = False
-        local_audio = [] # Will be populated if documentary mode standard
+        local_audio = []
     
     # 4. Color Grading
     if assembly and assembly.get("color_grading"):
@@ -738,29 +781,58 @@ async def render_final_video(
     if has_fresh_audio:
         logger.info("🎛️ Mixing Fresh TTS Audio with Background Music...")
         
+        # Prepare Tracks for Mixing
+        tracks_to_mix = []
+        
+        # 1. Voiceover (Main) - Concatenate first
+        concat_vo_path = Path("/tmp/concat_vo_final.mp3")
+        with open("/tmp/concat_vo_list.txt", "w") as f:
+            for p in local_audio:
+                f.write(f"file '{Path(p).absolute().as_posix()}'\n")
+        (
+            ffmpeg
+            .input("/tmp/concat_vo_list.txt", format="concat", safe=0)
+            .output(str(concat_vo_path), c="copy")
+            .overwrite_output()
+            .run(quiet=True, cmd=editor.ffmpeg_cmd)
+        )
+        tracks_to_mix.append({"path": concat_vo_path, "volume": 1.25}) # Boost VO slightly
+        
+        # 2. Original Background (Music/SFX preserved from clips)
+        if extracted_background_path and extracted_background_path.exists():
+             tracks_to_mix.append({"path": extracted_background_path, "volume": 0.4})
+             
+        # 3. Additional Dynamic Music (if any)
+        if bg_music_local:
+             tracks_to_mix.append({"path": bg_music_local, "volume": 0.15})
+             
+        # Mix multiple tracks
+        try:
+            final_audio_path = editor.mix_multiple_tracks(tracks_to_mix, "/tmp/final_audio_mix.mp3")
+        except Exception as e:
+            logger.error(f"❌ Mixing failed: {e}")
+            final_audio_path = concat_vo_path # Fallback to just VO
+            
         # Generate Subtitles
-        # For fresh audio, we should regenerate SRT to match exact timing if possible?
-        # Standard subtitle engine uses script word count estimation usually, which is fine.
         subtitle_scenes = []
         for s in script.get("scenes", []):
              sc = s.copy()
              if not sc.get("voiceover_text") and sc.get("dialogue"):
                  sc["voiceover_text"] = sc["dialogue"]
              subtitle_scenes.append(sc)
-             
         srt_path = subtitle_engine.generate_from_script(subtitle_scenes, "/tmp/subtitles.srt")
         
-        # Mix VO + BGM
-        if local_audio:
-            final_audio_path = editor.mix_audio(local_audio, bg_music_local, "/tmp/final_audio_mix.mp3")
-        elif bg_music_local: 
-            final_audio_path = bg_music_local
-            
-        # Finalize
+        # Finalize Video
         final_path = editor.finalize(stitched_path, final_audio_path, srt_path, "/tmp/final_video.mp4")
         
         # Cleanup
         for f in local_audio: Path(f).unlink(missing_ok=True)
+        if extracted_background_path: extracted_background_path.unlink(missing_ok=True)
+        if extracted_vocals_path: extracted_vocals_path.unlink(missing_ok=True)
+        if concat_vo_path: concat_vo_path.unlink(missing_ok=True)
+        Path("/tmp/stitched_source.mp3").unlink(missing_ok=True)
+        Path("/tmp/concat_vo_list.txt").unlink(missing_ok=True)
+        logger.info(f"✨ Advanced Audio Rescripting complete. Final video: {final_path}")
         
     elif video_type == "documentary" and audio_keys:
         # Documentary: Download VO and Mix
@@ -770,6 +842,15 @@ async def render_final_video(
         srt_path = subtitle_engine.generate_srt(script, "/tmp/subtitles.srt")
         
         # Mix VO + BGM
+        # Use new mix logic for consistency?
+        # For now keep old flow for 'standard' documentary unless we want to separate there too?
+        # User request was specifically for "original grok video clip" which usually implies the 'Story' mode converted/overridden or hybrid.
+        
+        # Let's stick to old simple mix since we don't have "original grok audio" here usually? 
+        # Actually documentary mode builds from clips too. 
+        # If the clips have sound, we might want to keep it? 
+        # BUT usually Grok clips are silent or generic in docu mode?
+        # Let's leave docu mode as is for now to avoid regression, optimizing the 'fresh_audio' (Story->Docu conversion) path.
         final_audio_path = editor.mix_audio(local_audio, bg_music_local, "/tmp/final_audio_mix.mp3")
         
         # Finalize
@@ -798,7 +879,13 @@ async def render_final_video(
                 # Silent video? create silent audio track
                 # editor.finalize will handle it? No, finalize expects audio path.
                 # If mute_source and no BGM, we effectively have no audio track.
-                # We can generate 1s of silence or just rely on stitched_path having silent track (from anullsrc)
+                # Creates a valid path with silent audio
+                import shutil
+                shutil.copy(stitched_path, "/tmp/silent.mp4") # Placeholder?
+                # Actually, finalize() uses map 1:a. If we pass stitched_path as audio_path, it uses its audio.
+                # If we want silence, we need a silent audio file.
+                # For now assume mute_source isn't primary use case here.
+                pass# We can generate 1s of silence or just rely on stitched_path having silent track (from anullsrc)
                 final_audio_path = stitched_path # It has anullsrc audio track now
             else:
                 final_audio_path = stitched_path

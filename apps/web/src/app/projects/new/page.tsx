@@ -1045,7 +1045,7 @@ function Step3SceneImages() {
 
 // ============ STEP 4: Scene Videos ============
 function Step4SceneVideos() {
-    const { scenes, updateScene, setStep, channelId, format } = useProjectStore();
+    const { scenes, updateScene, setStep, channelId, format, audioConfig } = useProjectStore();
     const [generatingIndex, setGeneratingIndex] = useState<number | null>(null);
     const [generatingAll, setGeneratingAll] = useState(false);
 
@@ -1070,6 +1070,10 @@ function Step4SceneVideos() {
                 niche_id: channelId,
                 is_shorts: format === 'short',
                 text_to_audio_prompt: scene.textToAudioPrompt,
+                // Voice Cloning Params
+                voice_sample_url: audioConfig?.voiceSampleUrl,
+                voice_provider: audioConfig?.provider || 'edge-tts',
+                voice_id: audioConfig?.voiceId,
             });
 
             // Validate the response has a proper video URL
@@ -1263,7 +1267,8 @@ function Step4SceneVideos() {
 function Step5Final() {
     const { 
         scenes, channelId, finalVideoUrl, setFinalVideoUrl, 
-        thumbnailUrl, thumbnailPrompt, setStep, reset, format, breakdown 
+        thumbnailUrl, thumbnailPrompt, setStep, reset, format, breakdown,
+        audioConfig, setAudioConfig 
     } = useProjectStore();
     const [isStitching, setIsStitching] = useState(false);
     const [isUploading, setIsUploading] = useState(false);
@@ -1272,9 +1277,16 @@ function Step5Final() {
 
     // Audio / Voiceover State
     const [audioSource, setAudioSource] = useState<"original" | "voiceover">("original");
-    const [provider, setProvider] = useState<"xtts" | "elevenlabs">("xtts");
-    const [voiceId, setVoiceId] = useState("");
-    const [voiceSampleUrl, setVoiceSampleUrl] = useState(""); // For XTTS reference
+
+    // Use store for voice settings
+    const provider = audioConfig.provider;
+    const voiceId = audioConfig.voiceId || "";
+    const voiceSampleUrl = audioConfig.voiceSampleUrl || ""; 
+
+    const setProvider = (val: "xtts" | "elevenlabs" | "edge-tts") => setAudioConfig({ provider: val });
+    const setVoiceId = (val: string) => setAudioConfig({ voiceId: val });
+    const setVoiceSampleUrl = (val: string) => setAudioConfig({ voiceSampleUrl: val });
+
     const [isUploadingSample, setIsUploadingSample] = useState(false);
     const [removeSpeakers, setRemoveSpeakers] = useState(false); // New state for Demucs
     const [previewUrl, setPreviewUrl] = useState("");
@@ -1613,6 +1625,7 @@ function Step5Final() {
                                         <SelectValue placeholder="Select provider" />
                                     </SelectTrigger>
                                     <SelectContent>
+                                        <SelectItem value="edge-tts">Edge TTS (Fast / Standard)</SelectItem>
                                         <SelectItem value="xtts">XTTS (Free / Clone)</SelectItem>
                                         <SelectItem value="elevenlabs">ElevenLabs (Paid / High Quality)</SelectItem>
                                     </SelectContent>
