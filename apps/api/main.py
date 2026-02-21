@@ -101,6 +101,7 @@ class JobStatus(BaseModel):
 class ChannelUpdate(BaseModel):
     name: Optional[str] = None
     voiceId: Optional[str] = None
+    voiceSampleUrl: Optional[str] = None
     styleSuffix: Optional[str] = None
     nicheId: Optional[str] = None
 
@@ -505,6 +506,8 @@ async def upload_channel_asset(
         update_data["anchorImage"] = key
     elif asset_type == "music":
         update_data["bgMusic"] = key
+    elif asset_type == "voice_sample":
+        update_data["voiceSampleUrl"] = key
         
     updated_channel = await db.channel.update(
         where={"nicheId": niche_id},
@@ -558,13 +561,6 @@ class GenerateSceneImageRequest(BaseModel):
     character_images: list[dict]  # list of {name, imageUrl}
     is_shorts: bool = False
 
-class GenerateVideoRequest(BaseModel):
-    scene_index: int
-    imageUrl: str
-    prompt: str
-    dialogue: Optional[str] = None
-    camera_angle: Optional[str] = "Medium Shot"
-    niche_id: str
 
 @app.post("/scripts/generate")
 async def generate_script(request: GenerateScriptRequest):
@@ -1394,6 +1390,10 @@ class GenerateVideoRequest(BaseModel):
     is_shorts: bool = False
     sound_effect: str | list | None = None
     emotion: str | None = None
+    # Voice Cloning Params
+    voice_sample_url: str | None = None
+    voice_provider: str = "edge-tts" # edge-tts, xtts, elevenlabs
+    voice_id: str | None = None
 
 
 def smart_coerce(val: any) -> str:
@@ -1414,6 +1414,10 @@ def smart_coerce(val: any) -> str:
 @app.post("/scenes/generate-video")
 async def generate_video(request: GenerateVideoRequest):
     """Generate video from image using Grok Playwright automation."""
+    log_msg = f"\n🎬 {request.scene_index} REQ: {request.voice_provider} | {request.voice_id} | {request.voice_sample_url}\n"
+    print(log_msg)
+    with open("debug_audio.log", "a", encoding="utf-8") as f:
+        f.write(log_msg)
     try:
         from services.grok_agent import GrokAnimator
         from services.cloud_storage import R2Storage
@@ -1431,6 +1435,7 @@ async def generate_video(request: GenerateVideoRequest):
         import tempfile
         import uuid
         from pathlib import Path
+        import os
         
         print(f"🎥 Generating video for scene {request.scene_index}")
         print(f"   Image: {request.image_url[:60]}...")
@@ -1457,12 +1462,35 @@ async def generate_video(request: GenerateVideoRequest):
                 tmp.write(response.content)
                 image_path = Path(tmp.name)
         
+        # Download Voice Sample if provided (for XTTS)
+        voice_reference_path = None
+        if request.voice_sample_url and request.voice_provider == "xtts":
+             print(f"🎙️ Downloading voice sample for XTTS cloning: {request.voice_sample_url}")
+             async with httpx.AsyncClient() as client:
+                try:
+                    v_resp = await client.get(request.voice_sample_url, follow_redirects=True)
+                    v_resp.raise_for_status()
+                    
+                    content_type = v_resp.headers.get('Content-Type', '')
+                    print(f"   ✅ Sample downloaded ({len(v_resp.content)} bytes, Type: {content_type})")
+                    
+                    if 'audio' not in content_type.lower() and len(v_resp.content) < 1000:
+                         print(f"   ⚠️ Warning: Downloaded content might not be audio. Type: {content_type}")
+                    
+                    # Create temp file with proper extension (guess mp3/wav)
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as v_tmp:
+                        v_tmp.write(v_resp.content)
+                        voice_reference_path = Path(v_tmp.name)
+                        print(f"   📂 Temp ref path: {voice_reference_path}")
+                except Exception as e:
+                    print(f"   ❌ Failed to download voice sample: {e}. Falling back to default voice.")
+
         try:
             # Determine aspect ratio
             aspect_ratio = "9:16" if request.is_shorts else "16:9"
             print(f"   📐 Aspect Ratio: {aspect_ratio} (shorts={request.is_shorts})")
             
-            from services.grok_agent import GrokAnimator, PromptBuilder, ModerationError
+            from services.grok_agent import GrokAnimator, PromptBuilder, VideoSettings, ModerationError
             animator = GrokAnimator()
             from services.script_generator import ScriptGenerator
             gen = ScriptGenerator()
@@ -1489,11 +1517,18 @@ async def generate_video(request: GenerateVideoRequest):
                         if b"<!DOCTYPE html>" in head or b"<html" in head:
                             is_html = True
                             
-                if is_html or file_size < 100000:
+                if is_html or file_size < 150000:
                     status_reason = "Grok Moderation (HTML Error Page)" if is_html else f"Corrupt/Too Small ({file_size}b)"
                     print(f"⚠️ {status_reason} detected. Grok refused the prompt.")
                     if path.exists(): os.unlink(path)
                     raise ModerationError(f"Generated video is content-moderated or corrupt HTML ({file_size} bytes).")
+                
+                # Check actual duration
+                if not VideoSettings.verify_clip_duration(path, expected_duration=10.0):
+                    print(f"⚠️ Duration verification failed for {path}")
+                    if path.exists(): os.unlink(path)
+                    raise ModerationError("Generated video has invalid duration (0s or mismatch).")
+
                 return path
 
             try:
@@ -1571,7 +1606,28 @@ async def generate_video(request: GenerateVideoRequest):
                     print(f"   🗣️ Dialogue detected: '{clean_text}'")
                     # Use a default voice or one from request (not yet in request, could add later)
                     # For now, default to standard narrative voice
-                    tts_path = await audio_engine.generate_narration(clean_text, provider="edge-tts")
+                    
+                    # AUTO-CLONE FROM SOURCE VIDEO: 
+                    # If provider is XTTS and we HAVE NO sample, try to extract audio from the Grok video
+                    # as a last resort reference.
+                    if request.voice_provider == "xtts" and not voice_reference_path:
+                         print("🧬 No voice sample provided. Attempting to clone voice FROM the Grok video...")
+                         try:
+                             # Extract audio from the generated clip
+                             clip_audio_path = video_path.parent / f"ref_from_video_{request.scene_index}.mp3"
+                             voice_reference_path = audio_engine.extract_audio_from_clip(video_path, clip_audio_path)
+                             print(f"   ✅ Extracted reference audio from Grok video: {voice_reference_path}")
+                         except Exception as e:
+                             print(f"   ⚠️ Failed to extract audio from Grok video: {e}")
+                             voice_reference_path = None
+
+                    # USE PROVIDED VOICE PARAMS
+                    tts_path = await audio_engine.generate_narration(
+                        clean_text, 
+                        provider=request.voice_provider, # xtts, edge-tts, etc
+                        voice_id=request.voice_id or "en-US-AriaNeural",
+                        reference_audio=voice_reference_path # For XTTS cloning
+                    )
                     
                     # Merge this audio into the video
                     # 1. Start with original video audio (or silence)
@@ -1592,19 +1648,29 @@ async def generate_video(request: GenerateVideoRequest):
                     
                     # If video has no audio stream, this adds it.
                     # If video has audio, we might want to keep it? 
-                    # User said: "if no [prompt] then use original audio".
-                    # Implication: If prompt EXISTS, we use generated audio.
-                    
-                    # We use ffmpeg to replace/add audio
+                # We use ffmpeg to replace/add audio
                     final_scene_path = video_editor.replace_audio_track(video_path, tts_path, mixed_video)
-                    video_path = final_scene_path
-                    print(f"   ✅ Audio added to scene {request.scene_index}")
+                    
+                    # Post-merge verification
+                    if VideoSettings.verify_clip_duration(final_scene_path, expected_duration=10.0):
+                        video_path = final_scene_path
+                        print(f"   ✅ Audio added and verified for scene {request.scene_index}")
+                    else:
+                        print(f"   ⚠️ Audio merge failed verification (duration mismatch). Reverting to original video.")
+                        if final_scene_path.exists():
+                            try: final_scene_path.unlink()
+                            except: pass
 
                 else:
                     print(f"   🎵 SFX-only prompt detected: '{text}'. Keeping original audio (no TTS generated).")
                     # In future: Call SFX generation model here.
             else:
                  print(f"   🔇 No audio prompt for scene {request.scene_index}. Keeping original audio.")
+                 
+            # Cleanup voice reference
+            if voice_reference_path and voice_reference_path.exists():
+                try: voice_reference_path.unlink()
+                except: pass
 
             #         print(f"✨ 4K Upscale complete: {video_path.name}")
             # except Exception as e:
@@ -1714,7 +1780,7 @@ async def stitch_videos(request: StitchVideosRequest):
                     local_path = temp_dir / f"clip_{i:03d}.mp4"
                     
                     # Try to parse key from URL to use direct R2 download (more robust)
-                    # Expected URL format: .../videos/niche/filename.mp4...
+                    # Expected URL format: .../videos/niche/filename.mp4 -> videos/niche/filename.mp4
                     # We look for 'videos/' in the URL path
                     if "videos/" in url:
                         # Extract key starting from 'videos/'
