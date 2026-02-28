@@ -12,6 +12,7 @@ interface ProjectState {
     channelId: string;
     format: 'short' | 'long';
     type: 'story' | 'documentary';
+    videoResolution: '480p' | '720p';
 
     // Script data
     topic: string;
@@ -36,9 +37,12 @@ interface ProjectState {
         voiceSampleUrl?: string;
     };
 
+    selectedMusicId: string | null;
+    musicOption: string;
+
     // Actions
     setStep: (step: ProjectStep) => void;
-    setSettings: (settings: { channelId: string; format: 'short' | 'long'; type: 'story' | 'documentary' }) => void;
+    setSettings: (settings: { channelId: string; format: 'short' | 'long'; type: 'story' | 'documentary', videoResolution?: '480p' | '720p' }) => void;
     setAudioConfig: (config: Partial<ProjectState['audioConfig']>) => void;
     setTopic: (topic: string) => void;
     setNarrative: (narrative: string) => void;
@@ -48,6 +52,8 @@ interface ProjectState {
     setFinalVideoUrl: (url: string) => void;
     setThumbnailUrl: (url: string) => void;
     setThumbnailPrompt: (prompt: string) => void;
+    setMusicId: (id: string | null) => void;
+    setMusicOption: (option: string) => void;
     reset: () => void;
     canProceed: () => boolean;
 }
@@ -57,6 +63,7 @@ const initialState = {
     channelId: '',
     format: 'short' as const,
     type: 'story' as const,
+    videoResolution: '480p' as const,
     topic: '',
     narrative: '',
     breakdown: null,
@@ -67,7 +74,9 @@ const initialState = {
     thumbnailPrompt: null,
     audioConfig: {
         provider: 'edge-tts' as const,
-    }
+    },
+    selectedMusicId: null,
+    musicOption: 'auto',
 };
 
 export const useProjectStore = create<ProjectState>()(
@@ -142,6 +151,8 @@ export const useProjectStore = create<ProjectState>()(
             setFinalVideoUrl: (url) => set({ finalVideoUrl: url }),
             setThumbnailUrl: (url) => set({ thumbnailUrl: url }),
             setThumbnailPrompt: (prompt) => set({ thumbnailPrompt: prompt }),
+            setMusicId: (id) => set({ selectedMusicId: id }),
+            setMusicOption: (option) => set({ musicOption: option }),
 
             reset: () => set(initialState),
 
@@ -169,6 +180,7 @@ export const useProjectStore = create<ProjectState>()(
                 channelId: state.channelId,
                 format: state.format,
                 type: state.type,
+                videoResolution: state.videoResolution,
                 topic: state.topic,
                 narrative: state.narrative,
                 breakdown: state.breakdown,
@@ -176,6 +188,8 @@ export const useProjectStore = create<ProjectState>()(
                 scenes: state.scenes,
                 currentStep: state.currentStep,
                 audioConfig: state.audioConfig,
+                selectedMusicId: state.selectedMusicId,
+                musicOption: state.musicOption,
             }),
         }
     )

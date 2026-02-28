@@ -102,7 +102,7 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
                     story_narrative: script,
                     niche_id: channelId,
                     video_length: format,  // 'short' or 'long'
-                    video_type: 'story',   // Default to 'story' for 1-click automation
+                    video_type: useProjectStore.getState().type,   // Read user's Story/Documentary selection
                 });
             }
 
@@ -297,7 +297,8 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
                                             camera_angle: ensureString(sceneData.camera_angle || sceneData.cameraAngle),
                                             sound_effect: sceneData.sfx || sceneData.sound_effect,
                                             emotion: ensureString(sceneData.emotion),
-                                            text_to_audio_prompt: ensureString(sceneData.text_to_audio_prompt || sceneData.textToAudioPrompt)
+                                            text_to_audio_prompt: ensureString(sceneData.text_to_audio_prompt || sceneData.textToAudioPrompt),
+                                            resolution: useProjectStore.getState().videoResolution
                                         });
                                         useProjectStore.getState().updateScene(index, {
                                             videoUrl: videoResult.videoUrl,
@@ -366,7 +367,8 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
                             camera_angle: ensureString(sceneData.camera_angle || sceneData.cameraAngle),
                             sound_effect: sceneData.sfx || sceneData.sound_effect,
                             emotion: ensureString(sceneData.emotion),
-                            text_to_audio_prompt: ensureString(sceneData.text_to_audio_prompt || sceneData.textToAudioPrompt)
+                            text_to_audio_prompt: ensureString(sceneData.text_to_audio_prompt || sceneData.textToAudioPrompt),
+                            resolution: useProjectStore.getState().videoResolution
                         });
                         currentVideoUrl = repairResult.videoUrl;
 
@@ -435,7 +437,9 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
                 niche_id: channelId,
                 title: breakdown.title || 'Untitled Video',
                 music: recommendedMood, // Pass the AI recommended mood
+                music_id: useProjectStore.getState().selectedMusicId, // Direct music ID
                 is_shorts: format === 'short',
+                video_resolution: useProjectStore.getState().videoResolution,
                 script: scriptContent, // Pass full script for context
                 auto_upload: autoUpload,
                 thumbnail_url: useProjectStore.getState().thumbnailUrl,

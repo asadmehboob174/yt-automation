@@ -254,9 +254,14 @@ class VideoSettings:
             "button:has-text('Square')",
         ],
     }
+
+    RESOLUTION_SELECTORS = {
+        "720p": ["button:has-text('720p')", "[data-resolution='720']"],
+        "480p": ["button:has-text('480p')", "[data-resolution='480']"],
+    }
     
     @classmethod
-    async def configure(cls, page: Page, duration: str = "10s", aspect: str = "9:16"):
+    async def configure(cls, page: Page, duration: str = "6s", aspect: str = "9:16", resolution: str = "720p"):
         """Set duration and aspect ratio before generating."""
         logger.info(f"⚙️ Configuring video settings: duration={duration}, aspect={aspect}")
         
@@ -307,16 +312,36 @@ class VideoSettings:
             except: continue
         
         # ── Step 3: Set Duration ──
-        for selector in cls.DURATION_SELECTORS.get(duration, []):
+        duration_key = f"{duration}s" if isinstance(duration, (int, float)) else str(duration)
+        if not duration_key.endswith("s"):
+            duration_key += "s"
+            
+        duration_clicked = False
+        for selector in cls.DURATION_SELECTORS.get(duration_key, []):
             try:
                 btn = page.locator(selector).first
                 if await btn.count() > 0 and await btn.is_visible():
                     await btn.click(timeout=1000)
-                    logger.info(f"✅ Set duration: {duration}")
+                    logger.info(f"✅ Set duration: {duration_key}")
+                    duration_clicked = True
+                    break
+            except: continue
+            
+        if not duration_clicked:
+            # Fallback if specific button isn't found, maybe click a raw toggle if available
+            logger.warning(f"⚠️ Could not find duration button for {duration_key} inside popup.")
+
+        # ── Step 4: Set Resolution ──
+        for selector in cls.RESOLUTION_SELECTORS.get(resolution, []):
+            try:
+                btn = page.locator(selector).first
+                if await btn.count() > 0 and await btn.is_visible():
+                    await btn.click(timeout=1000)
+                    logger.info(f"✅ Set resolution: {resolution}")
                     break
             except: continue
 
-        # ── Step 4: Close popup ──
+        # ── Step 5: Close popup ──
         if dropdown_opened:
             try:
                 await page.keyboard.press("Escape")
@@ -421,7 +446,7 @@ async def get_browser_context(playwright: any) -> BrowserContext:
     MAX_RETRIES = 5
     for attempt in range(MAX_RETRIES):
         try:
-            return await playwright.chromium.launch_persistent_context(
+            ctx = await playwright.chromium.launch_persistent_context(
                 user_data_dir=str(PROFILE_PATH),
                 headless=False,
                 accept_downloads=True,
@@ -429,6 +454,13 @@ async def get_browser_context(playwright: any) -> BrowserContext:
                 args=args,
                 viewport={'width': 1100, 'height': 800}
             )
+            # Register with global shutdown registry
+            try:
+                from apps.api.main import _active_browsers
+                _active_browsers.append((ctx, playwright))
+            except ImportError:
+                pass
+            return ctx
         except Exception as e:
             error_msg = str(e).lower()
             if "target page, context or browser has been closed" in error_msg or "existing browser session" in error_msg or "in use" in error_msg:
@@ -461,8 +493,9 @@ async def generate_single_clip(
     sound_effect: Optional[str] = None,
     character_name: str = "Character",
     emotion: str = "neutrally",
-    duration: str = "10s",
+    duration: str = "6s",
     aspect: str = "9:16",
+    resolution: str = "720p",
     external_page: Optional[Page] = None,
     grok_video_prompt: Optional[dict] = None,
     sfx: Optional[list[str]] = None,
@@ -516,7 +549,7 @@ async def generate_single_clip(
 
             # ... (Step 1-3 logic remains same)
             # ── Step 1: Set Aspect Ratio (via pop-up) ──
-            await VideoSettings.configure(page, duration=duration, aspect=aspect)
+            await VideoSettings.configure(page, duration=duration, aspect=aspect, resolution=resolution)
 
             # ── Step 2: Paste Prompt inside the main input area ──
             prompt = PromptBuilder.build(
@@ -564,6 +597,34 @@ async def generate_single_clip(
                 except: continue
             
             if not upload_success: pass
+
+            # ── Step 3.5: Click "Make video" button ──
+            logger.info("🎬 Waiting up to 15s for 'Make video' button to appear on the generated image...")
+            make_video_clicked = False
+            
+            # Use strict, specific selectors.
+            # CRITICAL: Avoid broad selectors like "div:has-text('...') >> button"
+            # because if the text exists anywhere, it selects the whole page body 
+            # and then clicks the VERY FIRST button on the page (e.g. Search).
+            make_video_selectors = [
+                "button[aria-label='Make video']",
+                "button:text-is('Make video')",
+                "button:has-text('Make video'):not([aria-label='Search'])"
+            ]
+            combined_selector = ", ".join(make_video_selectors)
+            
+            try:
+                # This will wait dynamically until the exact button is found or timeout is reached
+                btn = await page.wait_for_selector(combined_selector, state="visible", timeout=15000)
+                if btn:
+                    await btn.click(timeout=5000)
+                    logger.info("✅ Clicked 'Make video' button on the image")
+                    make_video_clicked = True
+            except Exception as e:
+                logger.warning(f"⚠️ 'Make video' button not found within 15s: {e}")
+            
+            if not make_video_clicked:
+                logger.warning("Generation may have auto-started or button detection failed.")
 
             # ── Step 4: Wait for Generation & Download (Dynamic Polling) ──
             logger.info("⏳ Waiting for video generation (Dynamic detection, max 120s)...")
@@ -778,6 +839,14 @@ class BrowserProfileManager:
                 # Avoid empty tabs by reusing the default page
                 if len(browser.pages) == 0:
                     await browser.new_page()
+                
+                # Register with global shutdown registry
+                try:
+                    from apps.api.main import _active_browsers
+                    _active_browsers.append((browser, playwright))
+                    logger.info("📋 Grok browser registered for shutdown cleanup.")
+                except ImportError:
+                    pass
                     
                 return browser, playwright
             except Exception as e:
@@ -812,7 +881,7 @@ class GrokAnimator:
         video_path = await animator.animate(
             image_path="/path/to/scene.png",
             motion_prompt="The character walks forward",
-            duration=10
+            duration=6
         )
     """
     
@@ -841,8 +910,9 @@ class GrokAnimator:
         image_path: Path,
         motion_prompt: str = "",
         style_suffix: str = "Cinematic, dramatic lighting",
-        duration: int = 10,
+        duration: int = 6,
         aspect_ratio: str = "9:16",
+        resolution: str = "720p",
         camera_angle: str = "Medium shot",
         dialogue: Optional[str] = None,
         sound_effect: Optional[str] = None,
@@ -880,6 +950,7 @@ class GrokAnimator:
                         motion_description=motion_prompt,
                         duration=duration_str,
                         aspect=aspect_ratio,
+                        resolution=resolution,
                         dialogue=dialogue,
                         sound_effect=sound_effect,
                         emotion=emotion,
@@ -918,6 +989,12 @@ class GrokAnimator:
                 finally:
                     # Close browser after EACH clip (Reverting speed boost per user request)
                     try:
+                        # Unregister from global shutdown registry
+                        try:
+                            from apps.api.main import _active_browsers
+                            _active_browsers[:] = [(b, p) for b, p in _active_browsers if b is not browser]
+                        except ImportError:
+                            pass
                         await browser.close()
                         await pw.stop()
                     except: pass
@@ -950,7 +1027,7 @@ class GrokAnimator:
                     image_path=Path(scene['image_path']),
                     motion_prompt=scene.get('motion_prompt', ''),
                     style_suffix=style_suffix,
-                    duration=scene.get('duration', 10)
+                    duration=scene.get('duration', 6)
                 )
                 results.append(video_path)
                 
@@ -1038,7 +1115,7 @@ if __name__ == "__main__":
             image_path=image_path,
             motion_prompt="The character slowly turns their head",
             style_suffix="Cinematic, dramatic lighting",
-            duration=10
+            duration=6
         )
         print(f"✅ Generated: {result}")
     

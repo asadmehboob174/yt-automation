@@ -77,6 +77,13 @@ class WhiskAgent:
                         args=args,
                         viewport=None, 
                     )
+                    # Register with global shutdown registry
+                    try:
+                        from apps.api.main import _active_browsers
+                        _active_browsers.append((browser, playwright))
+                        logger.info("📋 Whisk browser registered for shutdown cleanup.")
+                    except ImportError:
+                        pass
                     return browser, playwright
                 except Exception as e:
                     error_msg = str(e).lower()
@@ -95,6 +102,12 @@ class WhiskAgent:
     async def close(self):
         """Close browser and stop playwright."""
         logger.info("🛑 WhiskAgent.close() called. Cleaning up Playwright...")
+        # Unregister from global shutdown registry
+        try:
+            from apps.api.main import _active_browsers
+            _active_browsers[:] = [(b, p) for b, p in _active_browsers if b is not self.browser]
+        except ImportError:
+            pass
         if self.browser:
             try: await self.browser.close()
             except: pass
@@ -835,30 +848,29 @@ class WhiskAgent:
 
                              # Threshold: 15,000 (relaxed for 9:16 and mobile views)
                              if area > 15000: 
-                                 # CRITICAL FIX: Select the image in the LAST row (highest Y)
-                                 # Among images in the same row (similar Y within 50px tolerance), pick rightmost (highest X)
-                                 is_same_row = abs(y_coord - best_y) < 50
+                                 # CRITICAL FIX: To handle cases where 1 image loads and the 2nd hangs:
+                                 # We no longer strictly prefer the "bottom right" image.
+                                 # Instead, if we find a valid, fully loaded massive image, we just take it.
+                                 # We define "fully loaded" by ensuring it's not a tiny placeholder and has a valid area.
                                  
-                                 if y_coord > best_y + 50:
-                                     # This image is in a new row BELOW the current best - always prefer it
+                                 if best_img is None:
                                      best_y = y_coord
                                      best_x = x_coord
                                      best_area = area
                                      best_img = img
-                                     logger.debug(f"   -> Selected (New lower row)")
-                                 elif is_same_row and x_coord > best_x:
-                                     # Same row but further right - prefer it (rightmost in row)
-                                     best_x = x_coord
-                                     best_area = area
-                                     best_img = img
-                                     logger.debug(f"   -> Selected (Rightmost in row)")
-                                 elif best_img is None:
-                                     # First valid candidate
+                                     logger.debug(f"   -> Selected (First large valid image)")
+                                     # If the image is very large (e.g. > 100k pixels), it's definitely a generated image.
+                                     # We can break early instead of waiting for a second image that might hang.
+                                     if area > 100000:
+                                         logger.debug("   -> Image is massive, breaking early to avoid hanging on 2nd image.")
+                                         break
+                                 elif area > best_area * 1.5:
+                                     # Only swap if the new one is significantly larger (e.g. it snapped into place)
                                      best_y = y_coord
                                      best_x = x_coord
                                      best_area = area
                                      best_img = img
-                                     logger.debug(f"   -> Selected (First candidate)")
+                                     logger.debug(f"   -> Selected (Significantly larger image)")
                     except:
                         continue
                 

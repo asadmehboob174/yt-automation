@@ -856,41 +856,58 @@ class FFmpegVideoEditor:
         logger.info(f"🪧 Generated title card: '{text}'")
         return output_path
 
-    def upscale_video(
+    async def upscale_video(
         self,
         input_path: Path,
         output_path: Optional[Path] = None,
         target_resolution: tuple[int, int] = (3840, 2160)
     ) -> Path:
-        """Upscale video to 4K resolution using high-quality Lanczos scaling."""
+        """Upscale video to 4K resolution using Hugging Face Space AI_Video_Enhancer_4K."""
         output_path = output_path or self.output_dir / f"upscaled_{input_path.name}"
-        target_w, target_h = target_resolution
         
-        import subprocess
+        import os
+        import shutil
+        from gradio_client import Client
+        import asyncio
         
-        # High-quality 4K upscaling command
-        # Using lanczos for sharp upscaling
-        # Using libx264 with high bitrate for 4K content
-        cmd = [
-            self.ffmpeg_cmd, '-y',
-            '-i', str(input_path),
-            '-vf', f'scale={target_w}:{target_h}:flags=lanczos',
-            '-c:v', 'libx264',
-            '-preset', 'slow',
-            '-crf', '18', # High quality for 4K
-            '-pix_fmt', 'yuv420p',
-            '-c:a', 'copy', # Keep original audio
-            str(output_path)
-        ]
+        hf_token = os.getenv("HF_TOKEN")
         
-        logger.info(f"🚀 Upscaling {input_path.name} to {target_w}x{target_h} (4K)...")
-        try:
-            subprocess.run(cmd, check=True, capture_output=True)
-            logger.info(f"✅ Upscaled to 4K -> {output_path.name}")
+        if not hf_token:
+            logger.error("❌ HF_TOKEN not found. Skipping 4K upscale.")
+            shutil.copy(input_path, output_path)
             return output_path
-        except subprocess.CalledProcessError as e:
-            logger.error(f"❌ Upscale failed: {e.stderr.decode('utf-8')}")
-            # If upscale fails, fallback to original
-            import shutil
+            
+        logger.info(f"🚀 Sending {input_path.name} to Hugging Face Space (tggtg/AI_Video_Enhancer_4K)...")
+        
+        try:
+            # We must run gradio client synchronously in an executor because it blocks
+            def run_gradio():
+                client = Client("tggtg/AI_Video_Enhancer_4K", token=hf_token)
+                result = client.predict(
+                    file_obj=open(str(input_path), "rb"),
+                    api_name="/on_click_process"
+                )
+                return result
+                
+            # result is a tuple: (status_text, dict_with_video_path)
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, run_gradio)
+            
+            # Extract video path from result
+            if isinstance(result, tuple) and len(result) == 2:
+                status, video_info = result
+                remote_path = video_info.get("video")
+                if remote_path and os.path.exists(remote_path):
+                    shutil.copy(remote_path, output_path)
+                    logger.info(f"✅ Upscaled to 4K via HF Space -> {output_path.name}")
+                    return output_path
+            
+            logger.warning(f"⚠️ Unexpected response from HF Space: {result}")
+            raise ValueError("Invalid response format from space")
+            
+        except Exception as e:
+            logger.error(f"❌ HF Space Upscale failed: {e}")
+            logger.warning("⚠️ Falling back to returning original resolution video.")
+            # If upscale fails, fallback to original. We avoid heavy local FFmpeg upscale by design.
             shutil.copy(input_path, output_path)
             return output_path

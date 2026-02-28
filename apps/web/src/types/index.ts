@@ -58,6 +58,7 @@ export interface Scene {
     sfx?: string[];
     musicNotes?: string;
     formattedPrompt?: string;
+    resolution?: '480p' | '720p';
 }
 
 // ============ Script Types ============
@@ -143,4 +144,13 @@ export interface StorageStats {
     totalSize: number;
     fileCount: number;
     bucketName: string;
+}
+
+// ============ Music Types ============
+export interface BackgroundMusic {
+    id: string;
+    name: string;
+    url: string;
+    category: string;
+    createdAt: string;
 }

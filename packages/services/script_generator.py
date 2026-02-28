@@ -9,8 +9,11 @@ import httpx
 import json
 import asyncio
 import re
+import logging
 from typing import Optional, Union
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 
 class SceneOutput(BaseModel):
@@ -936,8 +939,9 @@ Find EVERY character defined in the script. Characters can appear in many format
 - "[CHARACTER NAME] - description..."
 - "Character 1: NAME - description..."
 - "1. NAME - description..."
+- "LOCKED NAME (info)" followed by description on next lines
 - Names in ALL CAPS followed by description
-- Any section labeled "Characters", "Cast", "Character Prompts", etc.
+- Any section labeled "Characters", "Cast", "Character Prompts", "LOCKED Characters", etc.
 
 For EACH character extract:
 - **name**: The character's name (clean, no roles like "The Cat")
@@ -1273,7 +1277,8 @@ OUTPUT JSON FORMAT:
         
         # Make regex extremely permissive for the header
         # Added: "Master Character Prompts" (without "Step 1" assumption, using loose match)
-        char_section_match = re.search(r'(?:PART 1:?|Step \d+:?)?\s*(?:THE CHARACTER BIOS|CHARACTER MASTER PROMPTS?|MASTER CHARACTERS?|CHARACTER PROMPTS?).*?(?=(?:PART 2|Step \d+|THE GLOBAL STYLE WRAPPER|MATCH END|🎞️|SCENE))', text + "MATCH END", re.DOTALL | re.IGNORECASE)
+        # Added: "LOCKED CHARACTERS" for scripts using the 🔒 LOCKED format
+        char_section_match = re.search(r'(?:PART 1:?|Step \d+:?|🔒)?\s*(?:THE CHARACTER BIOS|CHARACTER MASTER PROMPTS?|MASTER CHARACTERS?|CHARACTER PROMPTS?|LOCKED CHARACTERS?).*?(?=(?:PART 2|Step \d+|THE GLOBAL STYLE WRAPPER|MATCH END|🎞️|🗺|DIALOGUE MAP|\n\s*(?:SCENE|DIALOGUE MAP)))', text + "MATCH END", re.DOTALL | re.IGNORECASE)
         
         bio_text = ""
         if char_section_match:
@@ -1301,7 +1306,8 @@ OUTPUT JSON FORMAT:
             if "[" in bio_text and "]" in bio_text:
                 print("DEBUG: Detecting Format 3 ([NAME])")
                 # Pattern: [NAME] optional dash/text ... content ... until next [
-                bracket_iter = re.finditer(r'(?:^|\n)\s*\[([A-Z0-9\s_\-]+)\](?:[^\n]*)(.*?)(?=(?:\n\s*\[|MATCH END|SCENE|$))', bio_text, re.DOTALL)
+                # Refined: Capture same-line content too if it's there
+                bracket_iter = re.finditer(r'(?:^|\n)\s*\[([A-Z0-9\s_\-]+)\]\s*[:\-\–\—]?\s*(.*?)(?=(?:\n\s*\[|MATCH END|SCENE|$))', bio_text, re.DOTALL)
                 
                 found_any = False
                 for m in bracket_iter:
@@ -1455,7 +1461,9 @@ OUTPUT JSON FORMAT:
                     # Skip if already found or if it's a section header (like "Step 1")
                     if name.upper() in existing_names:
                         continue
-                    if re.match(r'^(STEP|SCENE|PART)\s*\d*$', name, re.IGNORECASE):
+                    if re.match(r'^(STEP|SCENE|PART|HEADER|TITLE|VERSION|CHARACTER|MASTER)\s*\d*$', name, re.IGNORECASE):
+                        continue
+                    if "MASTER PROMPTS" in name.upper() or "CHARACTER BIOS" in name.upper():
                         continue
                     # Clean multi-line content into single para
                     content = re.sub(r'\n+', ' ', content).strip()
@@ -1494,6 +1502,31 @@ OUTPUT JSON FORMAT:
                 
                 if characters:
                     print(f"✅ Format 8 found {len(characters)} characters")
+            
+            # Format 9 (LOCKED Characters): "LOCKED Name (info)\nDescription..."
+            # Example: LOCKED Boy (125cm)
+            #          A 125cm tall adventurous 10-year-old boy with...
+            if len(characters) == 0:
+                # Pattern: "LOCKED" keyword at start of line, followed by name and optional (info),
+                # then multi-line description until next LOCKED or section header
+                # Refinement: Use re.MULTILINE and better lookahead
+                fmt9_iter = re.finditer(
+                    r'^\s*LOCKED\b\s*(?!CHARACTERS|BIOS|PROMPTS)(.+?)(?:\s*\(([^)]+)\))?\s*[:\-–—]?\s*\n(.*?)(?=^\s*(?:LOCKED|🎬|🎞️|🗺|DIALOGUE MAP|SCENE)\b|MATCH END|\Z)',
+                    bio_text + "\nMATCH END",
+                    re.DOTALL | re.IGNORECASE | re.MULTILINE
+                )
+                for m in fmt9_iter:
+                    name = m.group(1).strip()
+                    role_info = m.group(2)  # Optional (125cm) etc.
+                    content = m.group(3).strip()
+                    # Clean multi-line content into single para
+                    content = re.sub(r'\n+', ' ', content).strip()
+                    
+                    if name and content and len(content) > 15:
+                        characters.append(MasterCharacter(name=name, prompt=content, locked=True))
+                
+                if characters:
+                    print(f"✅ Format 9 (LOCKED) found {len(characters)} characters")
             
             # Format 6: Simpler detection - look for lines containing "Master Text-to-Image Prompt:" anywhere
             if len(characters) == 0:
@@ -1648,6 +1681,12 @@ OUTPUT JSON FORMAT:
         else:
              print(f"✅ Extracted {found_scenes} scenes.")
 
+        # --- 5. Final Validation ---
+        if not characters:
+            logger.error("🛑 [PARSER] No characters found in script breakdown. Automation will likely fail.")
+        if not scenes:
+            logger.error("🛑 [PARSER] No scenes found in script breakdown. Automation will likely fail.")
+            
         return TechnicalBreakdownOutput(characters=characters, scenes=scenes)
 
     async def generate_viral_thumbnail_prompt(self, script_context: str, niche: str = "general") -> str:

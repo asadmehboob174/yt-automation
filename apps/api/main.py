@@ -34,12 +34,29 @@ from services.email_service import email_service
 # Global Prisma client
 db = Prisma()
 
+# Global registry for active Playwright browser contexts
+# Each entry is a tuple of (browser_context, playwright_instance)
+_active_browsers: list = []
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Connect to DB on startup
     await db.connect()
     yield
-    # Disconnect on shutdown
+    # Cleanup all active Playwright browsers on shutdown
+    import logging
+    _logger = logging.getLogger(__name__)
+    _logger.info(f"🛑 Server shutting down. Closing {len(_active_browsers)} active browser(s)...")
+    for entry in _active_browsers:
+        try:
+            browser, pw = entry
+            await browser.close()
+            await pw.stop()
+            _logger.info("🛑 Closed a Playwright browser on shutdown.")
+        except Exception as e:
+            _logger.warning(f"⚠️ Failed to close browser on shutdown: {e}")
+    _active_browsers.clear()
+    # Disconnect from DB
     await db.disconnect()
 
 app = FastAPI(
@@ -667,6 +684,7 @@ async def generate_breakdown(request: GenerateBreakdownRequest):
             # Extended list of markers that indicate a structured storyboard/script
             structure_markers = [
                 "CHARACTER MASTER PROMPTS", "MASTER CHARACTER", "CHARACTER BIOS",
+                "LOCKED CHARACTERS", "LOCKED",
                 "PART 1", "PART 2", "PART 3",
                 "STEP 1", "STEP 2", "STORYBOARD",
                 "SCENE 1", "SCENE 2", "SCENE:", 
@@ -1394,6 +1412,7 @@ class GenerateVideoRequest(BaseModel):
     voice_sample_url: str | None = None
     voice_provider: str = "edge-tts" # edge-tts, xtts, elevenlabs
     voice_id: str | None = None
+    resolution: str | None = "720p"
 
 
 def smart_coerce(val: any) -> str:
@@ -1501,9 +1520,10 @@ async def generate_video(request: GenerateVideoRequest):
                     image_path=image_path,
                     motion_prompt=prompt,
                     style_suffix="Cinematic, Pixar-style 3D animation",
-                    duration=10,
+                    duration=6,
                     camera_angle=request.camera_angle or "Medium Shot",
                     aspect_ratio=aspect_ratio,
+                    resolution=request.resolution or "720p",
                     dialogue=request.dialogue,
                     sound_effect=request.sound_effect,
                     emotion=request.emotion or "neutrally"
@@ -1524,7 +1544,7 @@ async def generate_video(request: GenerateVideoRequest):
                     raise ModerationError(f"Generated video is content-moderated or corrupt HTML ({file_size} bytes).")
                 
                 # Check actual duration
-                if not VideoSettings.verify_clip_duration(path, expected_duration=10.0):
+                if not VideoSettings.verify_clip_duration(path, expected_duration=6.0):
                     print(f"⚠️ Duration verification failed for {path}")
                     if path.exists(): os.unlink(path)
                     raise ModerationError("Generated video has invalid duration (0s or mismatch).")
@@ -1585,7 +1605,8 @@ async def generate_video(request: GenerateVideoRequest):
             #         video_path = upscaled_path
 
             # --- Scene Audio Generation (New) ---
-            if request.text_to_audio_prompt:
+            # NOTE: Disabled per user request to use original grok video voice
+            if False and request.text_to_audio_prompt:
                 print(f"🔊 generating audio for scene {request.scene_index} -> '{request.text_to_audio_prompt[:30]}...'")
                 from services.audio_engine import AudioEngine
                 from services.video_editor import FFmpegVideoEditor
@@ -1652,7 +1673,7 @@ async def generate_video(request: GenerateVideoRequest):
                     final_scene_path = video_editor.replace_audio_track(video_path, tts_path, mixed_video)
                     
                     # Post-merge verification
-                    if VideoSettings.verify_clip_duration(final_scene_path, expected_duration=10.0):
+                    if VideoSettings.verify_clip_duration(final_scene_path, expected_duration=6.0):
                         video_path = final_scene_path
                         print(f"   ✅ Audio added and verified for scene {request.scene_index}")
                     else:
@@ -1738,6 +1759,14 @@ class StitchVideosRequest(BaseModel):
     youtube_upload: Optional[dict] = None
     final_assembly: Optional[dict] = None
     audio_config: Optional[dict] = None # { mute_source_audio: bool, provider: str, voice_id: str, voice_sample_key: str }
+    music_id: Optional[str] = None # Direct ID from BackgroundMusic table
+    video_resolution: Optional[str] = None # e.g. '480p'
+
+@app.get("/audio/background-music")
+async def get_background_music():
+    """Fetch all available background music tracks."""
+    music = await db.backgroundmusic.find_many(order={"category": "asc"})
+    return music
 
 @app.post("/videos/stitch")
 async def stitch_videos(request: StitchVideosRequest):
@@ -1923,49 +1952,25 @@ async def stitch_videos(request: StitchVideosRequest):
         mute_source = audio_config.get("mute_source_audio", False)
         remove_speakers = audio_config.get("remove_speakers", False) # New flag from frontend
         
-        # If "Deep Remove Vocals" is selected, we MUST NOT mute the source during stitching
-        # because we need the audio to process it.
-        stitch_mute = mute_source
-        if remove_speakers:
-            print("🔊 Smart Vocal Removal requested: Preserving source audio for processing...")
-            stitch_mute = False
-        
+        # Stitch video (respecting mute_source_audio flag)
         stitched_path = editor.stitch_clips_with_fade(
             final_clips_to_stitch, 
             stitched_path, 
             fade_duration=0.3,
             target_resolution=target_res,
-            mute_audio=stitch_mute
+            mute_audio=mute_source
         )
         print(f"   ✅ Stitched video created: {stitched_path}")
         
-        # --- SMART VOCAL REMOVAL (Demucs) ---
-        if remove_speakers and not mute_source:
-             print(f"🧬 Performing Smart Vocal Removal (Demucs)...")
-             try:
-                 from services.audio_engine import AudioEngine
-                 engine = AudioEngine()
-                 
-                 # 1. Extract audio from stitched video
-                 full_audio = engine.extract_audio_from_clip(stitched_path)
-                 
-                 # 2. Separate (remove vocals)
-                 bg_audio = engine.remove_vocals(full_audio)
-                 
-                 # 3. Replace video audio with the instrumental version
-                 clean_video = temp_dir / "stitched_clean.mp4"
-                 stitched_path = editor.replace_audio_track(stitched_path, bg_audio, clean_video)
-                 print(f"   ✅ Replaced audio with instrumental track.")
-                 
-             except Exception as e:
-                 print(f"   ⚠️ Smart Vocal Removal failed: {e}. Falling back to original audio.")
+        # Smart Vocal Removal (Demucs) disabled per user request
 
         current_video_path = stitched_path
         
         # --- AUDIO GENERATION (TTS / Cloning) ---
-        audio_provider = audio_config.get("provider")
-        voice_id = audio_config.get("voice_id")
-        voice_sample_key = audio_config.get("voice_sample_key")
+        # User requested to remove this feature.
+        audio_provider = None
+        voice_id = None
+        voice_sample_key = None
         
         fresh_audio_paths = []
         if audio_provider:
@@ -2019,6 +2024,23 @@ async def stitch_videos(request: StitchVideosRequest):
             #      except Exception as e:
             #         print(f"   ❌ TTS Generation failed: {e}")
 
+        # --- High Quality Stage: 4K Upscale ---
+        if request.video_resolution == '480p':
+            try:
+                # Determine target 4K resolution (Landscape vs Vertical)
+                target_4k = (2160, 3840) if target_res[1] > target_res[0] else (3840, 2160)
+                print(f"🚀 Starting 4K Upscale (Target: {target_4k})...")
+                upscaled_path = temp_dir / "stitched_4k.mp4"
+                await editor.upscale_video(current_video_path, upscaled_path, target_resolution=target_4k)
+                
+                if upscaled_path.exists():
+                    current_video_path = upscaled_path
+                    print(f"   ✅ Upscale to 4K successful.")
+                else:
+                    print(f"   ⚠️ Upscale failed to produce output file.")
+            except Exception as e:
+                print(f"   ⚠️ 4K Upscale failed: {e}")
+
         # --- FINAL ASSEMBLY (Color Grading) ---
         if request.final_assembly and request.final_assembly.get("color_grading"):
             print(f"🎨 Applying Color Grading...")
@@ -2048,11 +2070,26 @@ async def stitch_videos(request: StitchVideosRequest):
         # Check for Manual Music Override from Channel Config
         music_path = None
         # Use either 'music' (frontend) or 'music_mood' (legacy) field
+        music_id = request.music_id
         music_selection = request.music or request.music_mood or "auto"
         music_mood = "auto" # Default
         
+        # 0. Check for Direct Music ID (Database curated selection)
+        if music_id:
+            print(f"🎵 Using database music ID: {music_id}")
+            try:
+                music_record = await db.backgroundmusic.find_unique(where={"id": music_id})
+                if music_record:
+                    music_path = generate_background_music(video_duration, mood=music_record.category, custom_url=music_record.url)
+                    music_mood = f"{music_record.category} - {music_record.name}"
+                else:
+                    print(f"   ⚠️ Music ID {music_id} not found in database. Falling back.")
+            except Exception as e:
+                print(f"   ❌ Failed to fetch/generate DB music: {e}")
+                music_path = None
+
         # 0. Check if Music is Disabled
-        if music_selection.lower() == "none":
+        if not music_path and music_selection.lower() == "none":
             print("🚫 Music explicitly disabled by user.")
             music_path = None
             music_mood = "none"
@@ -2101,6 +2138,8 @@ async def stitch_videos(request: StitchVideosRequest):
         if music_path:
             music_size = music_path.stat().st_size / 1024
             print(f"   ✅ Generated {video_duration:.1f}s of '{music_mood}' ambient music ({music_size:.1f} KB)")
+            # Log for user tracking
+            print(f"🎵 [BG MUSIC] Selected: {music_mood}")
         else:
             print(f"   🚫 No background music generated/selected.")
         
@@ -2137,16 +2176,16 @@ async def stitch_videos(request: StitchVideosRequest):
             
         # B. Original Audio + BGM (Story Style)
         elif music_path:
-            print(f"🔊 Mixing background music at 30% volume...")
+            print(f"🔊 Mixing background music at 35% volume...")
             if mute_source:
                  # If source muted and no fresh audio, it's just BGM
                  # add_background_music might preserve original audio track even if empty?
                  # If we used `mute_audio=True` in stitch, the video track has `anullsrc` text?
                  # Actually `stitch_clips_with_fade` adds `anullsrc`.
                  # So `add_background_music` will mix BGM with that silence.
-                 editor.add_background_music(current_video_path, music_path, final_path, music_volume=0.30)
+                 editor.add_background_music(current_video_path, music_path, final_path, music_volume=0.35)
             else:
-                 editor.add_background_music(current_video_path, music_path, final_path, music_volume=0.30)
+                 editor.add_background_music(current_video_path, music_path, final_path, music_volume=0.35)
             print(f"   ✅ Background music mixed")
             
         # C. No New Audio

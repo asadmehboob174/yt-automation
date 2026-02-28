@@ -418,6 +418,9 @@ async def animate_scenes_with_grok(image_keys: list[str], script: dict) -> list[
                     dialogue_str = " ".join([f'{k}: "{v}"' for k, v in dialogue_raw.items()])
                 elif isinstance(dialogue_raw, str):
                     dialogue_str = dialogue_raw
+                # Video Resolution
+                # Check for explicit resolution in script or scene, fallback to 720p
+                video_res = scene.get("resolution") or script.get("video_resolution") or "720p"
 
                 try:
                     # Animate with Grok
@@ -425,6 +428,8 @@ async def animate_scenes_with_grok(image_keys: list[str], script: dict) -> list[
                         image_path=local_image,
                         motion_prompt=motion_prompt,
                         duration=scene.get("duration_in_seconds", 10),
+                        aspect_ratio="16:9" if script.get("video_type") == "documentary" else "9:16",
+                        resolution=video_res,
                         grok_video_prompt=grok_prompt,
                         sfx=sfx_list,
                         music_notes=music_notes,
@@ -447,6 +452,8 @@ async def animate_scenes_with_grok(image_keys: list[str], script: dict) -> list[
                                 image_path=local_image,
                                 motion_prompt=new_prompt,
                                 duration=scene.get("duration_in_seconds", 10),
+                                aspect_ratio="16:9" if script.get("video_type") == "documentary" else "9:16",
+                                resolution=video_res,
                                 grok_video_prompt=None, # Force use of new_prompt
                                 sfx=sfx_list,
                                 music_notes=music_notes,
@@ -650,6 +657,9 @@ async def render_final_video(
     # 3.5 Generate Custom TTS / Rescripting
     # Check if we should use 'Advanced Rescripting' (text_to_audio_prompt)
     is_rescripting = any(s.get("text_to_audio_prompt") for s in script.get("scenes", []))
+    
+    # Disabled per user request to use original grok video voice
+    is_rescripting = False
     
     if is_rescripting:
         logger.info("🎤 Advanced Rescripting Detected: Using text_to_audio_prompt for audio generation.")

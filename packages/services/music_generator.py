@@ -179,11 +179,37 @@ class MusicLibrary:
                 return self._download_track("calm")
             raise e
 
-    def get_music_for_video(self, duration: float, mood: str = "calm") -> Path:
+    def download_from_url(self, url: str, filename: str) -> Path:
+        """Download a track from a custom URL."""
+        local_path = self.cache_dir / filename
+        if local_path.exists():
+            return local_path
+            
+        logger.info(f"📥 Downloading custom track from {url}...")
+        try:
+            with httpx.Client() as client:
+                resp = client.get(url, follow_redirects=True, timeout=120.0)
+                resp.raise_for_status()
+                local_path.write_bytes(resp.content)
+            logger.info(f"✅ Cached custom track: {local_path}")
+            return local_path
+        except Exception as e:
+            logger.error(f"❌ Failed to download custom music: {e}")
+            raise e
+
+    def get_music_for_video(self, duration: float, mood: str = "calm", custom_url: Optional[str] = None) -> Path:
         """
         Get a music track looped/trimmed to the exact video duration.
+        If custom_url is provided, it downloads and uses that track.
         """
-        # Map generic moods to our specific tracks
+        if custom_url:
+            import hashlib
+            url_hash = hashlib.md5(custom_url.encode()).hexdigest()[:8]
+            base_track = self.download_from_url(custom_url, f"custom_{url_hash}.mp3")
+            selected_mood = f"custom_{url_hash}"
+        else:
+            # Map generic moods to our specific tracks
+            pass
         # Note: MoodAnalyzer outputs keys that match our TRACKS keys mostly
         mood_map = {
             "scary": "horror",
@@ -303,9 +329,9 @@ class MusicLibrary:
             return base_track # Fallback to raw track
 
 # Function for compatibility with existing imports
-def generate_background_music(duration: float, mood: str = "calm") -> Path:
+def generate_background_music(duration: float, mood: str = "calm", custom_url: Optional[str] = None) -> Path:
     lib = MusicLibrary()
-    return lib.get_music_for_video(duration, mood)
+    return lib.get_music_for_video(duration, mood, custom_url)
 
 async def generate_music_with_ai(prompt: str, duration: int = 10) -> Optional[Path]:
     """Generate custom music using AI (MusicGen)."""
