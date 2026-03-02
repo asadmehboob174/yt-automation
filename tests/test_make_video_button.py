@@ -72,32 +72,42 @@ async def run_test():
         
         # Trying the exact selector first based on the HTML provided
         make_video_selectors = [
-            "button[aria-label='Make video']",  # Explicitly matches user's HTML
-            "button:has-text('Make video')",
-            "div:has-text('Make video') >> button"
+            "button[aria-label='Make video']",
+            "button:has-text('Make video'):not([aria-label='Search'])",
+            "div[role='button']:has-text('Make video')"
         ]
         
-        # To avoid grabbing other buttons, let's use the most specific one
         combined_selector = ", ".join(make_video_selectors)
         logger.info(f"Looking for: {combined_selector}")
         
         try:
-            # wait dynamically until the element is found or timeout is reached
+            # 1. Wait for ANY matching selector
             btn = await page.wait_for_selector(combined_selector, state="visible", timeout=15000)
             if btn:
-                # To be absolutely sure, let's hover it first to see what we're targeting visually
-                await btn.hover()
-                await asyncio.sleep(1) # Visual pause
-                
-                # Check what text we got
-                btn_text = await btn.text_content()
-                logger.info(f"About to click button with text: '{btn_text}'")
-                
-                await btn.click(timeout=5000)
-                logger.info("✅ Clicked 'Make video' button via script")
-                make_video_clicked = True
+                try:
+                    await btn.click(timeout=5000)
+                    logger.info("✅ Clicked 'Make video' button via locator")
+                    make_video_clicked = True
+                except Exception as e:
+                    logger.warning(f"Locator click failed, trying JS evaluation: {e}")
+                    
+            # 2. JS Evaluation Fallback (bypasses Playwright interception checks)
+            if not make_video_clicked:
+                clicked = await page.evaluate("""() => {
+                    const btns = Array.from(document.querySelectorAll('button, [role="button"], a, div'));
+                    for (const b of btns) {
+                        if (b.innerText && b.innerText.includes('Make video')) {
+                            b.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }""")
+                if clicked:
+                    logger.info("✅ Clicked 'Make video' button via JavaScript evaluation")
+                    make_video_clicked = True
         except Exception as e:
-            logger.warning(f"⚠️ 'Make video' button not found: {e}")
+            logger.warning(f"⚠️ 'Make video' button wait failed: {e}")
             
         # Verify result
         await asyncio.sleep(1)

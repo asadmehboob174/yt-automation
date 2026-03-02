@@ -61,7 +61,8 @@ class FFmpegVideoEditor:
         output_path: Optional[Path] = None,
         fade_duration: float = 0.4,
         target_resolution: tuple[int, int] = (1920, 1080),
-        mute_audio: bool = False
+        mute_audio: bool = False,
+        target_durations: Optional[list[float]] = None
     ) -> Path:
         """
         Stitch clips with smooth cross-dissolve (Mix) transitions and optional SFX.
@@ -101,109 +102,91 @@ class FFmpegVideoEditor:
             
         count = len(valid_clips)
         
-        # 2. Build Inputs & Scale Each Clip First
-        # Xfade requires consistent timebases/resos, so we scale inputs in the chain before xfading.
+        # 2. Build Inputs & Filter Parts
         inputs = []
         filter_parts = []
         
-        # Map SFX input if exists
-        sfx_input_idx = count
-        if has_sfx:
-             # We add SFX as the last input
-             pass 
-
+        v_labels = []
+        a_labels = []
+        
+        cumulative_offset = 0.0
+        
         for i, clip in enumerate(valid_clips):
-            inputs.extend(['-i', str(clip)])
-            # Scale each input [i:v] -> [v{i}]
+            target_dur = target_durations[i] if target_durations and i < len(target_durations) else durations[i]
+            durations[i] = target_dur # Actual duration we use
+            
+            # Input: Loop infinitely
+            inputs.extend(['-stream_loop', '-1', '-i', str(clip)])
+            
+            # Video Graph: Scale -> Crop -> Trim
+            v_label = f"vraw{i}"
             filter_parts.append(
                 f"[{i}:v]scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
-                f"crop={target_w}:{target_h},setsar=1[v{i}]"
+                f"crop={target_w}:{target_h},setsar=1,trim=duration={target_dur},setpts=PTS-STARTPTS[{v_label}]"
             )
-            # Audio: assume exists, map [i:a] -> [a{i}]
-            if mute_audio:
-                filter_parts.append(f"anullsrc=r=44100:cl=stereo[a{i}]")
-            else:
-                try:
-                    inputs_probe = ffmpeg.probe(str(clip), cmd=self.ffprobe_cmd)
-                    has_audio = any(s['codec_type'] == 'audio' for s in inputs_probe['streams'])
-                    if has_audio:
-                        filter_parts.append(f"[{i}:a]aresample=44100[a{i}]")
-                    else:
-                        filter_parts.append(f"anullsrc=r=44100:cl=stereo[a{i}]")
-                except:
-                     filter_parts.append(f"anullsrc=r=44100:cl=stereo[a{i}]")
+            v_labels.append(f"[{v_label}]")
+            
+            # Audio Graph: Resample -> Fade -> Delay
+            # We delay each clip by its start time in the master timeline
+            # StartTime(i) = Sum(D_k for k<i) - i * Fade
+            delay_ms = int(cumulative_offset * 1000)
+            
+            # Check if audio stream exists for the current clip
+            try:
+                inputs_probe = ffmpeg.probe(str(clip), cmd=self.ffprobe_cmd)
+                has_audio_stream = any(s['codec_type'] == 'audio' for s in inputs_probe['streams'])
+            except Exception:
+                has_audio_stream = False
 
-        # 3. Chain XFades
-        # Loop: [v0][v1]xfade=...[v01]; [v01][v2]xfade...
-        # We need to track the cumulative offset.
-        # Offset for transition i (between clip i and i+1) = Sum(durations 0..i) - (i * overlap)
-        
-        current_v_label = "[v0]"
-        current_a_label = "[a0]"
-        
-        current_offset = 0.0
-        
-        # Transition Timestamps (for SFX)
-        transition_times = []
-        
-        for i in range(count - 1):
-            # Duration of the 'current' clip (which might be a result of previous xfades)
-            # But simpler logic: Xfade offset is relative to the START of the VIDEO.
-            # Offset = (Duration(0) + Duration(1) + ... + Duration(i)) - (i+1)*Overlap ?
-            # Wait.
-            # Clip 0 starts at 0. Ends at D0.
-            # Clip 1 starts at D0 - Overlap.
-            # Clip 2 starts at (D0 + D1 - Overlap) - Overlap = D0 + D1 - 2*Overlap.
-            
-            # So, transition starts at:
-            # T_offset = CurrentCumulativeDuration - Overlap?
-            # No.
-            # Let's track precise end time.
-            
-            clip_dur = durations[i]
-            
-            # The offset for xfade is relative to the first input of the pair? No, global timeline?
-            # FFmpeg xfade `offset` is "timestamp of the start of transition".
-            # For the first transition (v0 -> v1), offset = D0 - Fade.
-            # For the second (v01 -> v2), offset = (D0 + D1 - Fade) - Fade?
-            
-            # Math:
-            # Start time of Clip i in timeline = Sum(D_k for k<i) - i * Fade
-            # Transition i (joining i and i+1) happens at: StartTime(i+1)
-            # StartTime(i+1) = StartTime(i) + D_i - Fade
-            
-            if i == 0:
-                current_offset = durations[0] - fade_duration
+            if has_audio_stream:
+                f_in = f"afade=t=in:st=0:d={fade_duration}," if i > 0 else ""
+                f_out = f"afade=t=out:st={target_dur - fade_duration}:d={fade_duration}," if i < (count - 1) else ""
+                
+                a_label = f"async{i}"
+                filter_parts.append(
+                    f"[{i}:a]aresample=44100,{f_in}{f_out}volume={0.10 if mute_audio else 1.0},"
+                    f"adelay={delay_ms}|{delay_ms},atrim=duration={cumulative_offset + target_dur},asetpts=PTS-STARTPTS[{a_label}]"
+                )
+                a_labels.append(f"[{a_label}]")
             else:
-                current_offset += durations[i] - fade_duration
+                # If no audio stream, create a silent audio source for the duration
+                a_label = f"async{i}"
+                filter_parts.append(
+                    f"anullsrc=r=44100:cl=stereo:d={target_dur}[a_null{i}];"
+                    f"[a_null{i}]adelay={delay_ms}|{delay_ms},atrim=duration={cumulative_offset + target_dur},asetpts=PTS-STARTPTS[{a_label}]"
+                )
+                a_labels.append(f"[{a_label}]")
             
-            transition_times.append(current_offset)
-            
-            next_v_label = f"[v{i+1}]"
-            next_a_label = f"[a{i+1}]"
-            
-            out_v = f"[vm{i+1}]"
-            out_a = f"[am{i+1}]"
-            
-            # Video XFade (Method: fade -> simple cross dissolve)
+            # Update offset for NEXT clip
+            cumulative_offset += target_dur - fade_duration
+
+        # 3. Join Video via XFade (Still sequential, but cleaner)
+        current_v = v_labels[0]
+        v_offset = 0.0
+        for i in range(count - 1):
+            v_offset += durations[i] - fade_duration
+            out_v = f"v_xfade{i}"
             filter_parts.append(
-                f"{current_v_label}{next_v_label}xfade=transition=fade:duration={fade_duration}:offset={current_offset}{out_v}"
+                f"{current_v}{v_labels[i+1]}xfade=transition=fade:duration={fade_duration}:offset={v_offset}[{out_v}]"
             )
-            
-            # Audio Crossfade (acrossfade)
-            # doesn't use offset, it just overlaps end of A and start of B.
-            # "c0 c1 acrossfade=d=0.5:c1=tri:c2=tri"
-            filter_parts.append(
-                f"{current_a_label}{next_a_label}acrossfade=d={fade_duration}:c1=tri:c2=tri{out_a}"
-            )
-            
-            current_v_label = out_v
-            current_a_label = out_a
+            current_v = f"[{out_v}]"
         
-        # 4. Inject SFX (Mix Effect)
-        final_v_label = current_v_label
-        final_a_label = current_a_label
+        final_v_label = current_v
+
+        # 4. Join Audio via AMix (Linear Parallel Mix)
+        amix_inputs = "".join(a_labels)
+        filter_parts.append(f"{amix_inputs}amix=inputs={count}:duration=longest:dropout_transition=0:normalize=0[a_mixed]")
+        final_a_label = "[a_mixed]"
         
+        # Transition Timestamps (for SFX WHOOSH)
+        # Transition i happens at Offset i
+        transition_times = []
+        v_offset_check = 0.0
+        for i in range(count - 1):
+            v_offset_check += durations[i] - fade_duration
+            transition_times.append(v_offset_check)
+        
+        # 5. Inject SFX (Mix Effect)
         if has_sfx and transition_times:
             # Add SFX input
             inputs.extend(['-i', str(sfx_path)])
@@ -452,22 +435,24 @@ class FFmpegVideoEditor:
         
         force_style = styles.get(style, styles["pop"])
         
-        # Windows path escaping for filter_complex
-        # https://ffmpeg.org/ffmpeg-filters.html#subtitles
-        # On Windows, we need to escape backslashes and colon in drive letter
-        # e.g C:\foo\bar.srt -> C\:/foo/bar.srt
-        # However, filter complex string quoting is tricky. Best approach is forward slashes and escaped colon.
-        srt_path_str = str(srt_path.absolute()).replace("\\", "/")
-        srt_path_str = srt_path_str.replace(":", "\\:")
+        # To completely avoid Windows drive letter colon (C:) parsing bugs in FFmpeg's filtergraph,
+        # we run FFmpeg inside the directory where the .srt file lives, and just use its filename.
+        srt_filename = srt_path.name
         
-        (
-            ffmpeg
-            .input(str(input_path))
-            .filter("subtitles", srt_path_str, force_style=force_style)
-            .output(str(output_path))
-            .overwrite_output()
-            .run(quiet=True, cmd=self.ffmpeg_cmd)
-        )
+        import subprocess
+        cmd = [
+            self.ffmpeg_cmd, '-y',
+            '-i', str(input_path.absolute()),
+            '-vf', f"subtitles='{srt_filename}':force_style='{force_style}'",
+            '-c:a', 'copy',
+            str(output_path.absolute())
+        ]
+        
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, cwd=str(srt_path.parent))
+        except subprocess.CalledProcessError as e:
+            logger.error(f"❌ FFmpeg burn_subtitles failed: {e.stderr.decode('utf-8')}")
+            raise e
         
         logger.info(f"✅ Burned subtitles (Style: {style}) -> {output_path.name}")
         return output_path
@@ -593,61 +578,96 @@ class FFmpegVideoEditor:
         self,
         audio_paths: list[Path],
         bg_music_path: Optional[Path],
-        output_path: Path
+        output_path: Path,
+        scene_interval: float = 9.7
     ) -> Path:
-        """Mix multiple audio files with optional background music."""
+        """Mix multiple audio files sequentially (no overlap) and optional background music."""
         if not audio_paths:
             raise ValueError("No audio files provided")
+
+        import subprocess
+        import ffmpeg
         
-        # Concatenate all audio files
+        # 1. Pad audio sequentially without overlaps
+        padded_paths = []
+        for i, audio in enumerate(audio_paths):
+            padded_out = self.output_dir / f"padded_narration_{i:03d}.mp3"
+            
+            # Check duration
+            try:
+                probe = ffmpeg.probe(str(audio), cmd=self.ffprobe_cmd)
+                duration = float(probe['streams'][0]['duration'])
+            except Exception as e:
+                logger.warning(f"⚠️ Could not probe audio {audio}, assuming 0s: {e}")
+                duration = 0.0
+            
+            if duration < scene_interval:
+                # Pad with exact silence amount needed
+                pad_amount = scene_interval - duration
+                cmd = [
+                    self.ffmpeg_cmd, '-y',
+                    '-i', str(audio),
+                    '-f', 'lavfi', '-i', f'anullsrc=r=44100:cl=stereo:d={pad_amount}',
+                    '-filter_complex', '[0:a][1:a]concat=n=2:v=0:a=1[aout]',
+                    '-map', '[aout]',
+                    '-c:a', 'libmp3lame', '-q:a', '2',
+                    str(padded_out)
+                ]
+                try:
+                    subprocess.run(cmd, check=True, capture_output=True)
+                    padded_paths.append(padded_out)
+                except subprocess.CalledProcessError as e:
+                    logger.error(f"❌ Padding failed for {audio}: {e.stderr.decode('utf-8')}")
+                    padded_paths.append(audio) # Fallback to original
+            else:
+                # Keep as-is if it's longer to avoid words being cut off
+                padded_paths.append(audio)
+        
+        # 2. Sequential Concatenation
         concat_file = self.output_dir / "audio_concat.txt"
         with open(concat_file, "w") as f:
-            for audio in audio_paths:
-                # FFmpeg requires forward slashes or escaped backslashes in concat files
-                safe_path = Path(audio).absolute().as_posix()
-                f.write(f"file '{safe_path}'\n")
+            for audio in padded_paths:
+                f.write(f"file '{Path(audio).absolute().as_posix()}'\n")
         
         concat_output = self.output_dir / "concat_audio.mp3"
         
-        try:
-            (
-                ffmpeg
-                .input(str(concat_file), format="concat", safe=0)
-                .output(str(concat_output), c="copy")
-                .overwrite_output()
-                .run(quiet=False, cmd=self.ffmpeg_cmd) # Enable logging
-            )
-        except subprocess.CalledProcessError as e:
-            logger.error(f"❌ FFmpeg mix_audio failed during concat. Error: {e}")
-            raise e
-        except Exception as e:
-            logger.error(f"❌ FFmpeg mix_audio failed: {e}")
-            raise e
+        cmd = [
+            self.ffmpeg_cmd, '-y',
+            '-f', 'concat', '-safe', '0',
+            '-i', str(concat_file),
+            '-c:a', 'libmp3lame', '-q:a', '2',
+            str(concat_output)
+        ]
         
-        # Mix with background music if provided
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+            logger.info("✅ Concatenated audio sequentially.")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"❌ Concat failed: {e.stderr.decode('utf-8')}")
+            raise e
+
+        # 3. Add background music over the master concatenation track
         if bg_music_path:
-            input_narration = ffmpeg.input(str(concat_output))
-            input_music = ffmpeg.input(str(bg_music_path))
-            
-            (
-                ffmpeg
-                .output(
-                    input_narration,
-                    input_music,
-                    str(output_path),
-                    filter_complex="[1:a]volume=0.2[music];[0:a][music]amix=inputs=2:duration=first:dropout_transition=2[aout]",
-                    map=['[aout]']
-                )
-                .overwrite_output()
-                .run(quiet=True, cmd=self.ffmpeg_cmd)
-            )
+            cmd = [
+                self.ffmpeg_cmd, '-y',
+                '-i', str(concat_output),
+                '-i', str(bg_music_path),
+                '-filter_complex', '[1:a]volume=0.15[music];[0:a][music]amix=inputs=2:duration=first:dropout_transition=2[aout]',
+                '-map', '[aout]',
+                '-c:a', 'libmp3lame', '-q:a', '2',
+                str(output_path)
+            ]
+            try:
+                subprocess.run(cmd, check=True, capture_output=True)
+                logger.info(f"✅ Mixed BGM + sequential voice -> {output_path.name}")
+            except subprocess.CalledProcessError as e:
+                logger.error(f"❌ BGM mixing failed: {e.stderr.decode('utf-8')}")
+                raise e
         else:
-            # Just copy the concatenated audio
             import shutil
             shutil.copy(concat_output, output_path)
-        
-        logger.info(f"✅ Mixed audio -> {output_path}")
-        return Path(output_path)
+
+        return output_path
         
     def mix_multiple_tracks(
         self,
@@ -710,40 +730,46 @@ class FFmpegVideoEditor:
         output_path: Path
     ) -> Path:
         """Combine video, audio, and subtitles into final output."""
+        import subprocess
+        
         if subtitle_path:
             # First combine video + audio, then burn subtitles
             temp_output = self.output_dir / "temp_combined.mp4"
             
-            (
-                ffmpeg
-                .output(
-                    ffmpeg.input(str(video_path)),
-                    ffmpeg.input(str(audio_path)),
-                    str(temp_output),
-                    c_v="copy",
-                    map=['0:v', '1:a'],
-                    shortest=None
-                )
-                .overwrite_output()
-                .run(quiet=True, cmd=self.ffmpeg_cmd)
-            )
+            cmd = [
+                self.ffmpeg_cmd, '-y',
+                '-i', str(video_path),
+                '-i', str(audio_path),
+                '-c:v', 'copy',
+                '-map', '0:v',
+                '-map', '1:a',
+                '-shortest',
+                str(temp_output)
+            ]
+            try:
+                subprocess.run(cmd, check=True, capture_output=True)
+            except subprocess.CalledProcessError as e:
+                logger.error(f"❌ FFmpeg finalize (video+audio) failed: {e.stderr.decode('utf-8')}")
+                raise e
             
             return self.burn_subtitles(temp_output, subtitle_path, output_path)
         else:
             # Just combine video + audio
-            (
-                ffmpeg
-                .output(
-                    ffmpeg.input(str(video_path)),
-                    ffmpeg.input(str(audio_path)),
-                    str(output_path),
-                    c_v="copy",
-                    map=['0:v', '1:a'],
-                    shortest=None
-                )
-                .overwrite_output()
-                .run(quiet=True, cmd=self.ffmpeg_cmd)
-            )
+            cmd = [
+                self.ffmpeg_cmd, '-y',
+                '-i', str(video_path),
+                '-i', str(audio_path),
+                '-c:v', 'copy',
+                '-map', '0:v',
+                '-map', '1:a',
+                '-shortest',
+                str(output_path)
+            ]
+            try:
+                subprocess.run(cmd, check=True, capture_output=True)
+            except subprocess.CalledProcessError as e:
+                logger.error(f"❌ FFmpeg finalize failed: {e.stderr.decode('utf-8')}")
+                raise e
             
             logger.info(f"✅ Finalized video -> {output_path}")
             return Path(output_path)
@@ -882,9 +908,10 @@ class FFmpegVideoEditor:
         try:
             # We must run gradio client synchronously in an executor because it blocks
             def run_gradio():
+                from gradio_client import Client, handle_file
                 client = Client("tggtg/AI_Video_Enhancer_4K", token=hf_token)
                 result = client.predict(
-                    file_obj=open(str(input_path), "rb"),
+                    file_obj=handle_file(str(input_path)),
                     api_name="/on_click_process"
                 )
                 return result
@@ -896,7 +923,13 @@ class FFmpegVideoEditor:
             # Extract video path from result
             if isinstance(result, tuple) and len(result) == 2:
                 status, video_info = result
-                remote_path = video_info.get("video")
+                
+                remote_path = None
+                if isinstance(video_info, dict):
+                    remote_path = video_info.get("video")
+                elif isinstance(video_info, str):
+                    remote_path = video_info
+
                 if remote_path and os.path.exists(remote_path):
                     shutil.copy(remote_path, output_path)
                     logger.info(f"✅ Upscaled to 4K via HF Space -> {output_path.name}")

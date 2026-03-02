@@ -1520,7 +1520,7 @@ async def generate_video(request: GenerateVideoRequest):
                     image_path=image_path,
                     motion_prompt=prompt,
                     style_suffix="Cinematic, Pixar-style 3D animation",
-                    duration=6,
+                    duration=10,
                     camera_angle=request.camera_angle or "Medium Shot",
                     aspect_ratio=aspect_ratio,
                     resolution=request.resolution or "720p",
@@ -1544,7 +1544,7 @@ async def generate_video(request: GenerateVideoRequest):
                     raise ModerationError(f"Generated video is content-moderated or corrupt HTML ({file_size} bytes).")
                 
                 # Check actual duration
-                if not VideoSettings.verify_clip_duration(path, expected_duration=6.0):
+                if not VideoSettings.verify_clip_duration(path, expected_duration=10.0):
                     print(f"⚠️ Duration verification failed for {path}")
                     if path.exists(): os.unlink(path)
                     raise ModerationError("Generated video has invalid duration (0s or mismatch).")
@@ -1673,7 +1673,7 @@ async def generate_video(request: GenerateVideoRequest):
                     final_scene_path = video_editor.replace_audio_track(video_path, tts_path, mixed_video)
                     
                     # Post-merge verification
-                    if VideoSettings.verify_clip_duration(final_scene_path, expected_duration=6.0):
+                    if VideoSettings.verify_clip_duration(final_scene_path, expected_duration=10.0):
                         video_path = final_scene_path
                         print(f"   ✅ Audio added and verified for scene {request.scene_index}")
                     else:
@@ -1761,6 +1761,7 @@ class StitchVideosRequest(BaseModel):
     audio_config: Optional[dict] = None # { mute_source_audio: bool, provider: str, voice_id: str, voice_sample_key: str }
     music_id: Optional[str] = None # Direct ID from BackgroundMusic table
     video_resolution: Optional[str] = None # e.g. '480p'
+    scene_dialogues: list[str] = [] # Per-scene narration text for TTS (Animated Storybook mode)
 
 @app.get("/audio/background-music")
 async def get_background_music():
@@ -1942,23 +1943,98 @@ async def stitch_videos(request: StitchVideosRequest):
             print(f"⚠️ Error fetching channel config: {e}. Defaulting to Landscape.")
         
         print(f"🔧 Stitching {len(local_clips)} clips with 0.4s black fade transitions (Target: {target_res})...")
-        
-        print(f"🔧 Stitching {len(local_clips)} clips with 0.4s black fade transitions (Target: {target_res})...")
         editor = FFmpegVideoEditor(output_dir=temp_dir)
-        stitched_path = temp_dir / "stitched_no_music.mp4"
+        ffprobe_cmd = os.getenv("FFPROBE_PATH", "ffprobe")
         
-        # We need to update VideoEditor to support target_resolution
         audio_config = request.audio_config or {}
         mute_source = audio_config.get("mute_source_audio", False)
         remove_speakers = audio_config.get("remove_speakers", False) # New flag from frontend
         
-        # Stitch video (respecting mute_source_audio flag)
+        # --- 1. AUDIO FIRST: ANIMATED STORYBOOK Narration ---
+        # We must generate the voice first to know how long each video clip needs to be.
+        audio_provider = audio_config.get("provider", "edge-tts") if audio_config else None
+        voice_id = audio_config.get("voice_id", "en-GB-RyanNeural") if audio_config else None
+        
+        fresh_audio_paths = []
+        narration_texts = []  # For subtitle generation later
+        target_durations = [] # Array of exactly how long each video clip should loop
+        
+        # Only generate TTS if we have scene dialogues AND a provider
+        if audio_provider and request.scene_dialogues:
+            print(f"🎙️ Animated Storybook Mode: Generating TTS narration for {len(request.scene_dialogues)} scenes...")
+            print(f"   Provider: {audio_provider} | Voice: {voice_id}")
+            from services.audio_engine import AudioEngine
+            engine = AudioEngine()
+            
+            for i, dialogue_text in enumerate(request.scene_dialogues):
+                if i >= len(final_clips_to_stitch):
+                    break # Don't generate audio for skipped corrupt clips
+                    
+                if not dialogue_text or not dialogue_text.strip():
+                    print(f"   ⏭️ Scene {i+1}: No narration text, skipping.")
+                    target_durations.append(10.0) # Default duration
+                    continue
+                    
+                clean_text = dialogue_text.strip()
+                import re
+                clean_text = re.sub(r'\[.*?\]', '', clean_text)
+                clean_text = re.sub(r'\(.*?\)', '', clean_text)
+                clean_text = clean_text.strip()
+                
+                if not clean_text:
+                    print(f"   ⏭️ Scene {i+1}: Only SFX markers, no spoken text.")
+                    target_durations.append(10.0)
+                    continue
+                
+                try:
+                    scene_audio_path = await engine.generate_narration(
+                        text=clean_text,
+                        voice_id=voice_id or "en-GB-RyanNeural",
+                        provider=audio_provider,
+                        output_path=temp_dir / f"narration_scene_{i:03d}.mp3"
+                    )
+                    
+                    # Get actual duration for video looping and subtitle sync
+                    import ffmpeg as ffprobe_lib
+                    audio_probe = ffprobe_lib.probe(str(scene_audio_path), cmd=ffprobe_cmd)
+                    audio_dur = float(audio_probe['streams'][0]['duration'])
+                    
+                    fresh_audio_paths.append(scene_audio_path)
+                    narration_texts.append({"index": i, "text": clean_text, "duration": audio_dur})
+                    
+                    # Pad out duration slightly so voice doesn't clip immediately
+                    target_durations.append(max(audio_dur + 0.5, 10.0))
+                    
+                    print(f"   ✅ Scene {i+1}: TTS generated ({audio_dur:.2f}s -> Setting Video Loop to {target_durations[-1]:.2f}s)")
+                except Exception as e:
+                    print(f"   ❌ Scene {i+1}: TTS failed: {e}")
+                    narration_texts.append({"index": i, "text": clean_text, "duration": 9.7})
+                    target_durations.append(10.0)
+            
+            if fresh_audio_paths:
+                print(f"🎙️ Generated {len(fresh_audio_paths)} narration clips driving {len(target_durations)} video segments.")
+            else:
+                print(f"⚠️ No narration clips generated. Falling back to BGM-only (10s segments).")
+        else:
+            print(f"   🔇 No scene dialogues provided or no audio provider. Defaulting to 10s video segments.")
+            target_durations = [10.0] * len(final_clips_to_stitch)
+            
+        # Ensure we have a target duration for every clip
+        while len(target_durations) < len(final_clips_to_stitch):
+             target_durations.append(10.0)
+
+
+        # --- 2. VIDEO STITCHING (Driven by Target Durations) ---
+        stitched_path = temp_dir / "stitched_no_music.mp4"
+        
+        # Stitch video (respecting mute_source_audio flag and exact audio lengths)
         stitched_path = editor.stitch_clips_with_fade(
             final_clips_to_stitch, 
             stitched_path, 
             fade_duration=0.3,
             target_resolution=target_res,
-            mute_audio=mute_source
+            mute_audio=mute_source,
+            target_durations=target_durations # newly calculated array
         )
         print(f"   ✅ Stitched video created: {stitched_path}")
         
@@ -1966,63 +2042,7 @@ async def stitch_videos(request: StitchVideosRequest):
 
         current_video_path = stitched_path
         
-        # --- AUDIO GENERATION (TTS / Cloning) ---
-        # User requested to remove this feature.
-        audio_provider = None
-        voice_id = None
-        voice_sample_key = None
-        
-        fresh_audio_paths = []
-        if audio_provider:
-            print(f"🎙️ Generating fresh Voiceover using {audio_provider}...")
-            from services.audio_engine import AudioEngine
-            engine = AudioEngine()
-            
-            # Download reference audio if XTTS
-            ref_audio_path = None
-            if audio_provider == "xtts" and voice_sample_key:
-                 from services.cloud_storage import R2Storage
-                 storage_downloader = R2Storage()
-                 ref_audio_path = temp_dir / "ref_voice_sample.wav"
-                 try:
-                     print(f"   📥 Downloading voice sample: {voice_sample_key}")
-                     storage_downloader.download(voice_sample_key, ref_audio_path)
-                 except Exception as e:
-                     print(f"   ⚠️ Failed to download voice sample for XTTS: {e}")
-            
-            # We need the script text for each scene. 
-            # Ideally the frontend sends the *text* to be spoken for each clip, but here we only have URLs.
-            # However, the frontend sends request.script (full text) usually.
-            # Or we can iterate if we had scene-level data. But StitchVideosRequest is "Simple".
-            # If we don't have per-scene text, we might just generate one long audio track from request.script?
-            # Or assume the frontend passed a way to map?
-            # Wait, `StitchVideosRequest` has `script: Optional[str]`. This is usually the full text.
-            # If we want per-scene sync, we need per-scene text.
-            # BUT, the user usually only changes this on the "Final" tab where they see the full script?
-            # Actually, `Step5Final` has access to `scenes`.
-            # If we want to support this properly, `StitchVideosRequest` needs `scene_texts` list or we use `script` as one block.
-            # Using `script` as one block is risky for sync.
-            # Let's check `StitchVideosRequest` again. It has `script`.
-            # For now, if we use TTS here, we'll generate one audio track from `request.script` and let it run over the video?
-            # Or we just support it if we can map it.
-            # BETTER: The frontend should send `scenes` with text.
-            # BUT `StitchVideosRequest` is designed to be simple.
-            # Let's stick to generating from `request.script` (full text) as a single narration track for now.
-            # This handles the "Voiceover for the whole video" use case.
-            
-            # if request.script:
-            #      try:
-            #         full_audio_path = await engine.generate_narration(
-            #             text=request.script,
-            #             voice_id=voice_id or "en-US-AriaNeural",
-            #             provider=audio_provider,
-            #             reference_audio=ref_audio_path,
-            #             output_path=temp_dir / "full_narration.mp3"
-            #         )
-            #         fresh_audio_paths.append(full_audio_path)
-            #         print(f"   ✅ Generated full narration: {full_audio_path.name}")
-            #      except Exception as e:
-            #         print(f"   ❌ TTS Generation failed: {e}")
+
 
         # --- High Quality Stage: 4K Upscale ---
         if request.video_resolution == '480p':
@@ -2057,8 +2077,7 @@ async def stitch_videos(request: StitchVideosRequest):
         print(f"🎵 Generating ambient background music...")
         import ffmpeg as ffprobe_lib
         
-        # Support custom FFmpeg paths
-        ffprobe_cmd = os.getenv("FFPROBE_PATH", "ffprobe")
+        # Support custom FFmpeg paths (Already defined above)
         
         probe = ffprobe_lib.probe(str(current_video_path), cmd=ffprobe_cmd)
         video_duration = float(probe['streams'][0]['duration'])
@@ -2155,7 +2174,7 @@ async def stitch_videos(request: StitchVideosRequest):
             if music_path:
                 # Mix narration with BGM (ducking handled by mix_audio usually?)
                 # Editor.mix_audio handles list of narration + bgm
-                mixed_audio = editor.mix_audio(fresh_audio_paths, music_path, mixed_audio)
+                mixed_audio = editor.mix_audio(fresh_audio_paths, music_path, mixed_audio, scene_interval=9.7)
             else:
                 # Just narration
                  import shutil
@@ -2193,8 +2212,79 @@ async def stitch_videos(request: StitchVideosRequest):
             print(f"   ℹ️ No background music/TTS to mix. Using stitched video.")
             import shutil
             shutil.copy(current_video_path, final_path)
-        
         # 5. Upload to R2
+        # --- ANIMATED STORYBOOK: Burn Subtitles ---
+        if narration_texts:
+            print(f"📝 Generating subtitles for {len(narration_texts)} narrated scenes...")
+            try:
+                from services.subtitle_engine import SubtitleEngine, SubtitleEntry
+                import ffmpeg as ffprobe_lib
+                
+                sub_engine = SubtitleEngine(output_dir=temp_dir)
+                entries = []
+                
+                # Calculate timing based on actual audio durations
+                current_time = 0.0
+                
+                for item in narration_texts:
+                    scene_idx = item["index"]
+                    text = item["text"]
+                    audio_dur = item.get("duration", 9.7)
+                    
+                    # Effective scene duration is what we used in video_editor.mix_audio (max(dur, 9.7))
+                    effective_dur = max(audio_dur, 9.7)
+                    scene_start = current_time
+                    scene_end = current_time + audio_dur # Subtitle ends when voice ends
+                    
+                    # Calculate precise reading speed for this specific scene
+                    words = text.split()
+                    word_count = len(words)
+                    
+                    if word_count > 0 and audio_dur > 0:
+                        # Dynamic words per second ensures perfect sync from start to end of scene
+                        words_per_second = word_count / audio_dur
+                    else:
+                        words_per_second = 2.5
+                        
+                    chunk_size = max(int(words_per_second * 3), 3)
+                    chunk_time = scene_start
+                    
+                    for j in range(0, len(words), chunk_size):
+                        chunk_words = words[j:j + chunk_size]
+                        chunk_text = " ".join(chunk_words)
+                        chunk_duration_s = len(chunk_words) / words_per_second
+                        
+                        # Don't exceed scene boundary
+                        chunk_end = min(chunk_time + chunk_duration_s, scene_end)
+                        
+                        entries.append(SubtitleEntry(
+                            text=chunk_text,
+                            start_seconds=chunk_time,
+                            end_seconds=chunk_end
+                        ))
+                        chunk_time = chunk_end
+                        
+                    # Advance global timeline by the effective duration (including padding)
+                    current_time += effective_dur
+                
+                if entries:
+                    srt_path = sub_engine.generate_srt(entries, temp_dir / "narration.srt")
+                    print(f"   ✅ Generated SRT with {len(entries)} subtitle entries")
+                    
+                    # Burn subtitles into the final video
+                    subtitled_path = temp_dir / "final_subtitled.mp4"
+                    editor.burn_subtitles(final_path, srt_path, subtitled_path, style="pop")
+                    
+                    if subtitled_path.exists() and subtitled_path.stat().st_size > 0:
+                        final_path = subtitled_path
+                        print(f"   ✅ Subtitles burned into video")
+                    else:
+                        print(f"   ⚠️ Subtitle burning failed, using video without subtitles")
+                        
+            except Exception as e:
+                print(f"   ❌ Subtitle generation/burning failed: {e}")
+                import traceback
+                traceback.print_exc()
         storage = R2Storage()
         safe_title = request.title.replace(" ", "_")[:30]
         final_key = f"videos/{request.niche_id}/{safe_title}_{uuid.uuid4().hex[:8]}.mp4"

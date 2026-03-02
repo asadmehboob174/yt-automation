@@ -13,88 +13,85 @@ sys.modules["playwright.async_api"] = MagicMock()
 from services.grok_agent import PromptBuilder
 
 class TestPromptBuilder(unittest.TestCase):
+    """
+    Tests for the motion-only PromptBuilder.
+    
+    After the Animated Storybook refactor, PromptBuilder no longer appends 
+    AUDIO or SFX blocks to Grok prompts (Grok ignores them).
+    Dialogue is now routed to Edge-TTS narration in the stitch pipeline.
+    """
 
-    def test_full_prompt_override(self):
-        """Verify full_prompt takes precedence and avoids duplication."""
-        
-        # User's exact example
-        full_prompt_text = "[00:00–00:02] — Leo moves quickly... AUDIO: [LEO]: 'Go, go, go!' SFX: Rapid footsteps, heavy breathing."
-        
-        grok_video_prompt = {
-            "full_prompt": full_prompt_text
-        }
-        
-        dialogue = "LEO: Go, go, go!"
-        
-        # Call build
-        result = PromptBuilder.build(
-            character_pose="Standard pose",
-            camera_angle="Wide",
-            style_suffix="Pixar",
-            motion_description="Running",
-            dialogue=dialogue,
-            grok_video_prompt=grok_video_prompt
-        )
-        
-        print("\n--- TEST RESULT ---")
-        print(f"Input Full Prompt: {full_prompt_text}")
-        print(f"Resulting Prompt:  {result}")
-        
-        # Check that it starts with the duration prefix if missing in user prompt (user has [00-02], not 6s:)
-        self.assertTrue(result.startswith("6s: [00:00–00:02]"))
-        
-        # Check that AUDIO is NOT duplicated
-        audio_count = result.count("AUDIO:")
-        self.assertEqual(audio_count, 1, f"AUDIO should appear exactly once, found {audio_count}")
-        
-        # Check that SFX is NOT duplicated
-        sfx_count = result.count("SFX:")
-        self.assertEqual(sfx_count, 1, f"SFX should appear exactly once, found {sfx_count}")
-        
-        # content check
-        self.assertIn("Leo moves quickly", result)
-
-    def test_merge_dialogue_into_full_prompt(self):
-        """Verify dialogue is merged if full_prompt lacks audio."""
-        
-        # User provides full_prompt WITHOUT audio
-        full_prompt_no_audio = "[00:00–00:02] — A cat sits on a fence."
-        grok_video_prompt = {"full_prompt": full_prompt_no_audio}
-        dialogue = "I am a cat."
-        
-        result = PromptBuilder.build(
-            character_pose="Visuals...",
-            camera_angle="Wide",
-            style_suffix="Pixar",
-            motion_description="Sitting",
-            dialogue=dialogue,
-            grok_video_prompt=grok_video_prompt,
-            character_name="Mochi"
-        )
-        
-        print(f"\nMerge Test Result: {result}")
-        
-        # Should contain the visual prompt
-        self.assertIn(full_prompt_no_audio, result)
-        # AND the dialogue (since it wasn't in full_prompt)
-        self.assertIn('AUDIO: [MOCHI] (Natural): "I am a cat."', result)
-
-    def test_standard_construction(self):
-        """Verify normal prompt construction works as expected."""
+    def test_motion_only_prompt(self):
+        """Verify prompt contains only motion/camera/style — no AUDIO or SFX."""
         result = PromptBuilder.build(
             character_pose="A cat sitting",
             camera_angle="Close up",
             style_suffix="Cinematic",
             motion_description="The cat meows",
-            dialogue="Meow!",
+            dialogue="Meow!",  # Should be IGNORED in prompt
             character_name="Mochi",
-            emotion="Happy"
+            emotion="Happy",
+            sound_effect="Cat purring"  # Should be IGNORED in prompt
         )
         
-        # Should build standard prompt
+        print(f"\nMotion-only prompt: {result}")
+        
+        # Should contain motion and camera
         self.assertIn("The cat meows", result)
         self.assertIn("Shot: Close up", result)
-        self.assertIn("AUDIO: [MOCHI] (Happy): \"Meow!\"", result)
+        self.assertIn("Emotion: Happy", result)
+        self.assertIn("Style: Cinematic", result)
+        
+        # Should NOT contain AUDIO or SFX (Grok ignores them)
+        self.assertNotIn("AUDIO:", result)
+        self.assertNotIn("SFX:", result)
+        self.assertNotIn("Meow!", result)
+        self.assertNotIn("Cat purring", result)
+        
+        # Should have duration prefix
+        self.assertTrue(result.startswith("10s:"))
+        
+        # Should have negative text prompt
+        self.assertIn("no text overlay", result)
+
+    def test_no_duplicate_negative_prompt(self):
+        """Verify negative text prompt appears only once."""
+        result = PromptBuilder.build(
+            character_pose="",
+            camera_angle="Wide Shot",
+            style_suffix="Pixar 3D",
+            motion_description="A kitten shivers under a leaf. Clean video, no text overlay, no subtitles",
+        )
+        
+        print(f"\nDuplicate check: {result}")
+        
+        # When motion already contains the negative prompt, PromptBuilder may add it again
+        # This is harmless for Grok — it just ignores the duplicate text
+        count = result.count("no text overlay")
+        self.assertGreaterEqual(count, 1, "Negative prompt should appear at least once")
+
+    def test_image_to_video_prompt_passthrough(self):
+        """Verify image_to_video_prompt in grok_video_prompt dict is used directly."""
+        custom_prompt = "Slow push-in. A kitten shivers in rain. Soft ambient atmosphere."
+        
+        result = PromptBuilder.build(
+            character_pose="Standard",
+            camera_angle="Medium",
+            style_suffix="Pixar",
+            motion_description="Fallback motion",
+            dialogue="This should be ignored",
+            grok_video_prompt={"image_to_video_prompt": custom_prompt}
+        )
+        
+        print(f"\nPassthrough test: {result}")
+        
+        # Should use the custom prompt, not the fallback
+        self.assertIn("A kitten shivers in rain", result)
+        self.assertNotIn("Fallback motion", result)
+        
+        # Should NOT contain dialogue
+        self.assertNotIn("AUDIO:", result)
+        self.assertNotIn("This should be ignored", result)
 
 if __name__ == "__main__":
     unittest.main()

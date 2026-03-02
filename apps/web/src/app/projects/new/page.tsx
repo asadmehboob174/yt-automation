@@ -1443,12 +1443,13 @@ function Step5Final() {
                 music_id: selectedMusicId,
                 is_shorts: format === 'short',
                 video_resolution: videoResolution,
-                script: breakdown?.scenes.map(s => s.dialogue).join("\n\n"), // Pass full script for TTS
+                script: breakdown?.scenes.map(s => s.dialogue).join("\n\n"),
+                scene_dialogues: scenes.map((s) => s.dialogue || ''),
                 audio_config: {
-                    mute_source_audio: audioSource === "voiceover",
-                    remove_speakers: removeSpeakers, // Pass it
-                    provider: audioSource === "voiceover" ? provider : null,
-                    voice_id: voiceId,
+                    provider: 'edge-tts',
+                    mute_source_audio: true,
+                    voice_id: 'en-GB-RyanNeural',
+                    remove_speakers: removeSpeakers, 
                     voice_sample_key: voiceSampleUrl 
                 }
             });

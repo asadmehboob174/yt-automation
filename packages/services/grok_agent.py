@@ -123,47 +123,16 @@ class PromptBuilder:
         # Apply timeline formatting to the base prompt
         base_prompt = format_timeline(base_prompt)
         
-        # 2. Synchronized AUDIO
-        audio_block = ""
-        if dialogue:
-            tone = f"({emotion})" if emotion and emotion.lower() != "neutrally" else "(Natural)"
-            
-            if isinstance(dialogue, dict):
-                audio_parts = []
-                for char, text in dialogue.items():
-                    audio_parts.append(f'[{char.upper()}] {tone}: "{text.strip()}"')
-                audio_block = " AUDIO: " + " ".join(audio_parts)
-            else:
-                d_str = str(dialogue).strip()
-                if "AUDIO:" not in base_prompt and "Dialogue" not in base_prompt:
-                    # Clean up existing character names if present in string like "BOY: Hello"
-                    match = re.search(r'^([^:]+):\s*"?(.+?)"?$', d_str)
-                    if match:
-                        char, text = match.groups()
-                        audio_block = f' AUDIO: [{char.upper()}] {tone}: "{text}"'
-                    else:
-                        audio_block = f' AUDIO: [{character_name.upper()}] {tone}: "{d_str}"'
+        # NOTE: AUDIO and SFX blocks removed — Grok Imagine ignores dialogue/SFX.
+        # Dialogue is now routed to Edge-TTS narration in the stitch pipeline.
+        # Keeping parameters in function signature for backward compatibility.
 
-        # 3. Layered SFX
-        sfx_block = ""
-        all_sfx = []
-        if sound_effect: all_sfx.append(sound_effect)
-        if sfx: all_sfx.extend(sfx)
-        
-        if all_sfx:
-            unique_sfx = list(dict.fromkeys([s for s in all_sfx if s]))
-            sfx_str = ", ".join(unique_sfx)
-            if "SFX:" not in base_prompt and "Sound Effect" not in base_prompt:
-                sfx_block = f" SFX: {sfx_str}."
-
-        # Final assembly
+        # Final assembly — motion-only prompt for Grok
         final_prompt = base_prompt.strip()
-        if audio_block: final_prompt += audio_block
-        if sfx_block: final_prompt += sfx_block
         
-        # Ensure it starts with the duration if not present (e.g. "6s: ")
+        # Ensure it starts with the duration if not present (e.g. "10s: ")
         if not re.search(r'^[0-9]+s:', final_prompt):
-             duration_prefix = "6s: " # Default to 6s for Grok Imagine
+             duration_prefix = "10s: " # Default to 10s for Grok Imagine
              final_prompt = duration_prefix + final_prompt
 
         return final_prompt
@@ -261,7 +230,7 @@ class VideoSettings:
     }
     
     @classmethod
-    async def configure(cls, page: Page, duration: str = "6s", aspect: str = "9:16", resolution: str = "720p"):
+    async def configure(cls, page: Page, duration: str = "10s", aspect: str = "9:16", resolution: str = "720p"):
         """Set duration and aspect ratio before generating."""
         logger.info(f"⚙️ Configuring video settings: duration={duration}, aspect={aspect}")
         
@@ -493,7 +462,7 @@ async def generate_single_clip(
     sound_effect: Optional[str] = None,
     character_name: str = "Character",
     emotion: str = "neutrally",
-    duration: str = "6s",
+    duration: str = "10s",
     aspect: str = "9:16",
     resolution: str = "720p",
     external_page: Optional[Page] = None,
@@ -603,25 +572,41 @@ async def generate_single_clip(
             make_video_clicked = False
             
             # Use strict, specific selectors.
-            # CRITICAL: Avoid broad selectors like "div:has-text('...') >> button"
-            # because if the text exists anywhere, it selects the whole page body 
-            # and then clicks the VERY FIRST button on the page (e.g. Search).
             make_video_selectors = [
                 "button[aria-label='Make video']",
-                "button:text-is('Make video')",
-                "button:has-text('Make video'):not([aria-label='Search'])"
+                "button:has-text('Make video'):not([aria-label='Search'])",
+                "div[role='button']:has-text('Make video')"
             ]
             combined_selector = ", ".join(make_video_selectors)
             
             try:
-                # This will wait dynamically until the exact button is found or timeout is reached
+                # 1. Wait for ANY matching selector
                 btn = await page.wait_for_selector(combined_selector, state="visible", timeout=15000)
                 if btn:
-                    await btn.click(timeout=5000)
-                    logger.info("✅ Clicked 'Make video' button on the image")
-                    make_video_clicked = True
+                    try:
+                        await btn.click(timeout=5000)
+                        logger.info("✅ Clicked 'Make video' button via locator")
+                        make_video_clicked = True
+                    except Exception as e:
+                        logger.warning(f"Locator click failed, trying JS evaluation: {e}")
+                        
+                # 2. JS Evaluation Fallback (bypasses Playwright interception checks)
+                if not make_video_clicked:
+                    clicked = await page.evaluate("""() => {
+                        const btns = Array.from(document.querySelectorAll('button, [role="button"], a, div'));
+                        for (const b of btns) {
+                            if (b.innerText && b.innerText.includes('Make video')) {
+                                b.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }""")
+                    if clicked:
+                        logger.info("✅ Clicked 'Make video' button via JavaScript evaluation")
+                        make_video_clicked = True
             except Exception as e:
-                logger.warning(f"⚠️ 'Make video' button not found within 15s: {e}")
+                logger.warning(f"⚠️ 'Make video' button wait failed: {e}")
             
             if not make_video_clicked:
                 logger.warning("Generation may have auto-started or button detection failed.")
@@ -910,7 +895,7 @@ class GrokAnimator:
         image_path: Path,
         motion_prompt: str = "",
         style_suffix: str = "Cinematic, dramatic lighting",
-        duration: int = 6,
+        duration: int = 10,
         aspect_ratio: str = "9:16",
         resolution: str = "720p",
         camera_angle: str = "Medium shot",

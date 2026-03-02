@@ -445,12 +445,14 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
                 thumbnail_url: useProjectStore.getState().thumbnailUrl,
                 youtube_upload: (breakdown as any).youtube_upload,
                 final_assembly: (breakdown as any).final_assembly,
+                // Animated Storybook: per-scene narration text for TTS
+                scene_dialogues: breakdown.scenes.map((s: any) =>
+                    s.dialogue || s.voiceover_text || ''
+                ),
                 audio_config: {
-                    provider: 'xtts',
-                    mute_source_audio: false, // Smart separation requires source audio
-                    remove_speakers: true, // "Keep Background Music" ON
-                    voice_id: undefined, // XTTS doesn't use ID usually
-                    voice_sample_key: undefined // Fallback to EdgeTTS if no sample? Or user needs to set default?
+                    provider: useProjectStore.getState().audioConfig.provider || 'edge-tts',
+                    mute_source_audio: true,  // Mute Grok's random audio
+                    voice_id: useProjectStore.getState().audioConfig.voiceId || 'en-GB-RyanNeural',
                 }
             });
             updateStep(6, 'done');
