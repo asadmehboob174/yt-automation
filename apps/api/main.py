@@ -1400,6 +1400,8 @@ async def verify_video(request: VerifyVideoRequest):
 class GenerateVideoRequest(BaseModel):
     scene_index: int
     image_url: str
+    previous_video_url: str | None = None
+    style_consistency_tag: str | None = None
     prompt: str | dict | None = "" # Add default to prevent 422
     niche_id: str
     dialogue: str | dict | None = "" # Add default to prevent 422
@@ -1460,26 +1462,52 @@ async def generate_video(request: GenerateVideoRequest):
         print(f"   Image: {request.image_url[:60]}...")
         print(f"   Motion: {request.prompt[:80]}...")
         
-        # Download the scene image to a temp file
+        # Determine the source image (fresh Whisk image OR last frame of previous video)
+        image_path = None
+        
         async with httpx.AsyncClient() as client:
-            target_url = request.image_url
-            # Fix placehold.co URLs to ensure PNG (Grok detects SVG as invalid)
-            if "placehold.co" in target_url and ".png" not in target_url:
-                target_url = target_url.replace("?", ".png?") if "?" in target_url else f"{target_url}.png"
-                print(f"🔄 Adjusted placeholder URL to force PNG: {target_url}")
-
-            response = await client.get(target_url, follow_redirects=True)
-            response.raise_for_status()
+            if request.previous_video_url:
+                print(f"🔗 Chaining from previous video: {request.previous_video_url[:60]}...")
+                try:
+                    # Download the previous video
+                    v_resp = await client.get(request.previous_video_url, follow_redirects=True)
+                    v_resp.raise_for_status()
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as v_tmp:
+                        v_tmp.write(v_resp.content)
+                        prev_video_path = Path(v_tmp.name)
+                    
+                    # Extract last frame
+                    from services.video_editor import FFmpegVideoEditor
+                    image_path = FFmpegVideoEditor.extract_last_frame(prev_video_path)
+                    print(f"✅ Successfully extracted last frame for chaining: {image_path}")
+                    
+                    # Clean up the downloaded video temp file
+                    os.unlink(prev_video_path)
+                except Exception as e:
+                    print(f"⚠️ Failed to chain from previous video: {e}. Falling back to fresh image.")
+                    image_path = None # Trigger fallback below
             
-            content_type = response.headers.get("content-type", "")
-            print(f"📥 Downloaded image type: {content_type}")
-            
-            if "image" not in content_type:
-                print("⚠️ Warning: Downloaded content might not be an image!")
+            # Fallback or Fresh Image
+            if not image_path:
+                target_url = request.image_url
+                # Fix placehold.co URLs to ensure PNG (Grok detects SVG as invalid)
+                if "placehold.co" in target_url and ".png" not in target_url:
+                    target_url = target_url.replace("?", ".png?") if "?" in target_url else f"{target_url}.png"
+                    print(f"🔄 Adjusted placeholder URL to force PNG: {target_url}")
 
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-                tmp.write(response.content)
-                image_path = Path(tmp.name)
+                print(f"📥 Downloading fresh image: {target_url[:60]}...")
+                response = await client.get(target_url, follow_redirects=True)
+                response.raise_for_status()
+                
+                content_type = response.headers.get("content-type", "")
+                print(f"📥 Downloaded image type: {content_type}")
+                
+                if "image" not in content_type:
+                    print("⚠️ Warning: Downloaded content might not be an image!")
+
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+                    tmp.write(response.content)
+                    image_path = Path(tmp.name)
         
         # Download Voice Sample if provided (for XTTS)
         voice_reference_path = None

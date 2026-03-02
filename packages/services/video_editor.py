@@ -25,7 +25,40 @@ class FFmpegVideoEditor:
         import os
         self.ffmpeg_cmd = os.getenv("FFMPEG_PATH", "ffmpeg")
         self.ffprobe_cmd = os.getenv("FFPROBE_PATH", "ffprobe")
-    
+        
+    @staticmethod
+    def extract_last_frame(video_path: Path, output_path: Optional[Path] = None) -> Path:
+        """Extract the last frame from a video clip as a PNG image.
+        
+        Uses FFmpeg to seek to the last frame and save it.
+        This is used for last-frame chaining between Grok clips.
+        """
+        import os
+        import subprocess
+        
+        if output_path is None:
+            output_path = video_path.with_suffix(".last_frame.png")
+            
+        ffmpeg_cmd = os.getenv("FFMPEG_PATH", "ffmpeg")
+        
+        # -sseof -0.1 seeks to 0.1s before end to reliably grab the last frame
+        cmd = [
+            ffmpeg_cmd, "-y",
+            "-sseof", "-0.1",
+            "-i", str(video_path),
+            "-frames:v", "1",
+            "-q:v", "2",
+            str(output_path)
+        ]
+        
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+            logger.info(f"✅ Extracted last frame -> {output_path.name}")
+            return output_path
+        except subprocess.CalledProcessError as e:
+            logger.error(f"❌ Failed to extract last frame from {video_path}: {e.stderr.decode('utf-8')}")
+            raise e
+
     def stitch_clips(
         self,
         clip_paths: list[Path],

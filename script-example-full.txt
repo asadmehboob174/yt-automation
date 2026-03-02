@@ -1,0 +1,201 @@
+THE RAINY DAY BOWL
+A Ghibli-Style Cinematic Short
+Complete Production Script  •  Whisk + Grok Imagine Pipeline
+STEP 1 — MASTER CHARACTER PROMPTS
+[HANA]
+[THE STUDIO]
+PIPELINE SUMMARY — ALL 12 SCENES
+CHAIN GROUPS
+STEP 2 — 12-SCENE CINEMATIC BREAKDOWN
+SCENE 1  RAINDROPS ON GLASS
+SCENE 2  A QUIET STUDIO
+SCENE 3  THE SOFT CLAY
+SCENE 4  THE SPINNING WHEEL
+SCENE 5  SHAPING THE CURVE
+SCENE 6  THE FINISHING TOUCH
+SCENE 7  SETTING THE BOWL TO REST
+SCENE 8  PAINTING A FLOWER
+SCENE 9  THE WARM KILN
+SCENE 10  THE WHISTLING KETTLE
+SCENE 11  THE FIRST POUR
+SCENE 12  PEACE IN THE RAIN
+PRODUCTION NOTES
+Audio Strategy:  Use Grok's built-in audio when correct (rain, ASMR, SFX). Mute and use TTS fallback only if Grok generates wrong music or sounds.
+Chain Rule:  Generate Whisk image once per chain start. Extract last frame after each clip. Feed last frame as input image to next clip in chain. Reset to Whisk image only when scene/subject changes.
+Whisk Tip:  For Scenes 4, 8, and 11 — generate 3 variations in Whisk and pick the best before sending to Grok. These are chain-starting images and must be perfect.
+Backup Images:  Scenes 5, 6, 7, and 12 have backup Whisk prompts. Use them only if the chain fails or produces inconsistent results.
+Generated with Claude — Ghibli Story Pipeline v1.0
+----------------------------------------
+WHISK IMAGE | A high-quality Ghibli-style 2D animation render of Hana, a young woman with a calm, gentle expression and short, dark hair tucked neatly behind her ears. She wears a simple cream-colored linen blouse beneath a navy-blue pottery apron lightly dusted with dried clay. Her eyes are warm and focused, and her movements are slow, careful, and mindful. The lighting is soft and diffused, as if filtered through rain clouds, creating a peaceful, overcast afternoon mood.
+----------------------------------------
+----------------------------------------
+WHISK IMAGE | A cozy, rustic pottery studio filled with wooden shelves holding unfinished clay pots, bowls, and mugs. Large windows reveal a lush green garden blurred by steady rainfall. The room is warm and earthy, with muted browns and soft greens, dried flowers in small vases, and a gentle orange glow from a ceramic kiln in the corner. The space feels quiet, lived-in, and comforting.
+----------------------------------------
+----------------------------------------
+CONSISTENT ENDING TAG — Add to every Image-to-Video prompt: "Soft diffused Ghibli lighting, overcast rainy afternoon mood, slow smooth motion, warm earthy tones, hand-painted animation texture, no sudden cuts or jumps."
+----------------------------------------
+----------------------------------------
+SCENE | TITLE | IMAGE SOURCE | CHAIN
+1 | Raindrops on Glass | Whisk image | 🆕 Fresh
+2 | A Quiet Studio | Whisk image | 🆕 Fresh
+3 | The Soft Clay | Whisk image | 🆕 Fresh
+4 | The Spinning Wheel | Whisk image | 🆕 Fresh → Chain Start
+5 | Shaping the Curve | Last frame of Scene 4 | 🔗 Chain
+6 | The Finishing Touch | Last frame of Scene 5 | 🔗 Chain
+7 | Setting the Bowl | Last frame of Scene 6 | 🔗 Chain End
+8 | Painting a Flower | Whisk image | 🆕 Fresh
+9 | The Warm Kiln | Whisk image | 🆕 Fresh
+10 | The Whistling Kettle | Whisk image | 🆕 Fresh
+11 | The First Pour | Whisk image | 🆕 Fresh → Chain Start
+12 | Peace in the Rain | Last frame of Scene 11 | 🔗 Chain End
+----------------------------------------
+----------------------------------------
+Chain Group 1:  Scene 4 → Scene 5 → Scene 6 → Scene 7  (Hana making the bowl — continuous action)
+----------------------------------------
+----------------------------------------
+Chain Group 2:  Scene 11 → Scene 12  (Hana drinking tea — peaceful ending)
+----------------------------------------
+----------------------------------------
+🆕 FRESH WHISK IMAGE
+----------------------------------------
+----------------------------------------
+WHISK IMAGE | A Ghibli-style 2D animation render. Extreme close-up of a rain-speckled windowpane. Large crystal-clear raindrops cling and slide slowly down the glass. The green garden outside is beautifully blurred and soft, with deep greens and muted greys. The glass surface reflects pale overcast sky light. Interior warmth subtly visible in the reflection. Soft diffused lighting, overcast rainy afternoon mood, warm earthy tones, hand-painted Ghibli texture.
+----------------------------------------
+----------------------------------------
+GROK VIDEO | The camera remains perfectly still. Large raindrops form slowly and slide down the glass in long crystal trails, occasionally merging with smaller drops. The blurred green garden outside sways very gently in the rain wind. No movement inside the frame except the raindrops themselves. Soft diffused Ghibli lighting, overcast rainy afternoon mood, slow smooth motion, warm earthy tones, hand-painted animation texture, no sudden cuts or jumps.
+----------------------------------------
+----------------------------------------
+AUDIO DIRECT | AUDIO: Steady rhythmic rain pattering on glass. No music. Only rain.
+----------------------------------------
+----------------------------------------
+🆕 FRESH WHISK IMAGE
+----------------------------------------
+----------------------------------------
+WHISK IMAGE | A Ghibli-style 2D animation render. Wide interior shot of [THE STUDIO]. Wooden shelves packed with unfinished pottery glow softly in warm kiln light. The potter's wheel sits empty and still. Large windows show grey rainy light streaming in softly. Dust particles float gently in the air. The kiln in the corner emits a gentle deep orange glow. Muted browns, soft greens, warm amber tones. Soft diffused lighting, peaceful overcast mood, hand-painted Ghibli texture.
+----------------------------------------
+----------------------------------------
+GROK VIDEO | The camera drifts almost imperceptibly to the left in an extremely slow pan. The kiln in the corner flickers with a gentle deep orange pulse. Soft rain shadows drift slowly across the wooden floor from the window light. Dust particles float lazily in the air. Nothing moves quickly — everything breathes slowly. Soft diffused Ghibli lighting, overcast rainy afternoon mood, slow smooth motion, warm earthy tones, hand-painted animation texture, no sudden cuts or jumps.
+----------------------------------------
+----------------------------------------
+AUDIO DIRECT | AUDIO: Distant rain outside. Faint warm kiln crackle. Deep ambient silence. No music.
+----------------------------------------
+----------------------------------------
+🆕 FRESH WHISK IMAGE
+----------------------------------------
+----------------------------------------
+WHISK IMAGE | A Ghibli-style 2D animation render. Extreme close-up of [HANA]'s hands. Her slender fingers press deeply into a smooth mound of wet dark grey clay on a wooden worktable. Fresh finger indentations visible. Tiny droplets of water glisten on the clay surface and on her skin. Her navy pottery apron visible at edges. Warm diffused studio light from above. Soft shadows under each finger. Soft diffused Ghibli lighting, overcast rainy mood, warm earthy tones, hand-painted Ghibli texture.
+----------------------------------------
+----------------------------------------
+GROK VIDEO | Hana's fingers press slowly and rhythmically into the wet grey clay, leaving deep smooth indentations. The clay responds softly — rising between her fingers, then flattening again as she kneads. Water glistens on her skin and on the clay surface. Her movements are never rushed, completely absorbed in the texture beneath her hands. Soft diffused Ghibli lighting, overcast rainy afternoon mood, slow smooth motion, warm earthy tones, hand-painted animation texture, no sudden cuts or jumps.
+----------------------------------------
+----------------------------------------
+AUDIO DIRECT | AUDIO: Soft wet clay thump and squish with each knead. Rain faint in background. No music.
+----------------------------------------
+----------------------------------------
+🆕 FRESH WHISK IMAGE → 🔗 CHAIN STARTS HERE
+----------------------------------------
+----------------------------------------
+WHISK IMAGE | A Ghibli-style 2D animation render. Medium shot of [HANA] seated gracefully at a wooden potter's wheel. Her hands are pressed firmly around a centered mound of wet clay, fingers splayed wide. Tiny water droplets suspended mid-air around the spinning wheel. Her expression calm and focused, eyes slightly downcast watching the clay. Her cream blouse and navy apron clearly visible. Warm kiln light from the left, soft grey window light from behind. Soft diffused Ghibli lighting, overcast rainy mood, warm earthy tones, hand-painted Ghibli texture.
+----------------------------------------
+----------------------------------------
+GROK VIDEO | The wooden wheel hums with a low steady rhythm. Hana's wet hands press firmly around the spinning clay, guiding it slowly to center. The clay wobbles slightly then gradually steadies into a perfect smooth cylinder rising under her touch. Tiny water droplets fly outward catching the soft light. Her breathing is calm and controlled. The wheel hum blends with the rain outside into one continuous peaceful sound. Soft diffused Ghibli lighting, overcast rainy afternoon mood, slow smooth motion, warm earthy tones, hand-painted animation texture, no sudden cuts or jumps.
+----------------------------------------
+----------------------------------------
+AUDIO DIRECT | AUDIO: Wooden wheel low steady hum. Wet clay sliding sound. Rain outside. No music.
+----------------------------------------
+----------------------------------------
+🔗 CHAIN — Use last frame of Scene 4
+----------------------------------------
+----------------------------------------
+WHISK IMAGE | BACKUP ONLY — A Ghibli-style 2D animation render. Extreme close-up of [HANA]'s thumbs pressed gently outward from inside a spinning clay cylinder. The clay walls are thin and translucent at the top, curving outward into a beautiful tea bowl shape. Water glistens on every surface. The wooden wheel base visible below. Warm amber studio light catching the wet clay surface. Soft diffused Ghibli lighting, overcast rainy mood, warm earthy tones, hand-painted Ghibli texture.
+----------------------------------------
+----------------------------------------
+GROK VIDEO | Hana's thumbs press gently outward from inside the spinning clay cylinder. The walls respond — thinning, curving, opening slowly into a beautiful rounded bowl shape. The clay surface glistens with water, catching warm amber light as the curve deepens. The transformation is unhurried and meditative, each millimeter of change deliberate and graceful. A soft wet sliding sound accompanies every movement. Soft diffused Ghibli lighting, overcast rainy afternoon mood, slow smooth motion, warm earthy tones, hand-painted animation texture, no sudden cuts or jumps.
+----------------------------------------
+----------------------------------------
+AUDIO DIRECT | AUDIO: Wet clay stretching and thinning sound. Wheel spinning hum. Rain faint. No music.
+----------------------------------------
+----------------------------------------
+🔗 CHAIN — Use last frame of Scene 5
+----------------------------------------
+----------------------------------------
+WHISK IMAGE | BACKUP ONLY — A Ghibli-style 2D animation render. Close-up of [HANA]'s hands holding a small wooden trimming tool against the base of a freshly shaped tea bowl. The wheel spins slowly. Fine pale clay curls peel away from the base and fall softly. Her fingers are steady and precise. Soft warm kiln light from the left. The wooden wheel surface dusted with dried clay. Soft diffused Ghibli lighting, overcast rainy mood, warm earthy tones, hand-painted Ghibli texture.
+----------------------------------------
+----------------------------------------
+GROK VIDEO | Hana holds a small wooden trimming tool steady against the base of the slowly spinning bowl. Fine pale clay curls peel away from the rim and fall in slow motion onto the wheel surface below. The scraping produces a crisp clean ASMR sound — precise and satisfying. Her hand is completely steady. The bowl base becomes smooth and clean with each careful pass of the tool. Soft diffused Ghibli lighting, overcast rainy afternoon mood, slow smooth motion, warm earthy tones, hand-painted animation texture, no sudden cuts or jumps.
+----------------------------------------
+----------------------------------------
+AUDIO DIRECT | AUDIO: Crisp clay scraping sound from trimming tool. Fine clay curls falling. Rain faint. No music.
+----------------------------------------
+----------------------------------------
+🔗 CHAIN — Use last frame of Scene 6
+----------------------------------------
+----------------------------------------
+WHISK IMAGE | BACKUP ONLY — A Ghibli-style 2D animation render. Medium shot of [HANA] standing beside a wooden shelf. She holds a freshly shaped pale clay tea bowl gently with both hands, carefully placing it among other drying pottery pieces. Her face is soft and satisfied. Grey rainy window light falls across the shelf and across her hands. Dust particles float in the light. Soft diffused Ghibli lighting, overcast rainy mood, warm earthy tones, hand-painted Ghibli texture.
+----------------------------------------
+----------------------------------------
+GROK VIDEO | Hana lifts the freshly shaped pale clay bowl gently from the wheel with both hands, cradling it carefully. She steps slowly toward the wooden shelf and places it carefully among the other drying pottery pieces. She adjusts it slightly — tilting it a fraction left, then settling it perfectly straight. Soft grey rainlight flickers across the shelf and across her hands as she steps back and looks at it quietly for a moment. Soft diffused Ghibli lighting, overcast rainy afternoon mood, slow smooth motion, warm earthy tones, hand-painted animation texture, no sudden cuts or jumps.
+----------------------------------------
+----------------------------------------
+AUDIO DIRECT | AUDIO: Soft footsteps on wooden floor. Bowl placed gently on shelf. Rain on window. No music.
+----------------------------------------
+----------------------------------------
+🆕 FRESH WHISK IMAGE (time has passed — bowl is now dry)
+----------------------------------------
+----------------------------------------
+WHISK IMAGE | A Ghibli-style 2D animation render. Close-up of a pale bone-dry tea bowl resting on a clean wooden worktable. [HANA]'s hand holds a very fine pointed brush loaded with deep cobalt blue pigment. The tip of the brush touches the bowl surface, beginning a tiny delicate cornflower petal. The brush bristles spread slightly under gentle pressure. Soft even studio light from above. No water, no clay — clean and precise. Soft diffused Ghibli lighting, quiet afternoon mood, warm earthy tones, hand-painted Ghibli texture.
+----------------------------------------
+----------------------------------------
+GROK VIDEO | Hana's fine brush tip touches the surface of the dry pale bowl. Deep cobalt blue pigment spreads slowly and beautifully into the clay — the color bleeding at the edges in a soft watercolor effect. She paints one small delicate cornflower petal at a time, each stroke slow and intentional. The brush makes a faint soft whisper sound against the dry surface. The flower takes shape gradually — fragile and handmade, perfectly imperfect. Soft diffused Ghibli lighting, overcast rainy afternoon mood, slow smooth motion, warm earthy tones, hand-painted animation texture, no sudden cuts or jumps.
+----------------------------------------
+----------------------------------------
+AUDIO DIRECT | AUDIO: Fine brush whisper on dry clay surface. Faint rain outside. Complete quiet otherwise. No music.
+----------------------------------------
+----------------------------------------
+🆕 FRESH WHISK IMAGE (new subject — kiln close-up)
+----------------------------------------
+----------------------------------------
+WHISK IMAGE | A Ghibli-style 2D animation render. Medium shot of a small round ceramic kiln in the corner of [THE STUDIO]. Its door is slightly open, revealing the painted tea bowl sitting inside bathed in deep amber and orange firelight. The kiln exterior glows warmly. Studio walls around it lit in orange and deep shadow. Rain visible through the window in the background, soft blue-grey contrast against the warm kiln light. Soft diffused Ghibli lighting, warm glowing mood, hand-painted Ghibli texture.
+----------------------------------------
+----------------------------------------
+GROK VIDEO | The kiln door closes with a soft gentle thud. Through the small kiln window, the painted bowl is visible inside, bathed in deep pulsing amber and orange firelight. The kiln exterior glows warmly. The glow intensifies slowly and rhythmically — a living warmth. Outside the studio window in the background, rain continues to fall in soft blue-grey sheets, creating a beautiful contrast of warm fire and cool rain. The kiln hums faintly. Soft diffused Ghibli lighting, overcast rainy afternoon mood, slow smooth motion, warm earthy tones, hand-painted animation texture, no sudden cuts or jumps.
+----------------------------------------
+----------------------------------------
+AUDIO DIRECT | AUDIO: Kiln door soft thud closing. Low kiln hum and heat. Rain outside window. No music.
+----------------------------------------
+----------------------------------------
+🆕 FRESH WHISK IMAGE (completely new object)
+----------------------------------------
+----------------------------------------
+WHISK IMAGE | A Ghibli-style 2D animation render. Close-up of a small black cast-iron kettle sitting on a portable ceramic stove. A thin wisp of white steam curls slowly from the spout. The kettle surface is slightly wet with condensation. The stove element glows faint orange beneath. Background is softly blurred wooden worktable and rainy window light. Cozy intimate framing. Soft diffused Ghibli lighting, overcast rainy mood, warm earthy tones, hand-painted Ghibli texture.
+----------------------------------------
+----------------------------------------
+GROK VIDEO | Steam begins to curl from the spout of the small black cast-iron kettle — thin at first, then thickening into soft billowing wisps that rise and dissolve into the air. The kettle produces a gentle building whistle that starts almost imperceptibly and grows into a soft clear tone. The sound blends seamlessly with the steady rain outside — two natural sounds in perfect harmony. Condensation glistens on the kettle surface. Soft diffused Ghibli lighting, overcast rainy afternoon mood, slow smooth motion, warm earthy tones, hand-painted animation texture, no sudden cuts or jumps.
+----------------------------------------
+----------------------------------------
+AUDIO DIRECT | AUDIO: Kettle building soft whistle blending with steady rain outside. Steam hiss. No music.
+----------------------------------------
+----------------------------------------
+🆕 FRESH WHISK IMAGE → 🔗 CHAIN STARTS HERE
+----------------------------------------
+----------------------------------------
+WHISK IMAGE | A Ghibli-style 2D animation render. Close-up of the finished glazed tea bowl resting on a small wooden tray. The bowl is now beautifully glazed — pale cream with a tiny hand-painted blue cornflower. [HANA]'s hands hold a small ceramic teapot tilted gently above the bowl. A thin stream of deep green tea pours gracefully into the bowl. Steam rises immediately. The bowl surface reflects soft warm light. Soft diffused Ghibli lighting, peaceful afternoon mood, warm earthy tones, hand-painted Ghibli texture.
+----------------------------------------
+----------------------------------------
+GROK VIDEO | Hana tilts the small ceramic teapot slowly above the finished glazed bowl. A thin graceful stream of deep green tea falls in a perfect arc into the bowl below. The tea swirls gently on impact — a beautiful spiral of green against pale cream. Steam rises immediately in soft delicate wisps toward the camera. A quiet satisfying sound accompanies each pour. The tiny blue cornflower on the bowl's side is now visible beneath the rising steam. Soft diffused Ghibli lighting, overcast rainy afternoon mood, slow smooth motion, warm earthy tones, hand-painted animation texture, no sudden cuts or jumps.
+----------------------------------------
+----------------------------------------
+AUDIO DIRECT | AUDIO: Gentle tea pouring glug-glug sound. Steam rising. Rain soft in background. No music.
+----------------------------------------
+----------------------------------------
+🔗 CHAIN — Use last frame of Scene 11
+----------------------------------------
+----------------------------------------
+WHISK IMAGE | BACKUP ONLY — A Ghibli-style 2D animation render. Wide shot from slightly behind and above [HANA] as she sits on a small wooden stool near the large studio window. She holds the glazed tea bowl with both hands close to her chest. Her posture is relaxed, shoulders slightly dropped in peace. Outside the window, soft rain falls over a lush blurred green garden. The studio behind her is dim and warm. She is small against the large window. Soft diffused Ghibli lighting, overcast rainy mood, warm earthy tones, hand-painted Ghibli texture, cinematic wide framing.
+----------------------------------------
+----------------------------------------
+GROK VIDEO | Hana raises the warm glazed bowl slowly to her lips and takes one long quiet sip. Her shoulders drop slightly — a small release of peace. The camera pulls back extremely slowly and imperceptibly, widening the frame to reveal the full studio behind her and the rain-filled garden beyond the window. The studio light dims gradually as if the afternoon is fading. Only the gentle rain, the faint warmth of the kiln, and her calm quiet breathing remain. Soft diffused Ghibli lighting, overcast rainy afternoon mood, slow smooth motion, warm earthy tones, hand-painted animation texture, no sudden cuts or jumps.
+----------------------------------------
+----------------------------------------
+AUDIO DIRECT | AUDIO: One quiet sip. Slow calm breathing. Gentle rain on window. Fading into silence. No music.
+----------------------------------------

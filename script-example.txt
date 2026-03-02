@@ -1,0 +1,85 @@
+THE RAINY DAY BOWL
+A Ghibli-Style Cinematic Short
+Complete Production Script  •  Whisk + Grok Imagine Pipeline
+
+STEP 1 — MASTER CHARACTER PROMPTS
+[HANA]
+
+[THE STUDIO]
+
+
+PIPELINE SUMMARY — ALL 12 SCENES
+
+
+CHAIN GROUPS
+
+
+STEP 2 — 12-SCENE CINEMATIC BREAKDOWN
+
+SCENE 1  RAINDROPS ON GLASS
+
+
+
+
+SCENE 2  A QUIET STUDIO
+
+
+
+
+SCENE 3  THE SOFT CLAY
+
+
+
+
+SCENE 4  THE SPINNING WHEEL
+
+
+
+
+SCENE 5  SHAPING THE CURVE
+
+
+
+
+SCENE 6  THE FINISHING TOUCH
+
+
+
+
+SCENE 7  SETTING THE BOWL TO REST
+
+
+
+
+SCENE 8  PAINTING A FLOWER
+
+
+
+
+SCENE 9  THE WARM KILN
+
+
+
+
+SCENE 10  THE WHISTLING KETTLE
+
+
+
+
+SCENE 11  THE FIRST POUR
+
+
+
+
+SCENE 12  PEACE IN THE RAIN
+
+
+
+
+PRODUCTION NOTES
+Audio Strategy:  Use Grok's built-in audio when correct (rain, ASMR, SFX). Mute and use TTS fallback only if Grok generates wrong music or sounds.
+Chain Rule:  Generate Whisk image once per chain start. Extract last frame after each clip. Feed last frame as input image to next clip in chain. Reset to Whisk image only when scene/subject changes.
+Whisk Tip:  For Scenes 4, 8, and 11 — generate 3 variations in Whisk and pick the best before sending to Grok. These are chain-starting images and must be perfect.
+Backup Images:  Scenes 5, 6, 7, and 12 have backup Whisk prompts. Use them only if the chain fails or produces inconsistent results.
+
+Generated with Claude — Ghibli Story Pipeline v1.0

@@ -71,7 +71,9 @@ class PromptBuilder:
         emotion: str = "neutrally",
         grok_video_prompt: Optional[dict] = None,
         sfx: Optional[list[str]] = None,
-        music_notes: Optional[str] = None
+        music_notes: Optional[str] = None,
+        style_consistency_tag: Optional[str] = None,
+        audio_directive: Optional[str] = None
     ) -> str:
         """
         Builds the prompt in the "Director's Script" format for Grok Imagine 1.0.
@@ -158,7 +160,15 @@ class PromptBuilder:
 
         # Final assembly
         final_prompt = base_prompt.strip()
-        if audio_block: final_prompt += audio_block
+        
+        if style_consistency_tag:
+            final_prompt += f" {style_consistency_tag}"
+            
+        if audio_block:
+            final_prompt += audio_block
+        elif audio_directive and "AUDIO:" not in final_prompt:
+            final_prompt += f" AUDIO: {audio_directive}"
+            
         if sfx_block: final_prompt += sfx_block
         
         # Ensure it starts with the duration if not present (e.g. "6s: ")
@@ -499,7 +509,9 @@ async def generate_single_clip(
     external_page: Optional[Page] = None,
     grok_video_prompt: Optional[dict] = None,
     sfx: Optional[list[str]] = None,
-    music_notes: Optional[str] = None
+    music_notes: Optional[str] = None,
+    style_consistency_tag: Optional[str] = None,
+    audio_directive: Optional[str] = None
 ) -> Path:
     browser = None
     pw = None
@@ -558,7 +570,9 @@ async def generate_single_clip(
                 character_name=character_name, emotion=emotion, sound_effect=sound_effect,
                 grok_video_prompt=grok_video_prompt,
                 sfx=sfx,
-                music_notes=music_notes
+                music_notes=music_notes,
+                style_consistency_tag=style_consistency_tag,
+                audio_directive=audio_directive
             )
             print(f"\n🚀 FULL GROK PROMPT:\n{prompt}\n")
             
@@ -919,7 +933,9 @@ class GrokAnimator:
         emotion: str = "neutrally",
         grok_video_prompt: Optional[dict] = None,
         sfx: Optional[list[str]] = None,
-        music_notes: Optional[str] = None
+        music_notes: Optional[str] = None,
+        style_consistency_tag: Optional[str] = None,
+        audio_directive: Optional[str] = None
     ) -> Path:
         """
         Animate an image using Grok Imagine with full serialization.
@@ -957,7 +973,9 @@ class GrokAnimator:
                         external_page=page, # Pass the active page
                         grok_video_prompt=grok_video_prompt,
                         sfx=sfx,
-                        music_notes=music_notes
+                        music_notes=music_notes,
+                        style_consistency_tag=style_consistency_tag,
+                        audio_directive=audio_directive
                     )
                     
                     # Validation: Check if file actually exists and has size
