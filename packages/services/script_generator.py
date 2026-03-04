@@ -84,6 +84,10 @@ class SceneBreakdown(BaseModel):
     sfx: Optional[list[str]] = None
     music_notes: Optional[str] = None
     text_to_audio_prompt: Optional[str] = None
+    
+    # New: Voiceover & Duration Config (v2 script format)
+    voiceover: str = ""  # Narrator voiceover text (separate from dialogue)
+    duration_config: Optional[dict] = None  # {clip_duration, needs_extend, extend_duration, total_clip_time}
 
 
 class YouTubeVideoSettings(BaseModel):
@@ -960,41 +964,42 @@ For EACH scene, you MUST extract these fields SEPARATELY:
 | Field | What to Look For | Examples |
 |-------|------------------|----------|
 | **text_to_image_prompt** | Visual/image description | "Text to Image Prompt:", "Visual:", "Image:", "Setting:", "Description:" |
-| **image_to_video_prompt** | Motion/animation description | "Text to Video Prompt:", "Motion:", "Animation:", "Action:", "Movement:" |
-| **dialogue** | Speech, audio, sound effects | "Dialog:", "Dialogue:", "Audio:", "Voiceover:", "VO:", "SFX:", "(spoken)" |
+| **image_to_video_prompt** | Motion/animation description. MUST include the Dialogue EXACTLY as it appears. | "Text to Video Prompt:", "Motion:", "Animation:", "Action:", "Dialogue:" |
+| **voiceover** | Narrator speech, separate from character dialogue | "Voiceover:", "VO:", "Narration:", "Narrator:" |
+| **dialogue** | Leave empty unless specifically requested | "" |
 | **camera_angle** | Shot type/camera info | "Shot Type:", "Short Type:", "Shot:", "Camera:", "Angle:", or embedded like "Medium shot of..." |
 
 CRITICAL RULES FOR SCENE EXTRACTION:
 1. **SEPARATE the fields** - Do NOT combine text_to_image_prompt with image_to_video_prompt
 2. If you see "Text to Image Prompt:" - extract ONLY that content for text_to_image_prompt
-3. If you see "Text to Video Prompt:" - extract ONLY that content for image_to_video_prompt  
+3. **DO NOT REMOVE DIALOGUE FROM THE VIDEO PROMPT**. If there is "Dialogue: 'Hi'", keep it inside `image_to_video_prompt`.
 4. Look for shot type at START of visual descriptions (e.g., "Wide shot of...", "Close-up of...")
 5. Extract EVERY scene, even if there are 10, 12, or more scenes
 6. Copy text EXACTLY as written (preserve the original wording)
 
 ### TASK 3: GENERATE YOUTUBE UPLOAD DATA
 Even if not in the script, you MUST generate a 'youtube_upload' object based on the script's content:
-- **video_settings**: {category: "Film & Animation", privacy: "public", made_for_kids: false}
-- **titles**: {primary: "Viral Clickbait Title", alternatives: ["Alt 1", "Alt 2"]}
+- **video_settings**: {{category: "Film & Animation", privacy: "public", made_for_kids: false}}
+- **titles**: {{primary: "Viral Clickbait Title", alternatives: ["Alt 1", "Alt 2"]}}
 - **description**: Engaging description with Hook, Story Summary, and Hashtags.
 - **tags**: [List of 20+ viral tags related to the niche/story]
-- **thumbnail**: {text: "Compelling Overlay Text", elements: ["Visual Element 1", "Visual Element 2"]}
-- **engagement**: {pinned_comment: "Engagement question?", reply_templates: {...}}
-- **community_posts**: {pre_launch: {...}, post_launch: {...}}
-- **analytics_targets**: {first_24_hours: {views: 1000, ...}}
+- **thumbnail**: {{text: "Compelling Overlay Text", elements: ["Visual Element 1", "Visual Element 2"]}}
+- **engagement**: {{pinned_comment: "Engagement question?", reply_templates: {{...}}}}
+- **community_posts**: {{pre_launch: {{...}}, post_launch: {{...}}}}
+- **analytics_targets**: {{first_24_hours: {{views: 1000, ...}}}}
 
 ### TASK 4: GENERATE FINAL ASSEMBLY DATA
 Even if not in the script, you MUST generate a 'final_assembly' object for post-production:
 - **total_clips**: Count of scenes extracted
-- **soundtrack**: {
+- **soundtrack**: {{
     background_music: "Description of music vibe (e.g. Dark Horror, Upbeat)",
     music_timing: "Specific timing (e.g. 'Build up (Sc 1-3) -> Climax (Sc 10)')", 
     sfx_mixing: "Audio mixing instructions"
-  }
-- **transitions**: {type: "mix/cut", duration: "0.5s", effects: "..."}
-- **color_grading**: {overall_look: "Visual style", consistency: "..."}
-- **title_cards**: {opening: "Title", closing: "CTA"}
-- **youtube_optimization**: {format: "9:16", hook: "...", pacing: "...", ending: "..."}
+  }}
+- **transitions**: {{type: "mix/cut", duration: "0.5s", effects: "..."}}
+- **color_grading**: {{overall_look: "Visual style", consistency: "..."}}
+- **title_cards**: {{opening: "Title", closing: "CTA"}}
+- **youtube_optimization**: {{format: "9:16", hook: "...", pacing: "...", ending: "..."}}
 
 ### OUTPUT FORMAT (STRICT JSON):
 Return ONLY this JSON structure, nothing else:
@@ -1011,10 +1016,11 @@ Return ONLY this JSON structure, nothing else:
       "scene_number": 1,
       "scene_title": "Scene title if any",
       "text_to_image_prompt": "ONLY the visual/image description",
-      "image_to_video_prompt": "ONLY the motion/animation description", 
-      "dialogue": "Speech, voiceover, or audio cues",
+      "image_to_video_prompt": "ONLY the motion/animation description, ENSURE YOU KEEP THE DIALOGUE HERE exactly as written", 
+      "voiceover_text": "Narrator speech or voiceover",
+      "voiceover": "Same as voiceover_text",
+      "dialogue": "",
       "camera_angle": "Wide Shot, Medium Shot, Close-up, etc.",
-      "voiceover_text": "Same as dialogue",
       "motion_description": "Same as image_to_video_prompt",
       "character_pose_prompt": "Same as text_to_image_prompt",
       "duration_in_seconds": 5
@@ -1044,6 +1050,7 @@ Return ONLY this JSON structure, nothing else:
 - Extract ALL characters (look for 3+)
 - Extract ALL scenes (look for 10+)
 - Keep fields SEPARATE (don't mix image and video prompts)
+- ALWAYS KEEP DIALOGUE INSIDE `image_to_video_prompt`. Do not put it in the `dialogue` field.
 - If a field is not found, use empty string ""
 - Preserve original text exactly as written
 """
@@ -1195,9 +1202,10 @@ OUTPUT JSON FORMAT:
     {{
       "scene_number": 1,
       "text_to_image_prompt": "...",
-      "image_to_video_prompt": "...",
-      "dialogue": "...",
-      "voiceover_text": "...",
+      "image_to_video_prompt": "Include motion AND keep the dialogue here exactly as written",
+      "voiceover": "Narrator speech",
+      "dialogue": "",
+      "voiceover_text": "Same as voiceover",
       "camera_angle": "Medium Shot",
       "duration_in_seconds": 5
     }}
@@ -1307,12 +1315,16 @@ OUTPUT JSON FORMAT:
                 print("DEBUG: Detecting Format 3 ([NAME])")
                 # Pattern: [NAME] optional dash/text ... content ... until next [
                 # Refined: Capture same-line content too if it's there
-                bracket_iter = re.finditer(r'(?:^|\n)\s*\[([A-Z0-9\s_\-]+)\]\s*[:\-\–\—]?\s*(.*?)(?=(?:\n\s*\[|MATCH END|SCENE|$))', bio_text, re.DOTALL)
+                bracket_iter = re.finditer(r'(?:^|\n)\s*\[([^]]+)\]\s*[:\-\–\—]?\s*(.*?)(?=(?:\n\s*\[|MATCH END|SCENE|$))', bio_text, re.DOTALL)
                 
                 found_any = False
                 for m in bracket_iter:
                     name_raw = m.group(1).strip()
                     content = m.group(2).strip()
+                    # Clean up bold syntax if it leaked out
+                    name_raw = name_raw.replace('**', '')
+                    content = content.replace('**', '').strip()
+                    
                     print(f"DEBUG: Found Bracket Char: {name_raw}")
                     
                     if name_raw and content:
@@ -1601,7 +1613,7 @@ OUTPUT JSON FORMAT:
                     # 1. Image Prompt
                     # Matches: "(Text-to-Image): ...", "Text-to-Image Prompt: ...", "Image Prompt: ..."
                     img_match = re.search(
-                        r'(?:(?:\(|\[)?(?:Text-to-Image|Text to Image|Image Prompt)(?:\)|\])?(?:\s*Prompt)?\s*:)\s*(.*?)(?=(?:\n\s*(?:\(|\[)?(?:Image-to-Video|Text-to-Video|Sound|AI News|Dialog|Scene)|$))', 
+                        r'(?:(?:\(|\[)?(?:Text-to-Image|Text to Image|Image Prompt)(?:\)|\])?(?:\s*Prompt)?\s*:)\s*(.*?)(?=(?:\n\s*(?:\(|\[)?(?:Image-to-Video|Text-to-Video|Sound|AI News|Dialog|Scene|Voiceover|Narration)|$))', 
                         block, re.DOTALL | re.IGNORECASE
                     )
                     img_prompt = img_match.group(1).strip() if img_match else ""
@@ -1609,7 +1621,7 @@ OUTPUT JSON FORMAT:
                     # 2. Video/Motion Prompt
                     # Matches: "(Image-to-Video): ...", "Text-to-Video Prompt: ...", "Video Prompt: ..."
                     vid_match = re.search(
-                        r'(?:(?:\(|\[)?(?:Image-to-Video|Text-to-Video|Text to Video|Video Prompt)(?:\)|\])?(?:\s*Prompt)?\s*:)\s*(.*?)(?=(?:\n\s*(?:\(|\[)?(?:Text-to-Image|Sound|AI News|Dialog|Scene)|$))', 
+                        r'(?:(?:\(|\[)?(?:Image-to-Video|Text-to-Video|Text to Video|Video Prompt)(?:\)|\])?(?:\s*Prompt)?\s*:)\s*(.*?)(?=(?:\n\s*(?:\(|\[)?(?:Text-to-Image|Sound|AI News|Scene|Voiceover|Narration)|$))', 
                         block, re.DOTALL | re.IGNORECASE
                     )
                     vid_prompt = vid_match.group(1).strip() if vid_match else ""
@@ -1618,7 +1630,7 @@ OUTPUT JSON FORMAT:
                     # Matches: "AI News Line:", "Dialog:", "Dialogue:", "Voiceover:"
                     # Handles multi-line values until the next keyword or end of block
                     dial_match = re.search(
-                        r'(?:(?:AI News Line|Dialog|Dialogue|Voiceover|Audio)(?:\s*Line)?\s*:)\s*(.*?)(?=(?:\n\s*(?:\(|\[)?(?:Text-to-Image|Image-to-Video|Sound|Scene)|$))', 
+                        r'(?:(?:AI News Line|Dialog|Dialogue|Audio)(?:\s*Line)?\s*:)\s*(.*?)(?=(?:\n\s*(?:\(|\[|\*\*)?(?:Text-to-Image|Image-to-Video|Sound|Scene|Voiceover|Narration)|$))', 
                         block, re.DOTALL | re.IGNORECASE
                     )
                     dialogue_raw = dial_match.group(1).strip() if dial_match else ""
@@ -1644,6 +1656,59 @@ OUTPUT JSON FORMAT:
                          # Usually we only want spoken audio in 'voiceover_text'
                          pass
 
+                    # 6. Voiceover (New v2 format)
+                    # Matches: "**Voiceover:**", "Voiceover:", etc.
+                    vo_match = re.search(
+                        r'(?:\*\*)?(?:Voiceover|Voice[\s-]?over|Narration|Narrator)(?:\*\*)?\s*:\s*(.*?)(?=(?:\n\s*(?:\(|\[|\*\*)?(?:Text-to-Image|Image-to-Video|Sound|Dialog|Dialogue|Audio|Scene|Emotion|Duration)|$))', 
+                        block, re.DOTALL | re.IGNORECASE
+                    )
+                    has_vo_field = bool(vo_match)
+                    voiceover_raw = vo_match.group(1).strip() if vo_match else ""
+                    
+                    # Normalize "no voiceover" / "none" to empty string
+                    is_none_vo = voiceover_raw.lower() in ["no voiceover", "none", "no voiceover.", "n/a", "-", "—"]
+                    if is_none_vo:
+                        voiceover_raw = ""
+
+                    # --- DECIDE TTS CONTENT (voiceover_text) ---
+                    # Priority logic:
+                    # 1. If Voiceover field is present:
+                    #    - If it's "none", TTS is silent (Explicit request).
+                    #    - If it has text, TTS uses that text.
+                    # 2. If Voiceover field is MISSING:
+                    #    - Fallback to Dialogue (Backward compatibility / Animated Storybook Mode)
+                    
+                    final_tts_text = ""
+                    if has_vo_field:
+                        if is_none_vo:
+                            final_tts_text = ""
+                        else:
+                            final_tts_text = voiceover_raw
+                    else:
+                        # Fallback to dialogue if no voiceover field exists
+                        final_tts_text = clean_audio
+                    
+                    # 7. Detect dialogue inside image_to_video_prompt (New v2 format)
+                    # Pattern: "Dialogue: 'text'" or 'Dialogue: "text"' within vid_prompt
+                    dialogue_in_prompt = ""
+                    if vid_prompt:
+                        dial_in_vid = re.search(
+                            r'Dialogue\s*:\s*["\']?(.*?)(?:["\']?\s*$|["\']?\s*\.?\s*$)',
+                            vid_prompt, re.DOTALL | re.IGNORECASE
+                        )
+                        if dial_in_vid:
+                            dialogue_in_prompt = dial_in_vid.group(1).strip().strip('"').strip("'")
+                            # Check for "No Dialogue" / "no dialogue"
+                            if dialogue_in_prompt.lower() in ["no dialogue", "no dialogue.", "none", ""]:
+                                dialogue_in_prompt = ""
+                            
+                            # CRITICAL FIX: DO NOT REMOVE DIALOGUE FROM THE VIDEO PROMPT.
+                            # We want the video generation API to process the dialogue as part of the prompt.
+                            
+                    # Use dialogue from prompt if we don't already have one from the dedicated field
+                    if dialogue_in_prompt and not clean_audio:
+                        clean_audio = dialogue_in_prompt
+
                     # Shot Type Inference
                     shot_type = "Medium Shot"
                     if "close-up" in img_prompt.lower(): shot_type = "Close-up"
@@ -1653,14 +1718,14 @@ OUTPUT JSON FORMAT:
                     print(f"   📦 Scene {s_num}: {scene_title[:30]}...")
                     print(f"      📷 Text-to-Image: {img_prompt[:60]}...")
                     print(f"      🎬 Text-to-Video: {vid_prompt[:60]}...")
-                    print(f"      🎤 Dialog/News: {clean_audio[:40]}...")
-                    print(f"      🔊 SFX: {sfx[:40]}...")
-                    print(f"      😊 Emotion: {emotion[:40]}...")
+                    print(f"      🎤 Dialogue: {clean_audio[:40]}...")
+                    print(f"      🗣️ Voiceover: {voiceover_raw[:40]} (TTS: {len(final_tts_text)} chars)")
+                    print(f"      🔊 SFX: {sfx[:40]} | 😊 Emotion: {emotion[:40]}")
                     
                     scenes.append(SceneBreakdown(
                         scene_number=s_num,
                         scene_title=scene_title,
-                        voiceover_text=clean_audio if "(SFX" not in dialogue_raw else "",
+                        voiceover_text=final_tts_text,
                         character_pose_prompt=img_prompt[:1000], 
                         text_to_image_prompt=img_prompt,
                         image_to_video_prompt=vid_prompt,
@@ -1670,7 +1735,8 @@ OUTPUT JSON FORMAT:
                         dialogue=clean_audio if "(SFX" not in dialogue_raw else None,
                         sound_effect=sfx,
                         emotion=emotion,
-                        duration_in_seconds=5
+                        duration_in_seconds=5,
+                        voiceover=voiceover_raw,
                     ))
                     found_scenes += 1
                 except Exception as ex:
@@ -1688,6 +1754,132 @@ OUTPUT JSON FORMAT:
             logger.error("🛑 [PARSER] No scenes found in script breakdown. Automation will likely fail.")
             
         return TechnicalBreakdownOutput(characters=characters, scenes=scenes)
+
+    async def _call_hf_completion(self, prompt: str) -> str:
+        """Call Hugging Face Inference API for chat completion."""
+        from huggingface_hub import InferenceClient
+        import os
+        import asyncio
+        
+        hf_token = os.getenv("HF_TOKEN")
+        if not hf_token:
+            raise ValueError("HF_TOKEN not found in environment")
+            
+        # Using a reliable instruction tuned model
+        client = InferenceClient(
+            model="meta-llama/Llama-3.3-70B-Instruct",
+            token=hf_token
+        )
+        
+        loop = asyncio.get_event_loop()
+        def _make_call():
+            response = client.chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=2000,
+                temperature=0.3
+            )
+            return response.choices[0].message.content
+
+        return await loop.run_in_executor(None, _make_call)
+
+    async def compute_scene_durations(self, scenes: list[dict]) -> list[dict]:
+        """
+        Use LLM (HF first, Gemini fallback) to compute the required video duration 
+        for each scene based on its voiceover or dialogue length.
+        Rules:
+        - Voiceover length <= 15 words -> 6s
+        - Voiceover length 16-40 words -> 10s
+        - Voiceover length 41-70 words -> 10s + 6s extend (max 16s)
+        - If no voiceover, use dialogue length instead
+        - If no voiceover and no dialogue, default to 6s
+        """
+        print("⏱️ Computing optimal scene durations using LLM...")
+        
+        # Build prompt payload
+        scene_texts = []
+        for s in scenes:
+            vo = s.get('voiceover_text') or s.get('voiceover', '')
+            dialogue = s.get('dialogue', '')
+            # Fallback to dialogue if no voiceover
+            text_to_analyze = vo if vo and vo.strip() else dialogue
+            scene_texts.append({
+                "scene_number": s.get('scene_number', 1),
+                "text_to_analyze": text_to_analyze.strip()
+            })
+            
+        prompt = f"""You are a video editor AI. Compute the required video clip duration for each scene based on its spoken text length (voiceover or dialogue).
+
+RULES:
+- If text is empty or very short (<= 15 words) -> "5s" clip, needs_extend=false
+- If text is medium (16-40 words) -> "10s" clip, needs_extend=false
+- If text is long (41-70 words) -> "10s" clip, needs_extend=true, extend_duration="5s" (Total ~15s max)
+
+SCENES TO ANALYZE:
+---
+{json.dumps(scene_texts, indent=2)}
+---
+
+OUTPUT STRICT JSON FORMAT ONLY:
+```json
+{{
+  "durations": [
+    {{
+      "scene_number": 1,
+      "clip_duration": "5s",
+      "needs_extend": false,
+      "extend_duration": null,
+      "total_clip_time": 5
+    }}
+  ]
+}}
+```"""
+        
+        try:
+            # 1. Try Hugging Face first
+            response_text = await self._call_hf_completion(prompt)
+            clean_text = self._clean_json_text(response_text)
+            data = json.loads(clean_text)
+            durations = data.get("durations", [])
+            print(f"   ✅ Computed durations via HuggingFace for {len(durations)} scenes.")
+        except Exception as e:
+            print(f"   ⚠️ HuggingFace failed for durations: {e}. Falling back to Gemini...")
+            try:
+                # 2. Try Gemini fallback
+                response_text = await self._call_gemini(prompt)
+                clean_text = self._clean_json_text(response_text)
+                data = json.loads(clean_text)
+                durations = data.get("durations", [])
+                print(f"   ✅ Computed durations via Gemini for {len(durations)} scenes.")
+            except Exception as e2:
+                print(f"   ❌ Both LLMs failed for duration computation: {e2}. Using safe defaults.")
+                # Safe default fallback
+                durations = []
+                for st in scene_texts:
+                    durations.append({
+                        "scene_number": st["scene_number"],
+                        "clip_duration": "10s",
+                        "needs_extend": False,
+                        "extend_duration": None,
+                        "total_clip_time": 10
+                    })
+
+        # Map back to scenes list
+        for scene in scenes:
+            s_num = scene.get('scene_number')
+            match = next((d for d in durations if d.get('scene_number') == s_num), None)
+            if match:
+                scene['duration_config'] = match
+                scene['duration_in_seconds'] = match.get('total_clip_time', 10)
+            else:
+                scene['duration_config'] = {
+                    "clip_duration": "10s",
+                    "needs_extend": False,
+                    "extend_duration": None,
+                    "total_clip_time": 10
+                }
+                scene['duration_in_seconds'] = 10
+                
+        return scenes
 
     async def generate_viral_thumbnail_prompt(self, script_context: str, niche: str = "general") -> str:
         """

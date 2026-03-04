@@ -113,6 +113,7 @@ class FFmpegVideoEditor:
         
         for i, clip in enumerate(valid_clips):
             target_dur = target_durations[i] if target_durations and i < len(target_durations) else durations[i]
+            target_dur = round(target_dur, 3)
             durations[i] = target_dur # Actual duration we use
             
             # Input: Loop infinitely
@@ -129,7 +130,7 @@ class FFmpegVideoEditor:
             # Audio Graph: Resample -> Fade -> Delay
             # We delay each clip by its start time in the master timeline
             # StartTime(i) = Sum(D_k for k<i) - i * Fade
-            delay_ms = int(cumulative_offset * 1000)
+            delay_ms = int(round(cumulative_offset, 3) * 1000)
             
             # Check if audio stream exists for the current clip
             try:
@@ -140,12 +141,12 @@ class FFmpegVideoEditor:
 
             if has_audio_stream:
                 f_in = f"afade=t=in:st=0:d={fade_duration}," if i > 0 else ""
-                f_out = f"afade=t=out:st={target_dur - fade_duration}:d={fade_duration}," if i < (count - 1) else ""
+                f_out = f"afade=t=out:st={round(target_dur - fade_duration, 3)}:d={fade_duration}," if i < (count - 1) else ""
                 
                 a_label = f"async{i}"
                 filter_parts.append(
-                    f"[{i}:a]aresample=44100,{f_in}{f_out}volume={0.10 if mute_audio else 1.0},"
-                    f"adelay={delay_ms}|{delay_ms},atrim=duration={cumulative_offset + target_dur},asetpts=PTS-STARTPTS[{a_label}]"
+                    f"[{i}:a]aresample=44100,{f_in}{f_out}volume={0.23 if mute_audio else 1.0},"
+                    f"adelay={delay_ms}|{delay_ms},atrim=duration={round(cumulative_offset + target_dur, 3)},asetpts=PTS-STARTPTS[{a_label}]"
                 )
                 a_labels.append(f"[{a_label}]")
             else:
@@ -153,18 +154,18 @@ class FFmpegVideoEditor:
                 a_label = f"async{i}"
                 filter_parts.append(
                     f"anullsrc=r=44100:cl=stereo:d={target_dur}[a_null{i}];"
-                    f"[a_null{i}]adelay={delay_ms}|{delay_ms},atrim=duration={cumulative_offset + target_dur},asetpts=PTS-STARTPTS[{a_label}]"
+                    f"[a_null{i}]adelay={delay_ms}|{delay_ms},atrim=duration={round(cumulative_offset + target_dur, 3)},asetpts=PTS-STARTPTS[{a_label}]"
                 )
                 a_labels.append(f"[{a_label}]")
             
             # Update offset for NEXT clip
-            cumulative_offset += target_dur - fade_duration
+            cumulative_offset = round(cumulative_offset + target_dur - fade_duration, 3)
 
         # 3. Join Video via XFade (Still sequential, but cleaner)
         current_v = v_labels[0]
         v_offset = 0.0
         for i in range(count - 1):
-            v_offset += durations[i] - fade_duration
+            v_offset = round(v_offset + durations[i] - fade_duration, 3)
             out_v = f"v_xfade{i}"
             filter_parts.append(
                 f"{current_v}{v_labels[i+1]}xfade=transition=fade:duration={fade_duration}:offset={v_offset}[{out_v}]"
@@ -517,9 +518,11 @@ class FFmpegVideoEditor:
         
         if has_audio:
             # Normalize both inputs to 44.1kHz Stereo to prevent mixing errors
+            # [0:a] is the video audio (Grok SFX/BGM) -> Duct it heavily to 23% volume
+            # [1:a] is the music track (ElevenLabs +/- BGM) -> Set to requested music_volume
             filter_complex = (
                 f"[1:a]aresample=44100,aformat=channel_layouts=stereo,volume={music_volume}[music];"
-                f"[0:a]aresample=44100,aformat=channel_layouts=stereo[vid_a];"
+                f"[0:a]aresample=44100,aformat=channel_layouts=stereo,volume=0.23[vid_a];"
                 # CRITICAL: normalize=0 prevents main audio from being dropped to 50%
                 f"[vid_a][music]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[aout]"
             )
@@ -579,48 +582,78 @@ class FFmpegVideoEditor:
         audio_paths: list[Path],
         bg_music_path: Optional[Path],
         output_path: Path,
-        scene_interval: float = 9.7
+        scene_interval: float = 9.7,
+        target_durations: Optional[list[float]] = None,
+        fade_duration: float = 0.4
     ) -> Path:
         """Mix multiple audio files sequentially (no overlap) and optional background music."""
-        if not audio_paths:
-            raise ValueError("No audio files provided")
-
         import subprocess
         import ffmpeg
         
         # 1. Pad audio sequentially without overlaps
         padded_paths = []
-        for i, audio in enumerate(audio_paths):
+        
+        # We assume audio_paths matches target_durations conceptually.
+        # If main.py passes [Audio1, None, Audio3], we align them.
+        for i in range(len(target_durations) if target_durations else len(audio_paths)):
+            audio = audio_paths[i] if i < len(audio_paths) else None
             padded_out = self.output_dir / f"padded_narration_{i:03d}.mp3"
             
-            # Check duration
-            try:
-                probe = ffmpeg.probe(str(audio), cmd=self.ffprobe_cmd)
-                duration = float(probe['streams'][0]['duration'])
-            except Exception as e:
-                logger.warning(f"⚠️ Could not probe audio {audio}, assuming 0s: {e}")
-                duration = 0.0
+            # Determine how much timeline space this clip gets
+            # If target_durations is provided, the space before the NEXT clip starts is (target_dur - fade_duration)
+            if target_durations and i < len(target_durations):
+                interval = target_durations[i] - fade_duration
+            else:
+                interval = scene_interval
+
+            # Duration of current audio
+            duration = 0.0
+            if audio:
+                try:
+                    probe = ffmpeg.probe(str(audio), cmd=self.ffprobe_cmd)
+                    duration = float(probe['streams'][0]['duration'])
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not probe audio {audio}, assuming 0s: {e}")
+                    duration = 0.0
             
-            if duration < scene_interval:
+            if not audio or duration < (interval - 0.005):
                 # Pad with exact silence amount needed
-                pad_amount = scene_interval - duration
-                cmd = [
-                    self.ffmpeg_cmd, '-y',
-                    '-i', str(audio),
-                    '-f', 'lavfi', '-i', f'anullsrc=r=44100:cl=stereo:d={pad_amount}',
-                    '-filter_complex', '[0:a][1:a]concat=n=2:v=0:a=1[aout]',
-                    '-map', '[aout]',
-                    '-c:a', 'libmp3lame', '-q:a', '2',
-                    str(padded_out)
-                ]
+                # Round to 3 decimal places to avoid scientific notation like 8.88e-16 which crashes FFmpeg
+                pad_amount = round(interval - duration, 3)
+                interval_str = str(round(interval, 3))
+                
+                if pad_amount <= 0.001 and audio:
+                    padded_paths.append(audio)
+                    continue
+
+                # If audio exists, concat it with silence. If not, just silence.
+                if audio:
+                    cmd = [
+                        self.ffmpeg_cmd, '-y',
+                        '-i', str(audio),
+                        '-f', 'lavfi', '-i', f'anullsrc=r=44100:cl=stereo:d={pad_amount}',
+                        '-filter_complex', '[0:a][1:a]concat=n=2:v=0:a=1[aout]',
+                        '-map', '[aout]',
+                        '-c:a', 'libmp3lame', '-q:a', '2',
+                        str(padded_out)
+                    ]
+                else:
+                    cmd = [
+                        self.ffmpeg_cmd, '-y',
+                        '-f', 'lavfi', '-i', f'anullsrc=r=44100:cl=stereo:d={interval_str}',
+                        '-map', '0:a',
+                        '-c:a', 'libmp3lame', '-q:a', '2',
+                        str(padded_out)
+                    ]
+                    
                 try:
                     subprocess.run(cmd, check=True, capture_output=True)
                     padded_paths.append(padded_out)
                 except subprocess.CalledProcessError as e:
-                    logger.error(f"❌ Padding failed for {audio}: {e.stderr.decode('utf-8')}")
-                    padded_paths.append(audio) # Fallback to original
+                    logger.error(f"❌ Padding failed for scene {i}: {e.stderr.decode('utf-8')}")
+                    if audio: padded_paths.append(audio) 
             else:
-                # Keep as-is if it's longer to avoid words being cut off
+                # Keep as-is if it's longer
                 padded_paths.append(audio)
         
         # 2. Sequential Concatenation

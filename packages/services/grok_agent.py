@@ -175,7 +175,8 @@ class VideoSettings:
     """Detect and select duration/aspect ratio before generation."""
     
     DURATION_SELECTORS = {
-        "6s": ["[data-duration='6']", "button:has-text('6s')", ".duration-6"],
+        "5s": ["[data-duration='5']", "button:has-text('5s')", ".duration-5", "[data-duration='6']", "button:has-text('6s')", ".duration-6"],
+        "6s": ["[data-duration='5']", "button:has-text('5s')", ".duration-5", "[data-duration='6']", "button:has-text('6s')", ".duration-6"],
         "10s": ["[data-duration='10']", "button:has-text('10s')", ".duration-10"],
     }
     
@@ -327,7 +328,7 @@ class VideoSettings:
             import ffmpeg
             probe = ffmpeg.probe(str(clip_path))
             actual = float(probe['streams'][0]['duration'])
-            tolerance = 0.5  # 500ms tolerance
+            tolerance = 1.5  # 1.5s tolerance because AI generators are imprecise
             
             if abs(actual - expected_duration) > tolerance:
                 logger.warning(f"⚠️ Duration mismatch: expected {expected_duration}s, got {actual}s")
@@ -468,7 +469,10 @@ async def generate_single_clip(
     external_page: Optional[Page] = None,
     grok_video_prompt: Optional[dict] = None,
     sfx: Optional[list[str]] = None,
-    music_notes: Optional[str] = None
+    music_notes: Optional[str] = None,
+    dialogue_mode: bool = False,
+    needs_extend: bool = False,
+    extend_duration: Optional[str] = None
 ) -> Path:
     browser = None
     pw = None
@@ -520,7 +524,7 @@ async def generate_single_clip(
             # ── Step 1: Set Aspect Ratio (via pop-up) ──
             await VideoSettings.configure(page, duration=duration, aspect=aspect, resolution=resolution)
 
-            # ── Step 2: Paste Prompt inside the main input area ──
+            # ── Step 2: Build Prompt (but don't paste yet) ──
             prompt = PromptBuilder.build(
                 character_pose, camera_angle, style_suffix,
                 motion_description, dialogue,
@@ -529,26 +533,16 @@ async def generate_single_clip(
                 sfx=sfx,
                 music_notes=music_notes
             )
-            print(f"\n🚀 FULL GROK PROMPT:\n{prompt}\n")
+            # Ensure it starts with duration for the refinement pass
+            if not re.search(r'^[0-9]+s:', prompt):
+                 prompt = f"{duration} {prompt}"
             
-            prompt_selectors = [".ProseMirror", "textarea", "textarea[placeholder*='imagine']"]
-            prompt_filled = False
-            for selector in prompt_selectors:
-                try:
-                    el = page.locator(selector).first
-                    if await el.count() > 0 and await el.is_visible():
-                        await el.click()
-                        await el.fill(prompt)
-                        logger.info(f"✅ Filled prompt in {selector}")
-                        prompt_filled = True
-                        break
-                except: continue
-            
-            if not prompt_filled:
-                raise UIChangedError("Could not find prompt field")
+            print(f"\n🚀 FINAL REFINEMENT PROMPT:\n{prompt}\n")
 
-            # ── Step 3: Attach Image (starts generation automatically) ──
-            logger.info(f"📤 Attaching image: {image_path.name}...")
+            # ── Step 3: Attach Image (The SEED Pass) ──
+            # We follow the User's "Seed + Continue" workflow:
+            # Pass 1: Image only, NO prompt.
+            logger.info(f"📤 Pass 1 (SEED): Attaching image: {image_path.name}...")
             upload_success = False
             
             upload_selectors = ["button:has-text('Upload image')", "button[aria-label*='Attach']", "input[type='file']"]
@@ -565,174 +559,264 @@ async def generate_single_clip(
                         break
                 except: continue
             
-            if not upload_success: pass
-
-            # ── Step 3.5: Click "Make video" button ──
-            logger.info("🎬 Waiting up to 15s for 'Make video' button to appear on the generated image...")
-            make_video_clicked = False
+            # ── Step 3.5: Click "Make video" for the Seed ──
+            # Since prompt is empty, Grok will just animate the image "sensibly"
+            logger.info("🎬 Pass 1/2: Clicking 'Make video' for the initial Seed animation...")
             
-            # Use strict, specific selectors.
+            # 3.5.1: Wait for upload to complete (indicated by the appearance of the "Remove" button)
+            logger.info("⏳ Waiting for image upload to finalize...")
+            try:
+                # Look for the close/remove button on the attached image thumbnail
+                await page.wait_for_selector("button[aria-label*='Remove'], button:has(svg:has-path[d*='M6']), .absolute.top-1.right-1 button", state="visible", timeout=10000)
+                logger.info("✅ Upload confirmed (Remove button detected).")
+                
+                # IMPORTANT: Add a short stabilization sleep after the "Remove" button appears.
+                # The frontend UI and internal React/Next.js state might still be propagating changes 
+                # (e.g., enabling the "Make a video" button).
+                await asyncio.sleep(2)
+            except:
+                logger.warning("🕒 Upload confirmation (Remove button) timed out, attempting click anyway...")
+
+            make_video_clicked = False
             make_video_selectors = [
+                 # 1. Direct aria-label (Most stable if it exists)
                 "button[aria-label='Make video']",
+                # 2. Text match inside a button, excluding the search bar
                 "button:has-text('Make video'):not([aria-label='Search'])",
-                "div[role='button']:has-text('Make video')"
+                # 3. Floating action button parent (Bottom right corner of prompt area)
+                ".absolute.bottom-4.right-4 button:has-text('Make video')", 
+                ".absolute.bottom-3.right-3 button:has-text('Make video')",
+                # 4. Role-based matching
+                "div[role='button']:has-text('Make video')",
+                # 5. Icon + Text wrapper
+                "button:has(svg):has-text('Make video')",
+                # 6. Ultra-generic fallback
+                "text='Make video'"
             ]
             combined_selector = ", ".join(make_video_selectors)
             
-            try:
-                # 1. Wait for ANY matching selector
-                btn = await page.wait_for_selector(combined_selector, state="visible", timeout=15000)
-                if btn:
-                    try:
-                        await btn.click(timeout=5000)
-                        logger.info("✅ Clicked 'Make video' button via locator")
+            for attempt in range(15): 
+                try:
+                    # Check if button is visible and enabled
+                    btn = await page.wait_for_selector(combined_selector, state="visible", timeout=3000)
+                    if btn:
+                        # Ensure it's not disabled
+                        is_disabled = await btn.evaluate("el => el.disabled || el.getAttribute('aria-disabled') === 'true'")
+                        if is_disabled:
+                            logger.info(f"⏳ 'Make video' button is disabled (Attempt {attempt+1}), waiting...")
+                            await asyncio.sleep(1)
+                            continue
+
+                        await btn.scroll_into_view_if_needed()
+                        await btn.click(force=True, timeout=5000)
+                        logger.info("✅ Successfully clicked 'Make video' via Playwright locator.")
                         make_video_clicked = True
-                    except Exception as e:
-                        logger.warning(f"Locator click failed, trying JS evaluation: {e}")
-                        
-                # 2. JS Evaluation Fallback (bypasses Playwright interception checks)
-                if not make_video_clicked:
+                        break
+                except:
+                    # JS Fallback - very aggressive
                     clicked = await page.evaluate("""() => {
-                        const btns = Array.from(document.querySelectorAll('button, [role="button"], a, div'));
-                        for (const b of btns) {
-                            if (b.innerText && b.innerText.includes('Make video')) {
-                                b.click();
-                                return true;
-                            }
+                        const findBtn = () => {
+                            const candidates = Array.from(document.querySelectorAll('button, [role="button"], span, div'));
+                            return candidates.find(b => 
+                                b.innerText && 
+                                b.innerText.toLowerCase().includes('make video') &&
+                                b.getBoundingClientRect().width > 0
+                            );
+                        };
+                        const b = findBtn();
+                        if (b && !b.disabled && b.getAttribute('aria-disabled') !== 'true') {
+                            b.scrollIntoView();
+                            b.click(); return true;
                         }
                         return false;
                     }""")
                     if clicked:
-                        logger.info("✅ Clicked 'Make video' button via JavaScript evaluation")
+                        logger.info("✅ Successfully clicked 'Make video' via JS fallback.")
                         make_video_clicked = True
-            except Exception as e:
-                logger.warning(f"⚠️ 'Make video' button wait failed: {e}")
-            
-            if not make_video_clicked:
-                logger.warning("Generation may have auto-started or button detection failed.")
+                        break
+                await asyncio.sleep(1)
 
-            # ── Step 4: Wait for Generation & Download (Dynamic Polling) ──
-            logger.info("⏳ Waiting for video generation (Dynamic detection, max 120s)...")
+            # ── Step 4: Multi-Pass Polling (Seed -> Extend -> Refine -> Download) ──
+            logger.info("⏳ Starting Multi-Pass Polling (Seed + Refine)...")
             
             output_dir = Path(os.getcwd()) / "generated_videos"
             output_dir.mkdir(exist_ok=True)
             output = output_dir / f"clip_{uuid4()}.mp4"
             
-            download_selectors = [
-                "button[aria-label='Download']",
-                "button:has-text('Download')",
-                "[data-testid='download-button']"
-            ]
-            
-            generating_indicators = [
-                "text='Generating...'",
-                "text='Thinking...'",
-                "text='Finalizing...'",
-                ".animate-pulse",
-                "div[role='progressbar']",
-                "svg.animate-spin",
-                "button:has-text('Cancel Video')"
-            ]
+            # Multi-Pass State Management
+            current_pass = "SEED" 
+            is_extended = False
+            is_refined = False
+            last_video_src = None # Track URL to detect NEW generation
 
-            max_wait = 150 # Increased to allow for re-generations
+            max_wait = 400 # Increased for dual-pass
             poll_interval = 4
-            min_vid_wait = 25 # HARD FLOOR: Never download before 25s for videos
             start_time = asyncio.get_event_loop().time()
 
             while (asyncio.get_event_loop().time() - start_time) < max_wait:
                 if page.is_closed(): break
                 elapsed = int(asyncio.get_event_loop().time() - start_time)
-                
-                # Check for moderation flagging
-                moderation_indicators = [
-                    "text='Potentially sensitive content'",
-                    "text='Content modified'",
-                    "text='Moderated'",
-                    "[aria-label*='sensitive']",
-                ]
-                for mod_sel in moderation_indicators:
-                    try:
-                        if await page.locator(mod_sel).first.is_visible():
-                            logger.error(f"🚨 Moderation flagged: {mod_sel}")
-                            raise ModerationError("Grok flagged this content as moderated.")
-                    except ModerationError: raise
-                    except: continue
 
-                # Check if STILL generating
+                # 1. Check for standard generation indicators
                 is_generating = False
-                for ind in generating_indicators:
+                gen_selectors = [
+                    "text='Generating...'", "text='Thinking...'", "text='Generative...'",
+                    "text='Finalizing...'", ".animate-pulse", "button:has-text('Cancel Video')",
+                    "div[role='progressbar']", "svg.animate-spin"
+                ]
+                for ind in gen_selectors:
                     try:
                         if await page.locator(ind).first.is_visible():
                             is_generating = True
-                            if elapsed % 12 == 0:
-                                logger.info(f"⏳ Still generating... ({ind})")
+                            if elapsed % 20 == 0: logger.info(f"⏳ Grok is busy ({current_pass} pass)...")
                             break
                     except: continue
 
-                # Only proceed to download if not generating AND floor passed
-                if (not is_generating and elapsed >= min_vid_wait) or elapsed > 100:
-                    video_locator = page.locator("video").first
-                    video_visible = await video_locator.is_visible()
-                    
-                    if video_visible:
-                        # ── PRECISION CHECK: Verify duration in-browser ──
-                        video_ready = await page.evaluate("""
-                            () => {
-                                const v = document.querySelector('video');
-                                if (!v) return { ready: false };
-                                return {
-                                    ready: v.readyState >= 3,
-                                    duration: v.duration,
-                                    src: v.src
-                                };
-                            }
-                        """)
-                        
-                        can_download = (
-                            video_ready.get("ready") and 
-                            video_ready.get("duration", 0) > 0 and 
-                            len(video_ready.get("src", "")) > 5
-                        )
+                # 2. Check for dual-video scenario ("I prefer this" buttons)
+                try:
+                    prefer_buttons = page.locator("button:has-text('I prefer this'), button:has-text('prefer this')")
+                    prefer_count = await prefer_buttons.count()
+                    if prefer_count > 0:
+                        logger.info(f"🎭 Grok generated {prefer_count} video options! Clicking 'I prefer this' on the first one...")
+                        await prefer_buttons.first.click()
+                        await asyncio.sleep(3) # Wait for UI to settle after selection
+                        logger.info("✅ Selected preferred video. Resuming flow...")
+                        continue # Re-enter loop to pick up the selected video
+                except: pass
 
-                        if can_download or elapsed > 110:
-                            # USER REQUEST: Add 5 second more delay after detection to be safe
-                            logger.info(f"⏳ Video ready ({video_ready.get('duration')}s). Waiting 5s extra buffer...")
-                            await asyncio.sleep(5)
-                            
-                            for selector in download_selectors:
-                                try:
-                                    btn = page.locator(selector).first
-                                    if await btn.count() > 0 and await btn.is_visible():
-                                        logger.info("🎯 Starting download...")
-                                        
-                                        async with page.expect_download(timeout=30000) as dl_info:
-                                            await btn.click()
-                                        download = await dl_info.value
-                                        await download.save_as(output)
-                                        
-                                        # ── POST-DOWNLOAD VERIFICATION ──
-                                        if output.exists() and output.stat().st_size > 150000:
-                                            expected_dur = float(duration.replace('s', ''))
-                                            if VideoSettings.verify_clip_duration(output, expected_dur):
-                                                logger.info(f"✅ Download verified: {output.stat().st_size} bytes, matches duration.")
-                                                return output
-                                            else:
-                                                logger.warning("⚠️ ffprobe verification failed (0s or corrupted). Deleting and retrying poll...")
-                                                try: output.unlink()
-                                                except: pass
-                                        else:
-                                            logger.warning(f"⚠️ File too small ({output.stat().st_size if output.exists() else 0}b). Retrying poll...")
-                                            try: output.unlink()
-                                            except: pass
-                                except: continue
+                # 3. Check if video is "Ready" enough to continue/download
+                video_ready = await page.evaluate("""
+                    () => {
+                        const v = document.querySelector('video');
+                        if (!v) return { ready: false };
+                        return { ready: v.readyState >= 3, duration: v.duration, src: v.src };
+                    }
+                """)
                 
+                # A video is "Truly New" if its SRC is different from the last pass
+                is_new_video = video_ready.get("src") != last_video_src
+                ready = video_ready.get("ready") and video_ready.get("duration", 0) > 0 and not is_generating and is_new_video
+
+                if ready:
+                    # --- BRANCH A: Handle Initial Seed Complete ---
+                    if current_pass == "SEED":
+                        last_video_src = video_ready.get("src")
+                        logger.info(f"🌱 Seed Pass Complete (src={last_video_src[:40]}...).")
+                        
+                        # MANDATORY: Give Grok UI 5 seconds to show buttons (Continue/Extend)
+                        await asyncio.sleep(5)
+                        
+                        if needs_extend and not is_extended:
+                            logger.info("🔄 Needs Extend: Clicking 'Extend video' for duration...")
+                            extend_clicked = False
+                            # Strictly look for 'Extend' for duration
+                            for sel in ["button:has-text('Extend video')", "button:has-text('Extend')", "[aria-label*='Extend']"]:
+                                try:
+                                    btn = page.locator(sel).first
+                                    if await btn.count() > 0:
+                                        await btn.click(); extend_clicked = True; break
+                                except: continue
+                            
+                            if extend_clicked:
+                                await asyncio.sleep(3)
+                                ext_dur = extend_duration or "6s"
+                                await VideoSettings.configure(page, duration=ext_dur, aspect=aspect)
+                                await asyncio.sleep(1)
+                                try: await page.keyboard.press("Enter")
+                                except: pass
+                                
+                                logger.info(f"🎬 Extension ({ext_dur}) started. Waiting for EXTENDED clip...")
+                                current_pass = "EXTENDING"
+                                start_time = asyncio.get_event_loop().time()
+                                await asyncio.sleep(5) 
+                                continue
+                        
+                        # Move directly to Refinement if no extension
+                        current_pass = "REFINING"
+                        is_extended = True
+                        # Don't 'continue' here, fall through to click REFINEMENT immediately
+                    
+                    # --- BRANCH B: Handle Extension Complete ---
+                    if current_pass == "EXTENDING":
+                        last_video_src = video_ready.get("src")
+                        logger.info(f"✅ Extension Complete (src={last_video_src[:40]}...). Moving to Refinement...")
+                        current_pass = "REFINING"
+                        is_extended = True
+                        # Fall through to click REFINEMENT
+
+                    # --- BRANCH C: Trigger Refinement (Manual Continue) ---
+                    if current_pass == "REFINING" and not is_refined:
+                        logger.info("🎭 PASS 2/2: Refining Scene — Typing 'Continue this frame' into Input...")
+                        
+                        try:
+                            # 1. Type the Refinement Prompt into the main input box
+                            prompt_input = page.locator(".ProseMirror, textarea, [contenteditable='true']").first
+                            await prompt_input.click()
+                            
+                            # Prefix with "Continue this frame" as per user request
+                            refine_text = f"Continue this frame. {prompt}"
+                            await prompt_input.fill(refine_text)
+                            await asyncio.sleep(1)
+                            
+                            # 2. Click the 'Submit' (Up Arrow) button
+                            submit_clicked = False
+                            submit_selectors = [
+                                "button[aria-label='Submit']",
+                                "button:has(svg.fa-arrow-up)", 
+                                "button:has(svg):has-text('')", # Often an icon-only button
+                                ".absolute.bottom-2.right-2 button", # Position-based fallback
+                                "button.rounded-full:has(svg)" # Circular icon button
+                            ]
+                            
+                            for sel in submit_selectors:
+                                try:
+                                    btn = page.locator(sel).last # Usually the rightmost/last button
+                                    if await btn.count() > 0 and await btn.is_visible():
+                                        await btn.click(force=True)
+                                        submit_clicked = True
+                                        break
+                                except: continue
+                                
+                            if not submit_clicked:
+                                # Final Keyboard Fallback
+                                await page.keyboard.press("Enter")
+                                submit_clicked = True
+                            
+                            logger.info("💎 Refinement Pass submitted. Waiting for FINAL high-quality clip...")
+                            current_pass = "DOWNLOADING" 
+                            is_refined = True
+                            start_time = asyncio.get_event_loop().time() 
+                            last_video_src = video_ready.get("src") # Capture to wait for CHANGE
+                            await asyncio.sleep(10) 
+                            continue
+                            
+                        except Exception as e:
+                            logger.error(f"❌ Refinement injection failed: {e}")
+                            logger.warning("⚠️ Falling back to current Seed/Extended clip.")
+                            current_pass = "DOWNLOADING"
+
+                    # --- BRANCH D: Final Download ---
+                    if current_pass == "DOWNLOADING":
+                        logger.info("🎯 Final Refined Clip is ready! Starting download...")
+                        
+                        for sel in ["button[aria-label='Download']", "button:has-text('Download')", "[data-testid='download-button']"]:
+                            try:
+                                btn = page.locator(sel).first
+                                if await btn.count() > 0:
+                                    async with page.expect_download(timeout=30000) as dl_info:
+                                        await btn.click()
+                                    download = await dl_info.value
+                                    await download.save_as(output)
+                                    
+                                    if output.exists() and output.stat().st_size > 150000:
+                                        logger.info(f"✅ Final Video generated and downloaded! ({output.stat().st_size} bytes)")
+                                        return output
+                            except: continue
+
                 await asyncio.sleep(poll_interval)
 
-            if not button_download_success:
-                raise RuntimeError(f"Failed to generate or download a valid video within {max_wait}s")
-            
-            return output
-                
+            raise RuntimeError(f"Grok Multi-Pass generation failed or timed out after {max_wait}s")
+
         finally:
             # ONLY CLOSE IF WE OPENED IT
             if not external_page and browser:
@@ -895,7 +979,7 @@ class GrokAnimator:
         image_path: Path,
         motion_prompt: str = "",
         style_suffix: str = "Cinematic, dramatic lighting",
-        duration: int = 10,
+        duration: int | str = 10,
         aspect_ratio: str = "9:16",
         resolution: str = "720p",
         camera_angle: str = "Medium shot",
@@ -904,7 +988,10 @@ class GrokAnimator:
         emotion: str = "neutrally",
         grok_video_prompt: Optional[dict] = None,
         sfx: Optional[list[str]] = None,
-        music_notes: Optional[str] = None
+        music_notes: Optional[str] = None,
+        dialogue_mode: bool = False,
+        needs_extend: bool = False,
+        extend_duration: Optional[str] = None
     ) -> Path:
         """
         Animate an image using Grok Imagine with full serialization.
@@ -912,7 +999,8 @@ class GrokAnimator:
         # CRITICAL: Hold the lock for the ENTIRE duration of the generation.
         # This prevents concurrent Grok requests from fighting over the same profile.
         async with _grok_lock:
-            duration_str = f"{duration}s"
+            # Handle both int and string durations
+            duration_str = str(duration) if isinstance(duration, str) and duration.endswith('s') else f"{duration}s"
             
             MAX_RETRIES = 3
             for attempt in range(MAX_RETRIES):
@@ -942,7 +1030,10 @@ class GrokAnimator:
                         external_page=page, # Pass the active page
                         grok_video_prompt=grok_video_prompt,
                         sfx=sfx,
-                        music_notes=music_notes
+                        music_notes=music_notes,
+                        dialogue_mode=dialogue_mode,
+                        needs_extend=needs_extend,
+                        extend_duration=extend_duration
                     )
                     
                     # Validation: Check if file actually exists and has size

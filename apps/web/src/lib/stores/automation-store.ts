@@ -437,7 +437,8 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
                 niche_id: channelId,
                 title: breakdown.title || 'Untitled Video',
                 music: recommendedMood, // Pass the AI recommended mood
-                music_id: useProjectStore.getState().selectedMusicId, // Direct music ID
+                music_id: useProjectStore.getState().customBgmEnabled ? useProjectStore.getState().selectedMusicId : null, // Direct music ID if enabled
+                subtitles_enabled: useProjectStore.getState().subtitlesEnabled,
                 is_shorts: format === 'short',
                 video_resolution: useProjectStore.getState().videoResolution,
                 script: scriptContent, // Pass full script for context
@@ -451,8 +452,8 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
                 ),
                 audio_config: {
                     provider: useProjectStore.getState().audioConfig.provider || 'edge-tts',
-                    mute_source_audio: true,  // Mute Grok's random audio
-                    voice_id: useProjectStore.getState().audioConfig.voiceId || 'en-GB-RyanNeural',
+                    mute_source_audio: false,  // Do not fully mute Grok's audio; let backend lower it
+                    voice_id: 'en-US-JennyNeural', // Natural girl voice
                 }
             });
             updateStep(6, 'done');

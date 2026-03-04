@@ -9,9 +9,15 @@ import logging
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import edge_tts
+import shutil
+import os
+from dotenv import load_dotenv
+from .cloud_storage import R2Storage
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -22,41 +28,72 @@ class AudioEngine:
     def __init__(self, voice_id: str = "en-US-AriaNeural"):
         self.voice_id = voice_id
         self.output_dir = Path(tempfile.mkdtemp())
+        self.ffmpeg_cmd = os.getenv("FFMPEG_PATH", "ffmpeg")
     
     async def generate_narration(
         self,
         text: str,
         voice_id: str = "en-US-AriaNeural",
         provider: str = "edge-tts", # edge-tts, elevenlabs, xtts
-        reference_audio: Optional[Path] = None,
+        reference_audio: Optional[Union[Path, str]] = None,
         output_path: Optional[Path] = None
     ) -> Path:
-        """Generate narration using specified provider."""
-        output_path = output_path or self.output_dir / f"narration_{provider}.mp3"
+        """
+        Generate narration with cascading priority:
+        1. ElevenLabs (If API Key + Voice ID provided)
+        2. XTTS (If Reference Audio provided)
+        3. Edge-TTS (Reliable Fallback)
+        """
+        output_path = output_path or self.output_dir / f"narration_final.mp3"
+        if isinstance(output_path, str): output_path = Path(output_path)
         
-        # Pre-process prompt for better pacing/emotion
+        # If reference_audio is a string (from DB), convert to Path
+        if reference_audio and isinstance(reference_audio, str):
+            reference_audio = Path(reference_audio)
+
+        # 1. Pre-process text
         text = self._preprocess_prompt(text)
+        is_arabic_script = any('\u0600' <= c <= '\u06FF' for c in text)
+        is_path_voice = (":" in voice_id or "/" in voice_id or "\\" in voice_id)
+        
+        # 2. Try ElevenLabs Priority
+        eleven_api_key = os.getenv("ELEVENLABS_API_KEY")
+        # Removed the 'not is_arabic_script' block so ElevenLabs can process Urdu
+        if eleven_api_key and not is_path_voice:
+            try:
+                logger.info(f"💎 Attempting ElevenLabs (Priority) for voice: {voice_id}")
+                return await self._generate_elevenlabs(text, voice_id, output_path)
+            except Exception as e:
+                logger.warning(f"⚠️ ElevenLabs failed: {e}. Moving to XTTS/Edge fallback.")
+
+        # 3. Try XTTS Priority
+        if reference_audio:
+            if isinstance(reference_audio, str): reference_audio = Path(reference_audio)
+            try:
+                logger.info(f"🎭 Attempting XTTS Cloning for reference: {reference_audio.name}")
+                return await self._generate_xtts(text, reference_audio, output_path)
+            except Exception as e:
+                logger.warning(f"🧬 XTTS Cloning failed: {e}. Moving to Edge-TTS fallback.")
+
+        # 4. Final Edge-TTS Fallback
+        active_voice = voice_id
+        if is_arabic_script:
+             logger.info(f"🌐 Urdu script detected. Using Edge-TTS (ur-PK-UzmaNeural).")
+             active_voice = "ur-PK-UzmaNeural"
+        elif is_path_voice:
+             active_voice = "en-GB-RyanNeural"
         
         try:
-            if provider == "elevenlabs":
-                return await self._generate_elevenlabs(text, voice_id, output_path)
-            elif provider == "xtts":
-                return await self._generate_xtts(text, reference_audio, output_path)
-            else:
-                # Default to Edge TTS
-                communicate = edge_tts.Communicate(text, voice_id)
-                await communicate.save(str(output_path))
-        except Exception as e:
-            import traceback
-            logger.error(f"❌ TTS Provider {provider} failed: {e}")
-            logger.error(traceback.format_exc())
-            # Fallback
-            logger.info("⚠️ Falling back to EdgeTTS default (en-US-AriaNeural)")
-            communicate = edge_tts.Communicate(text, "en-US-AriaNeural")
+            logger.info(f"🛡️ Using Edge-TTS fallback: {active_voice}")
+            communicate = edge_tts.Communicate(text, active_voice)
             await communicate.save(str(output_path))
-            
-        logger.info(f"✅ Generated narration ({provider}) -> {output_path.name}")
-        return output_path
+            return output_path
+        except Exception as e:
+             logger.error(f"❌ Ultimate fallback failed: {e}")
+             # Last ditch effort
+             communicate = edge_tts.Communicate(text, "en-US-AriaNeural")
+             await communicate.save(str(output_path))
+             return output_path
 
     def _preprocess_prompt(self, text: str) -> str:
         """
@@ -80,15 +117,13 @@ class AudioEngine:
 
     async def _generate_elevenlabs(self, text: str, voice_id: str, output_path: Path) -> Path:
         """Generate using ElevenLabs API."""
-        import os
         import httpx
         
         api_key = os.getenv("ELEVENLABS_API_KEY")
         if not api_key:
-            logger.warning("ELEVENLABS_API_KEY missing, falling back...")
-            raise ValueError("ELEVENLABS_API_KEY not found")
+            raise ValueError("ELEVENLABS_API_KEY missing")
             
-        # Using V1 endpoint for simplicity, V2 requires more payload structure
+        # Using V1 endpoint for simplicity, but using V2 model for MUCH better quality
         url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
         headers = {
             "Accept": "audio/mpeg",
@@ -97,7 +132,7 @@ class AudioEngine:
         }
         data = {
             "text": text,
-            "model_id": "eleven_monolingual_v1",
+            "model_id": "eleven_multilingual_v2", # Upgraded to Multilingual V2 (Much better quality)
             "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}
         }
         
@@ -122,15 +157,48 @@ class AudioEngine:
              
         logger.info(f"🧬 Cloning voice using XTTS (Cloud) with ref: {reference_audio.name}")
         
-        # Connect to a stable XTTS space
+        # 1. Prepare & Upload to R2 so Gradio Space can download it (local paths won't work)
+        try:
+            # Convert to WAV for better compatibility with remote spaces (some require WAV explicitly)
+            wav_ref = reference_audio.with_suffix(".wav")
+            if not wav_ref.exists():
+                logger.info(f"🔄 Converting {reference_audio.name} to WAV for compatibility...")
+                conversion_cmd = [
+                    self.ffmpeg_cmd, "-y",
+                    "-i", str(reference_audio),
+                    "-acodec", "pcm_s16le",
+                    "-ar", "22050", # Common XTTS sample rate
+                    "-ac", "1",
+                    str(wav_ref)
+                ]
+                subprocess.run(conversion_cmd, check=True, capture_output=True)
+            
+            r2 = R2Storage()
+            # Unique key for this voice reference
+            remote_key = f"voices/refs/{wav_ref.name}"
+            r2.upload(wav_ref, remote_key, content_type="audio/wav")
+            reference_url = r2.get_url(remote_key)
+            logger.info(f"📤 Uploaded WAV reference to R2. URL: {reference_url[:60]}...")
+        except Exception as e:
+            logger.warning(f"⚠️ R2 upload/conversion failed, falling back to local path: {e}")
+            reference_url = str(reference_audio)
+
+        # 2. Connect to a stable XTTS space
         # Trying a few known good ones for resilience
-        spaces = ["capleaf/VIZ-XTTS-2", "tony-f/XTTS-v2", "coqui/xtts"]
+        spaces = [
+            "hasanbasbunar/Voice-Cloning-XTTS-v2",
+            "JymNils/Voice-Cloning-XTTS-v2",
+            "ohmykush/coqui-XTTS-v2",
+            "KaidenKama/coqui-XTTS-v2",
+            "coqui/xtts" # Official but often down
+        ]
         client = None
+        hf_token = os.getenv("HF_TOKEN")
         
         for space_name in spaces:
             try:
                 logger.info(f"🔄 Connecting to XTTS Space: {space_name}...")
-                client = Client(space_name)
+                client = Client(space_name, token=hf_token)
                 # Test connectivity with a tiny check if possible, or just assume ok if Client() works
                 break
             except Exception as e:
@@ -138,33 +206,88 @@ class AudioEngine:
         
         if not client:
              raise RuntimeError("Could not connect to any XTTS provider Space")        
-        # API parameters for XTTS-2 common demo:
-        # 1. Text (str)
-        # 2. Language (str)
-        # 3. Reference Audio (filepath)
-        # 4. Mic Audio (filepath/null)
-        # 5. Use Mic (bool)
-        # 6. Cleanup (bool)
-        # 7. No Auto-Detect (bool)
-        # 8. Agree (bool)
         
-        result = client.predict(
-                text,	
-                "en",	
-                str(reference_audio),	
-                None,	
-                False,	
-                False,	
-                False,	
-                True,	
-                api_name="/predict" # Explicit API name is safer
-        )
+        # Map languages to the Literal strings expected by the Space
+        lang_map = {
+            "en": "English",
+            "fr": "French",
+            "es": "Spanish",
+            "de": "German",
+            "it": "Italian",
+            "pt": "Portuguese",
+            "pl": "Polish",
+            "tr": "Turkish",
+            "ru": "Russian",
+            "nl": "Dutch",
+            "cs": "Czech",
+            "ar": "Arabic",
+            "zh": "Chinese",
+            "ja": "Japanese",
+            "ko": "Korean",
+            "hu": "Hungarian",
+            "hi": "Hindi"
+        }
         
-        # Result format for this space is typically (text_output, audio_filepath)
-        # We need the second element
-        generated_wav = result[1] 
-        
-        shutil.copy(generated_wav, output_path)
+        # Detect language or use script detection
+        is_arabic_script = any('\u0600' <= c <= '\u06FF' for c in text)
+        if is_arabic_script:
+            lang_name = "Arabic" # Arabic is supported by XTTS-v2 and shares script with Urdu
+        else:
+            try:
+                from langdetect import detect
+                lang_code = detect(text)
+                lang_name = lang_map.get(lang_code, "English")
+            except:
+                lang_name = "English"
+
+        # Try calling the synthesis endpoint
+        try:
+            result = client.predict(
+                text,                       # text
+                str(reference_url),         # reference_audio_url (Using R2 URL)
+                None,                       # example_audio_name (Mutual exclusive with URL)
+                lang_name,                  # language
+                0.75,                       # temperature
+                1.0,                        # speed
+                True,                       # do_sample
+                5.0,                        # repetition_penalty
+                1.0,                        # length_penalty
+                30,                         # gpt_cond_len
+                50,                         # top_k
+                0.85,                       # top_p
+                True,                       # remove_silence_enabled
+                -45,                        # silence_threshold
+                300,                        # min_silence_len
+                100,                        # keep_silence
+                "Native XTTS splitting",     # text_splitting_method
+                250,                        # max_chars_per_segment
+                False,                      # enable_preprocessing
+                api_name="/voice_clone_synthesis"
+            )
+        except Exception as e:
+            logger.warning(f"XTTS /voice_clone_synthesis failed: {e}. Trying generic predict.")
+            # Fallback to a simpler call if the space is different
+            # Most spaces expect [text, language, ref_audio]
+            result = client.predict(
+                text,
+                lang_name,
+                str(reference_url),
+                api_name="/predict"
+            )
+
+        # Result format for this space is typically just the audio filepath string
+        # But some might return a tuple or a dict.
+        if isinstance(result, str):
+            audio_path = result
+        elif isinstance(result, (list, tuple)) and len(result) > 0:
+            # Check if it's (text, file) or just (file,)
+            audio_path = result[1] if len(result) > 1 else result[0]
+        elif isinstance(result, dict) and 'data' in result:
+             audio_path = result['data'][0]
+        else:
+             audio_path = str(result)
+             
+        shutil.copy(audio_path, output_path)
         return output_path
     
     def mix_with_sidechain_compression(

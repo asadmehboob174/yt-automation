@@ -248,6 +248,7 @@ export default function NewVideoPage() {
 function Step1Script() {
     const {
         channelId, format, type, videoResolution, topic, narrative,
+        subtitlesEnabled, customBgmEnabled,
         setSettings, setTopic, setNarrative, setBreakdown, setStep
     } = useProjectStore();
     const { isRunning, progress, steps, currentAction, startAutomation } = useAutomationStore();
@@ -479,12 +480,38 @@ function Step1Script() {
                         </div>
                     </RadioGroup>
                 </div>
+                <div className="space-y-4">
+                    <Label className="text-base">Video Features</Label>
+                    <div className="flex flex-col gap-4">
+                        <div className="flex items-center space-x-2">
+                            <Switch
+                                id="subtitles"
+                                checked={subtitlesEnabled}
+                                onCheckedChange={(checked) => setSettings({ channelId, format, type, subtitlesEnabled: checked })}
+                            />
+                            <Label htmlFor="subtitles">Generate Subtitles</Label>
+                        </div>
+                        <div className="flex items-center space-x-2">
+                            <Switch
+                                id="custom-music"
+                                checked={customBgmEnabled}
+                                onCheckedChange={(checked) => setSettings({ channelId, format, type, customBgmEnabled: checked })}
+                            />
+                            <Label htmlFor="custom-music">Custom Background Music</Label>
+                        </div>
+                    </div>
+                </div>
             </div>
 
             <Separator />
 
             {/* Background Music Selector (Project Level) */}
-            <MusicSelector />
+            {customBgmEnabled && (
+                <>
+                    <MusicSelector />
+                    <Separator />
+                </>
+            )}
 
             <Separator />
 
@@ -1446,11 +1473,9 @@ function Step5Final() {
                 script: breakdown?.scenes.map(s => s.dialogue).join("\n\n"),
                 scene_dialogues: scenes.map((s) => s.dialogue || ''),
                 audio_config: {
-                    provider: 'edge-tts',
-                    mute_source_audio: true,
-                    voice_id: 'en-GB-RyanNeural',
-                    remove_speakers: removeSpeakers, 
-                    voice_sample_key: voiceSampleUrl 
+                    ...audioConfig,
+                    mute_source_audio: audioSource === "voiceover", // Ensure this reflects the actual UI choice
+                    remove_speakers: removeSpeakers,
                 }
             });
             setFinalVideoUrl(result.final_video_url);

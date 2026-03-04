@@ -422,19 +422,31 @@ async def animate_scenes_with_grok(image_keys: list[str], script: dict) -> list[
                 # Check for explicit resolution in script or scene, fallback to 720p
                 video_res = scene.get("resolution") or script.get("video_resolution") or "720p"
 
+                # Determine Dialogue Mode
+                dialogue_mode = bool(dialogue_str and dialogue_str.strip() and dialogue_str.lower() != "none")
+                
+                # Extract Extension Config
+                duration_config = scene.get("duration_config", {})
+                needs_extend = duration_config.get("needs_extend", False)
+                extend_duration = duration_config.get("extend_duration", None)
+                base_duration = duration_config.get("clip_duration", "10s")
+
                 try:
                     # Animate with Grok
                     video_path = await animator.animate(
                         image_path=local_image,
                         motion_prompt=motion_prompt,
-                        duration=scene.get("duration_in_seconds", 10),
+                        duration=base_duration,
                         aspect_ratio="16:9" if script.get("video_type") == "documentary" else "9:16",
                         resolution=video_res,
                         grok_video_prompt=grok_prompt,
                         sfx=sfx_list,
                         music_notes=music_notes,
                         emotion=current_emotion,
-                        dialogue=dialogue_str
+                        dialogue=dialogue_str,
+                        dialogue_mode=dialogue_mode,
+                        needs_extend=needs_extend,
+                        extend_duration=extend_duration
                     )
                 except Exception as e:
                     from .grok_agent import ModerationError
@@ -451,13 +463,17 @@ async def animate_scenes_with_grok(image_keys: list[str], script: dict) -> list[
                             video_path = await animator.animate(
                                 image_path=local_image,
                                 motion_prompt=new_prompt,
-                                duration=scene.get("duration_in_seconds", 10),
+                                duration=base_duration,
                                 aspect_ratio="16:9" if script.get("video_type") == "documentary" else "9:16",
                                 resolution=video_res,
                                 grok_video_prompt=None, # Force use of new_prompt
                                 sfx=sfx_list,
                                 music_notes=music_notes,
-                                emotion=current_emotion
+                                emotion=current_emotion,
+                                dialogue=dialogue_str,
+                                dialogue_mode=dialogue_mode,
+                                needs_extend=needs_extend,
+                                extend_duration=extend_duration
                             )
                         else:
                             raise e # If rewrite failed or didn't change anything, give up

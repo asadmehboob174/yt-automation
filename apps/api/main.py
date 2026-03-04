@@ -448,7 +448,10 @@ async def list_characters(niche_id: str):
         response.append({
             "id": char.id,
             "name": char.name,
-            "imageUrl": storage.get_url(char.imageUrl)
+            "imageUrl": storage.get_url(char.imageUrl),
+            "voiceUrl": char.voiceUrl,
+            "voiceProvider": char.voiceProvider,
+            "voiceId": char.voiceId
         })
         
     return {"characters": response}
@@ -486,7 +489,10 @@ async def create_character(
     return {
         "id": char.id,
         "name": char.name,
-        "imageUrl": storage.get_url(key)
+        "imageUrl": storage.get_url(key),
+        "voiceUrl": char.voiceUrl,
+        "voiceProvider": char.voiceProvider,
+        "voiceId": char.voiceId
     }
 
 @app.delete("/characters/{char_id}")
@@ -494,6 +500,41 @@ async def delete_character(char_id: str):
     """Delete a character."""
     await db.character.delete(where={"id": char_id})
     return {"status": "deleted"}
+
+@app.post("/voices/extract-from-video")
+async def extract_voice_api(video_path: str = Form(...), character_name: str = Form(...)):
+    """Extract vocals from a local video file."""
+    from services.voice_extractor import VoiceExtractor
+    extractor = VoiceExtractor()
+    vpath = extractor.extract_vocals(Path(video_path), character_name)
+    if not vpath:
+        raise HTTPException(status_code=500, detail="Vocal extraction failed")
+    
+    # Return both relative and absolute for convenience
+    return {
+        "voice_url": str(vpath),
+        "filename": vpath.name,
+        "status": "success"
+    }
+
+@app.patch("/characters/{char_id}/voice")
+async def update_character_voice(
+    char_id: str,
+    voice_url: Optional[str] = Form(None),
+    voice_provider: Optional[str] = Form(None),
+    voice_id: Optional[str] = Form(None)
+):
+    """Update voice settings for a character."""
+    update_data = {}
+    if voice_url: update_data["voiceUrl"] = voice_url
+    if voice_provider: update_data["voiceProvider"] = voice_provider
+    if voice_id: update_data["voiceId"] = voice_id
+    
+    char = await db.character.update(
+        where={"id": char_id},
+        data=update_data
+    )
+    return char
 
 
 # --- Asset Upload & Script Submission ---
@@ -737,6 +778,10 @@ async def generate_breakdown(request: GenerateBreakdownRequest):
         result = breakdown.model_dump()
         result["thumbnail_prompt"] = thumbnail_prompt
         
+        # --- NEW: Compute Per-Scene Durations using LLM ---
+        if result.get('scenes'):
+            result['scenes'] = await generator.compute_scene_durations(result['scenes'])
+        
         print(f"📊 Returning breakdown with {len(result.get('scenes', []))} scenes and {len(result.get('characters', []))} characters")
         print(f"   🖼️ Thumbnail Prompt: {thumbnail_prompt[:50]}...")
         
@@ -745,7 +790,8 @@ async def generate_breakdown(request: GenerateBreakdownRequest):
         for i, scene in enumerate(result.get('scenes', [])):
             cpp = scene.get('character_pose_prompt', '')[:50] or 'EMPTY'
             img = scene.get('text_to_image_prompt', '')[:50] or 'EMPTY'
-            print(f"   Scene {i+1}: character_pose_prompt={cpp}... | text_to_image_prompt={img}...")
+            dur = scene.get('duration_in_seconds', 10)
+            print(f"   Scene {i+1}: character_pose_prompt={cpp}... | duration={dur}s | text_to_image_prompt={img}...")
         return result
 
     except Exception as e:
@@ -1761,6 +1807,7 @@ class StitchVideosRequest(BaseModel):
     audio_config: Optional[dict] = None # { mute_source_audio: bool, provider: str, voice_id: str, voice_sample_key: str }
     music_id: Optional[str] = None # Direct ID from BackgroundMusic table
     video_resolution: Optional[str] = None # e.g. '480p'
+    subtitles_enabled: bool = False # Frontend toggle
     scene_dialogues: list[str] = [] # Per-scene narration text for TTS (Animated Storybook mode)
 
 @app.get("/audio/background-music")
@@ -1952,13 +1999,44 @@ async def stitch_videos(request: StitchVideosRequest):
         
         # --- 1. AUDIO FIRST: ANIMATED STORYBOOK Narration ---
         # We must generate the voice first to know how long each video clip needs to be.
-        audio_provider = audio_config.get("provider", "edge-tts") if audio_config else None
-        voice_id = audio_config.get("voice_id", "en-GB-RyanNeural") if audio_config else None
+        # DEFAULT: Use the "Girl" cloned voice as narrator (XTTS)
+        DEFAULT_VOICE_URL = r"D:\GitHub\yt-automation\packages\assets\voices\girl_clone_raw.mp3"
+        
+        # Pull from config or use our new global default
+        audio_provider = audio_config.get("provider")
+        voice_id = audio_config.get("voice_id")
+        
+        # AGGRESSIVE DEFAULT: If provider is missing OR it's edge-tts, swap to Premium (ElevenLabs if key, else XTTS)
+        eleven_api_key = os.getenv("ELEVENLABS_API_KEY")
+        
+        if not audio_provider or audio_provider == "edge-tts":
+            if eleven_api_key:
+                 print(f"   💎 Elevating Edge-TTS request to ElevenLabs Voice (Matilda - Free Priority)")
+                 audio_provider = "elevenlabs"
+                 voice_id = "XrExE9yKIg1WjnnlVkGX"
+            else:
+                 print(f"   🔄 Upgrading default voice from '{voice_id}' to Cloned Girl Voice (XTTS)")
+                 audio_provider = "xtts"
+                 voice_id = DEFAULT_VOICE_URL
+        
+        # Final fallbacks for missing fields
+        audio_provider = audio_provider or ("elevenlabs" if eleven_api_key else "xtts")
+        voice_id = voice_id or ("XrExE9yKIg1WjnnlVkGX" if eleven_api_key else DEFAULT_VOICE_URL)
         
         fresh_audio_paths = []
         narration_texts = []  # For subtitle generation later
         target_durations = [] # Array of exactly how long each video clip should loop
         
+        # 1.0 Extract intended durations from script if possible
+        script_durations = []
+        if request.script:
+            import re
+            # Look for "Duration: 5s" or "Duration: 10s" in the script
+            matches = re.findall(r"Duration:\s*(\d+)s", request.script)
+            script_durations = [float(m) for m in matches]
+            if script_durations:
+                print(f"   ⏱️ Parsed {len(script_durations)} scene durations from script. Defaults updated.")
+
         # Only generate TTS if we have scene dialogues AND a provider
         if audio_provider and request.scene_dialogues:
             print(f"🎙️ Animated Storybook Mode: Generating TTS narration for {len(request.scene_dialogues)} scenes...")
@@ -1966,13 +2044,16 @@ async def stitch_videos(request: StitchVideosRequest):
             from services.audio_engine import AudioEngine
             engine = AudioEngine()
             
-            for i, dialogue_text in enumerate(request.scene_dialogues):
-                if i >= len(final_clips_to_stitch):
-                    break # Don't generate audio for skipped corrupt clips
-                    
+            for i in range(len(final_clips_to_stitch)):
+                dialogue_text = request.scene_dialogues[i] if i < len(request.scene_dialogues) else None
+                
+                # Get the "baseline" duration for this scene (from script or default 5s)
+                script_val = script_durations[i] if i < len(script_durations) else 5.0
+                
                 if not dialogue_text or not dialogue_text.strip():
-                    print(f"   ⏭️ Scene {i+1}: No narration text, skipping.")
-                    target_durations.append(10.0) # Default duration
+                    print(f"   ⏭️ Scene {i+1}: No narration text. Using script duration: {script_val}s")
+                    target_durations.append(script_val)
+                    fresh_audio_paths.append(None) # GAP
                     continue
                     
                 clean_text = dialogue_text.strip()
@@ -1982,15 +2063,39 @@ async def stitch_videos(request: StitchVideosRequest):
                 clean_text = clean_text.strip()
                 
                 if not clean_text:
-                    print(f"   ⏭️ Scene {i+1}: Only SFX markers, no spoken text.")
-                    target_durations.append(10.0)
+                    print(f"   ⏭️ Scene {i+1}: Only SFX markers. Using script duration: {script_val}s")
+                    target_durations.append(script_val)
+                    fresh_audio_paths.append(None) # GAP
                     continue
-                
+
                 try:
+                    # --- Character Voice Support ---
+                    # 1. Detect character name from dialogue (e.g. "GIRL: Hello")
+                    char_override_provider = audio_provider
+                    # Default: Use the global voice_id if provider is XTTS (cloning)
+                    char_override_ref = voice_id if char_override_provider == "xtts" else None
+                    
+                    if ":" in clean_text:
+                        possible_split = clean_text.split(":", 1)
+                        possible_name = possible_split[0].strip()
+                        # Search DB for this character
+                        matched_char = await db.character.find_first(
+                            where={
+                                "name": {"equals": possible_name, "mode": "insensitive"}
+                            }
+                        )
+                        if matched_char and matched_char.voiceUrl:
+                            print(f"   🎭 Detected Character: {matched_char.name}. Using custom voice: {matched_char.voiceUrl}")
+                            char_override_provider = matched_char.voiceProvider or "xtts"
+                            char_override_ref = matched_char.voiceUrl
+                            # Strip the name from text for better TTS
+                            clean_text = possible_split[1].strip()
+
                     scene_audio_path = await engine.generate_narration(
                         text=clean_text,
                         voice_id=voice_id or "en-GB-RyanNeural",
-                        provider=audio_provider,
+                        provider=char_override_provider,
+                        reference_audio=char_override_ref,
                         output_path=temp_dir / f"narration_scene_{i:03d}.mp3"
                     )
                     
@@ -1999,29 +2104,32 @@ async def stitch_videos(request: StitchVideosRequest):
                     audio_probe = ffprobe_lib.probe(str(scene_audio_path), cmd=ffprobe_cmd)
                     audio_dur = float(audio_probe['streams'][0]['duration'])
                     
+                    # Padding logic: tts + 0.6, but at least as long as script intended
+                    final_dur = max(audio_dur + 0.6, script_val)
+                    
                     fresh_audio_paths.append(scene_audio_path)
                     narration_texts.append({"index": i, "text": clean_text, "duration": audio_dur})
+                    target_durations.append(final_dur)
                     
-                    # Pad out duration slightly so voice doesn't clip immediately
-                    target_durations.append(max(audio_dur + 0.5, 10.0))
-                    
-                    print(f"   ✅ Scene {i+1}: TTS generated ({audio_dur:.2f}s -> Setting Video Loop to {target_durations[-1]:.2f}s)")
+                    print(f"   ✅ Scene {i+1}: TTS generated ({audio_dur:.2f}s -> Setting Video Loop to {final_dur:.2f}s)")
                 except Exception as e:
                     print(f"   ❌ Scene {i+1}: TTS failed: {e}")
-                    narration_texts.append({"index": i, "text": clean_text, "duration": 9.7})
-                    target_durations.append(10.0)
+                    narration_texts.append({"index": i, "text": clean_text, "duration": script_val - 0.4})
+                    target_durations.append(script_val)
+                    fresh_audio_paths.append(None)
             
-            if fresh_audio_paths:
-                print(f"🎙️ Generated {len(fresh_audio_paths)} narration clips driving {len(target_durations)} video segments.")
+            non_none_audios = [a for a in fresh_audio_paths if a is not None]
+            if non_none_audios:
+                print(f"🎙️ Generated {len(non_none_audios)} narration clips driving {len(target_durations)} video segments.")
             else:
-                print(f"⚠️ No narration clips generated. Falling back to BGM-only (10s segments).")
+                print(f"⚠️ No narration clips generated. Falling back to script durations.")
         else:
-            print(f"   🔇 No scene dialogues provided or no audio provider. Defaulting to 10s video segments.")
-            target_durations = [10.0] * len(final_clips_to_stitch)
-            
-        # Ensure we have a target duration for every clip
-        while len(target_durations) < len(final_clips_to_stitch):
-             target_durations.append(10.0)
+            print(f"   🔇 No scene dialogues provided or no audio provider. Using script durations (or 5s default).")
+            # Calculate durations based on script if possible
+            target_durations = []
+            for i in range(len(final_clips_to_stitch)):
+                target_durations.append(script_durations[i] if i < len(script_durations) else 5.0)
+            fresh_audio_paths = [None] * len(final_clips_to_stitch)
 
 
         # --- 2. VIDEO STITCHING (Driven by Target Durations) ---
@@ -2031,7 +2139,7 @@ async def stitch_videos(request: StitchVideosRequest):
         stitched_path = editor.stitch_clips_with_fade(
             final_clips_to_stitch, 
             stitched_path, 
-            fade_duration=0.3,
+            fade_duration=0.4,
             target_resolution=target_res,
             mute_audio=mute_source,
             target_durations=target_durations # newly calculated array
@@ -2174,24 +2282,16 @@ async def stitch_videos(request: StitchVideosRequest):
             if music_path:
                 # Mix narration with BGM (ducking handled by mix_audio usually?)
                 # Editor.mix_audio handles list of narration + bgm
-                mixed_audio = editor.mix_audio(fresh_audio_paths, music_path, mixed_audio, scene_interval=9.7)
+                mixed_audio = editor.mix_audio(fresh_audio_paths, music_path, mixed_audio, target_durations=target_durations)
             else:
-                # Just narration
-                 import shutil
-                 shutil.copy(fresh_audio_paths[0], mixed_audio)
+                # Mix narration ONLY but we still need it properly spaced using mix_audio!
+                # Even without BGM, mix_audio pads the narrations correctly using target_durations.
+                mixed_audio = editor.mix_audio(fresh_audio_paths, None, mixed_audio, target_durations=target_durations)
             
-            # Combine with video (which might be silent if mute_source was True)
-            # Finalize expects separate audio path
-            # We can use editor.finalize logic here or just a direct ffmpeg merge
-            # Let's use editor.finalize if we can import it? 
-            # finalize takes (video, audio, subtitle, output)
-            
-            # Since we are in main, editor is instantiated.
-            # But duplicate logic is messy. editor.finalize matches lengths.
-            # Let's use editor.finalize. We need to create dummy subtitle path if none?
-            # Or wait, finalize handles optional subtitles.
-            
-            final_path = editor.finalize(current_video_path, mixed_audio, None, final_path)
+            # Use add_background_music to MIX the generated TTS back INTO the
+            # existing video audio instead of completely stripping it using finalize()
+            # We set volume=1.0 because the BGM inside `mixed_audio` is already dropped to low volume during mix_audio if present.
+            editor.add_background_music(current_video_path, mixed_audio, final_path, music_volume=1.0)
             
         # B. Original Audio + BGM (Story Style)
         elif music_path:
@@ -2214,7 +2314,7 @@ async def stitch_videos(request: StitchVideosRequest):
             shutil.copy(current_video_path, final_path)
         # 5. Upload to R2
         # --- ANIMATED STORYBOOK: Burn Subtitles ---
-        if narration_texts:
+        if narration_texts and request.subtitles_enabled:
             print(f"📝 Generating subtitles for {len(narration_texts)} narrated scenes...")
             try:
                 from services.subtitle_engine import SubtitleEngine, SubtitleEntry

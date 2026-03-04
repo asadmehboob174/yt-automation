@@ -31,12 +31,15 @@ model Channel {
 }
 
 model Character {
-  id        String   @id @default(cuid())
-  channelId String
-  channel   Channel  @relation(fields: [channelId], references: [id], onDelete: Cascade)
-  name      String
-  imageUrl  String
-  createdAt DateTime @default(now())
+  id            String   @id @default(cuid())
+  channelId     String
+  channel       Channel  @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  name          String
+  imageUrl      String
+  voiceUrl      String?  // Local or R2 path to reference audio
+  voiceProvider String?  // "elevenlabs", "xtts", "edge-tts"
+  voiceId       String?  // Permanent Voice ID (for ElevenLabs)
+  createdAt     DateTime @default(now())
 }
 
 model Video {

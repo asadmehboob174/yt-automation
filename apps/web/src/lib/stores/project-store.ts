@@ -40,9 +40,13 @@ interface ProjectState {
     selectedMusicId: string | null;
     musicOption: string;
 
+    // UI Toggles
+    subtitlesEnabled: boolean;
+    customBgmEnabled: boolean;
+
     // Actions
     setStep: (step: ProjectStep) => void;
-    setSettings: (settings: { channelId: string; format: 'short' | 'long'; type: 'story' | 'documentary', videoResolution?: '480p' | '720p' }) => void;
+    setSettings: (settings: Partial<{ channelId: string; format: 'short' | 'long'; type: 'story' | 'documentary', videoResolution: '480p' | '720p', subtitlesEnabled: boolean, customBgmEnabled: boolean }>) => void;
     setAudioConfig: (config: Partial<ProjectState['audioConfig']>) => void;
     setTopic: (topic: string) => void;
     setNarrative: (narrative: string) => void;
@@ -77,6 +81,8 @@ const initialState = {
     },
     selectedMusicId: null,
     musicOption: 'auto',
+    subtitlesEnabled: false,
+    customBgmEnabled: false,
 };
 
 export const useProjectStore = create<ProjectState>()(
@@ -190,6 +196,8 @@ export const useProjectStore = create<ProjectState>()(
                 audioConfig: state.audioConfig,
                 selectedMusicId: state.selectedMusicId,
                 musicOption: state.musicOption,
+                subtitlesEnabled: state.subtitlesEnabled,
+                customBgmEnabled: state.customBgmEnabled,
             }),
         }
     )
