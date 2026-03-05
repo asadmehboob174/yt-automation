@@ -128,6 +128,9 @@ export const useProjectStore = create<ProjectState>()(
                     dialogue: (s.dialogue as string) || (s.voiceover_text as string) || '',
                     // Map shot type
                     shotType: (s.shotType as string) || (s.camera_angle as string) || 'medium shot',
+                    // Map duration (LLM-computed scene duration)
+                    duration: (s.duration_in_seconds as number) || (s.duration as number) || 6,
+                    durationConfig: s.duration_config as any,
                     // Existing URLs
                     imageUrl: (s.imageUrl as string) || (s.image_url as string) || '',
                     videoUrl: (s.videoUrl as string) || (s.video_url as string) || '',

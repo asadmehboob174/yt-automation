@@ -296,9 +296,11 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
                                             is_shorts: format === 'short',
                                             camera_angle: ensureString(sceneData.camera_angle || sceneData.cameraAngle),
                                             sound_effect: sceneData.sfx || sceneData.sound_effect,
-                                            emotion: ensureString(sceneData.emotion),
+                                            emotion: ensureString(sceneData.emotion || sceneData.grok_video_prompt?.emotion || sceneData.grokVideoPrompt?.emotion),
                                             text_to_audio_prompt: ensureString(sceneData.text_to_audio_prompt || sceneData.textToAudioPrompt),
-                                            resolution: useProjectStore.getState().videoResolution
+                                            resolution: useProjectStore.getState().videoResolution,
+                                            duration: sceneData.duration || sceneData.duration_in_seconds || 10,
+                                            duration_config: sceneData.duration_config || sceneData.durationConfig,
                                         });
                                         useProjectStore.getState().updateScene(index, {
                                             videoUrl: videoResult.videoUrl,
@@ -363,12 +365,14 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
                             prompt: ensureString(sceneData.image_to_video_prompt || sceneData.textToVideo || sceneData.prompt),
                             dialogue: ensureString(sceneData.dialogue),
                             niche_id: channelId,
-                            is_shorts: format === 'short',
                             camera_angle: ensureString(sceneData.camera_angle || sceneData.cameraAngle),
                             sound_effect: sceneData.sfx || sceneData.sound_effect,
-                            emotion: ensureString(sceneData.emotion),
+                            emotion: ensureString(sceneData.emotion || sceneData.grok_video_prompt?.emotion || sceneData.grokVideoPrompt?.emotion),
                             text_to_audio_prompt: ensureString(sceneData.text_to_audio_prompt || sceneData.textToAudioPrompt),
-                            resolution: useProjectStore.getState().videoResolution
+                            resolution: useProjectStore.getState().videoResolution,
+                            duration: sceneData.duration || sceneData.duration_in_seconds || 10,
+                            duration_config: sceneData.duration_config || sceneData.durationConfig,
+                            extend_duration: sceneData.duration_config?.extend_duration || sceneData.durationConfig?.extend_duration
                         });
                         currentVideoUrl = repairResult.videoUrl;
 

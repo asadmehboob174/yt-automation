@@ -62,7 +62,8 @@ class FFmpegVideoEditor:
         fade_duration: float = 0.4,
         target_resolution: tuple[int, int] = (1920, 1080),
         mute_audio: bool = False,
-        target_durations: Optional[list[float]] = None
+        target_durations: Optional[list[float]] = None,
+        clip_audio_volumes: Optional[list[float]] = None
     ) -> Path:
         """
         Stitch clips with smooth cross-dissolve (Mix) transitions and optional SFX.
@@ -145,7 +146,7 @@ class FFmpegVideoEditor:
                 
                 a_label = f"async{i}"
                 filter_parts.append(
-                    f"[{i}:a]aresample=44100,{f_in}{f_out}volume={0.23 if mute_audio else 1.0},"
+                    f"[{i}:a]aresample=44100,{f_in}{f_out}volume={0.23 if mute_audio else (clip_audio_volumes[i] if clip_audio_volumes and i < len(clip_audio_volumes) else 1.0)},"
                     f"adelay={delay_ms}|{delay_ms},atrim=duration={round(cumulative_offset + target_dur, 3)},asetpts=PTS-STARTPTS[{a_label}]"
                 )
                 a_labels.append(f"[{a_label}]")

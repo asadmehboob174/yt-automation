@@ -165,7 +165,13 @@ const parseJsonScript = (jsonScript: string): ScriptBreakdown => {
         // Legacy fields
         dialogue: s.dialogue || "",
         // Ensure duration is present
-        duration: s.duration_in_seconds || s.duration || 10,
+        duration: s.duration_in_seconds || s.duration || 6,
+        durationConfig: s.duration_config || {
+            clip_duration: (s.duration_in_seconds || s.duration || 6) + "s",
+            needs_extend: (s.duration_in_seconds || s.duration || 6) > 10,
+            extend_duration: (s.duration_in_seconds || s.duration || 6) > 10 ? "6s" : null,
+            total_clip_time: s.duration_in_seconds || s.duration || 6
+        },
         // Computed Preview Prompt
         formattedPrompt: buildGrokPrompt(s)
     }));
@@ -963,6 +969,12 @@ function Step3SceneImages() {
                                         <div className="flex items-center gap-2">
                                             <h3 className="font-bold text-lg">Scene {index + 1}</h3>
                                             <Badge variant="outline" className="text-[10px] h-5">IMAGE PHASE</Badge>
+                                            {scene.duration && (
+                                                <Badge variant="secondary" className="text-[10px] h-5">
+                                                    <Clock className="w-3 h-3 mr-1" />
+                                                    {scene.duration}s
+                                                </Badge>
+                                            )}
                                         </div>
                                         <div className="space-y-1">
                                             <p className="text-[10px] uppercase font-bold text-muted-foreground/70">Text-to-Image Prompt</p>
@@ -1119,12 +1131,15 @@ function Step4SceneVideos() {
                 camera_angle: scene.shotType,
                 niche_id: channelId,
                 is_shorts: format === 'short',
+                emotion: scene.grokVideoPrompt?.emotion,
                 text_to_audio_prompt: scene.textToAudioPrompt,
                 // Voice Cloning Params
                 voice_sample_url: audioConfig?.voiceSampleUrl,
                 voice_provider: audioConfig?.provider || 'edge-tts',
                 voice_id: audioConfig?.voiceId,
                 resolution: videoResolution,
+                duration: scene.duration || 10,
+                duration_config: scene.durationConfig,
             });
 
             // Validate the response has a proper video URL
@@ -1262,6 +1277,12 @@ function Step4SceneVideos() {
                                     <h3 className="font-semibold">Scene {index + 1}{scene.title && `: ${scene.title}`}</h3>
                                     {scene.shotType && (
                                         <span className="text-xs bg-muted px-2 py-0.5 rounded">{scene.shotType}</span>
+                                    )}
+                                    {scene.duration && (
+                                        <Badge variant="secondary" className="text-[10px] h-5">
+                                            <Clock className="w-3 h-3 mr-1" />
+                                            {scene.duration}s
+                                        </Badge>
                                     )}
                                 </div>
                                 <p className="text-sm text-muted-foreground line-clamp-2">

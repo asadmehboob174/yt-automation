@@ -426,10 +426,33 @@ async def animate_scenes_with_grok(image_keys: list[str], script: dict) -> list[
                 dialogue_mode = bool(dialogue_str and dialogue_str.strip() and dialogue_str.lower() != "none")
                 
                 # Extract Extension Config
-                duration_config = scene.get("duration_config", {})
-                needs_extend = duration_config.get("needs_extend", False)
-                extend_duration = duration_config.get("extend_duration", None)
-                base_duration = duration_config.get("clip_duration", "10s")
+                # Robust Duration Extraction (Handles snake_case and camelCase)
+                duration_cfg = scene.get("duration_config") or scene.get("durationConfig") or {}
+                needs_extend = duration_cfg.get("needs_extend", False)
+                extend_duration = duration_cfg.get("extend_duration", None)
+                
+                # Check multiple fields for base duration
+                base_duration = duration_cfg.get("clip_duration")
+                if not base_duration:
+                    # [DIAGNOSTIC] Log raw duration fields to see what's actually arriving from Inngest
+                    raw_dur_val = scene.get("duration")
+                    raw_dur_in_sec = scene.get("duration_in_seconds")
+                    logger.info(f"🔍 Scene {i+1} Duration DEBUG: duration={raw_dur_val} | duration_in_seconds={raw_dur_in_sec}")
+                    
+                    # Fallback to raw duration fields: Prioritize 'duration' (sent by frontend) over 'duration_in_seconds' (Pydantic default 10)
+                    raw_duration = raw_dur_val or raw_dur_in_sec
+                    if raw_duration:
+                        base_duration = f"{raw_duration}s" if isinstance(raw_duration, (int, float)) else str(raw_duration)
+                    else:
+                        base_duration = "10s" # Final fallback
+                
+                # Ensure base_duration is exactly "6s" or "10s" for Grok UI matching
+                if "6" in str(base_duration):
+                    base_duration = "6s"
+                else:
+                    base_duration = "10s"
+                
+                logger.info(f"   🎬 Using Final Base Duration: {base_duration}")
 
                 try:
                     # Animate with Grok

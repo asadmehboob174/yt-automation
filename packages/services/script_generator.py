@@ -100,18 +100,18 @@ class YouTubeVideoSettings(BaseModel):
 
 
 class YouTubeTitles(BaseModel):
-    primary: str
-    alternatives: list[str]
+    primary: Optional[str] = None
+    alternatives: list[str] = []
 
 
 class YouTubeThumbnailElement(BaseModel):
-    text: str
-    elements: list[str]
+    text: Optional[str] = None
+    elements: list[str] = []
 
 
 class YouTubeSchedule(BaseModel):
-    best_time: str
-    best_days: list[str]
+    best_time: Optional[str] = None
+    best_days: list[str] = []
 
 
 class YouTubeReplyTemplates(BaseModel):
@@ -123,13 +123,13 @@ class YouTubeReplyTemplates(BaseModel):
 
 
 class YouTubeEngagement(BaseModel):
-    pinned_comment: str
+    pinned_comment: Optional[str] = None
     reply_templates: Optional[YouTubeReplyTemplates] = None
 
 
 class YouTubeCommunityPost(BaseModel):
-    timing: str
-    text: str
+    timing: Optional[str] = None
+    text: Optional[str] = None
 
 
 class YouTubeCommunityPosts(BaseModel):
@@ -141,17 +141,17 @@ class YouTubeCommunityPosts(BaseModel):
 
 
 class YouTubeEndScreenElement(BaseModel):
-    type: str  # subscribe, best_for_viewer, playlist
-    position: str  # top_center, bottom_left, etc.
+    type: Optional[str] = None  # subscribe, best_for_viewer, playlist
+    position: Optional[str] = None  # top_center, bottom_left, etc.
     message: Optional[str] = None
-    start_time_seconds: int
-    end_time_seconds: int
+    start_time_seconds: Optional[int] = None
+    end_time_seconds: Optional[int] = None
     playlist_name: Optional[str] = None
 
 
 class YouTubeEndScreen(BaseModel):
-    duration_seconds: int
-    elements: list[YouTubeEndScreenElement]
+    duration_seconds: Optional[int] = None
+    elements: list[YouTubeEndScreenElement] = []
     usage_note: Optional[str] = None
 
 
@@ -191,9 +191,9 @@ class YouTubeUploadMetadata(BaseModel):
 
 class YouTubeUpload(BaseModel):
     video_settings: Optional[YouTubeVideoSettings] = None
-    titles: YouTubeTitles
-    description: str
-    tags: list[str]
+    titles: Optional[YouTubeTitles] = None
+    description: Optional[str] = None
+    tags: list[str] = []
     thumbnail: Optional[YouTubeThumbnailElement] = None
     schedule: Optional[YouTubeSchedule] = None
     engagement: Optional[YouTubeEngagement] = None
@@ -209,19 +209,19 @@ class YouTubeUpload(BaseModel):
 # ============================================
 
 class SoundtrackConfig(BaseModel):
-    background_music: str
+    background_music: Optional[str] = None
     music_timing: Optional[str] = None
     sfx_mixing: Optional[str] = None
 
 
 class TransitionConfig(BaseModel):
-    type: str
-    duration: str
+    type: Optional[str] = None
+    duration: Optional[str] = None
     effects: Optional[str] = None
 
 
 class ColorGradingConfig(BaseModel):
-    overall_look: str
+    overall_look: Optional[str] = None
     consistency: Optional[str] = None
 
 
@@ -238,10 +238,10 @@ class YouTubeOptimizationConfig(BaseModel):
 
 
 class FinalAssembly(BaseModel):
-    total_clips: int
-    soundtrack: SoundtrackConfig
-    transitions: TransitionConfig
-    color_grading: ColorGradingConfig
+    total_clips: Optional[int] = None
+    soundtrack: Optional[SoundtrackConfig] = None
+    transitions: Optional[TransitionConfig] = None
+    color_grading: Optional[ColorGradingConfig] = None
     title_cards: Optional[TitleCardsConfig] = None
     youtube_optimization: Optional[dict] = None
 
@@ -260,9 +260,8 @@ class ScriptGenerator:
     # Gemini API
     GEMINI_API = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
     
-    # HuggingFace Inference API (OpenAI-compatible router endpoint)
-    HF_API = "https://router.huggingface.co/v1/chat/completions"
-    HF_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+    # HuggingFace Inference API
+    HF_MODEL = "meta-llama/Llama-3.3-70B-Instruct"
     
     def __init__(self):
         # Gemini key
@@ -386,59 +385,49 @@ Generate exactly {scene_count} scenes adhering to the structure above.
                 except (KeyError, IndexError):
                     return ""
     async def _call_huggingface(self, prompt: str, max_tokens: int = 16384, timeout: float = 120.0, retries: int = 3) -> str:
-        """Call HuggingFace Inference API."""
+        """Call HuggingFace Inference API via resilient Hub Client."""
+        from huggingface_hub import InferenceClient
+        
         async with self._call_semaphore:
             now = asyncio.get_event_loop().time()
             time_since_last = now - self._last_call_time
             if time_since_last < self._min_interval:
                 await asyncio.sleep(self._min_interval - time_since_last)
             
-            headers = {
-                "Authorization": f"Bearer {self.hf_token}",
-                "Content-Type": "application/json"
-            }
-            
-            payload = {
-                "model": self.HF_MODEL,
-                "messages": [
-                    {"role": "system", "content": "You are a helpful assistant that outputs only valid JSON."},
-                    {"role": "user", "content": prompt}
-                ],
-                "max_tokens": max_tokens,
-                "temperature": 0.7,
-                "stream": False
-            }
+            if not self.hf_token:
+                raise ValueError("HF_TOKEN (or HUGGINGFACE_API_KEY) not found in environment")
+                
+            client = InferenceClient(model=self.HF_MODEL, token=self.hf_token)
             
             print(f"🤖 Calling HuggingFace ({self.HF_MODEL})...")
             
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                for attempt in range(retries):
-                    try:
-                        resp = await client.post(self.HF_API, json=payload, headers=headers)
-                        
-                        if resp.status_code == 429:
-                            wait_time = 5 * (attempt + 1)
-                            print(f"⚠️ Rate limited. Waiting {wait_time}s...")
-                            await asyncio.sleep(wait_time)
-                            continue
-                            
-                        resp.raise_for_status()
-                        result = resp.json()
-                        self._last_call_time = asyncio.get_event_loop().time()
-                        return result['choices'][0]['message']['content']
-                        
-                    except httpx.HTTPStatusError as e:
-                        if e.response.status_code == 403:
-                            print(f"❌ HF Access Forbidden (403). Your token may not have access to {self.HF_MODEL} or the router endpoint.")
-                            raise e # Propagate to allow fallback logic in caller
-                        print(f"⚠️ HF HTTP Error (Attempt {attempt+1}/{retries}): {e}")
-                        if attempt == retries - 1: raise e
-                        await asyncio.sleep(2)
-                    except Exception as e:
-                        print(f"⚠️ HF Call failed (Attempt {attempt+1}/{retries}): {e}")
-                        if attempt == retries - 1:
-                            raise e
-                        await asyncio.sleep(2)
+            loop = asyncio.get_event_loop()
+            def _make_call():
+                # Inference API chat_completion is much more robust than direct model POST
+                resp = client.chat_completion(
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=max_tokens if max_tokens < 2000 else 2000, # Cap tokens for free tier sanity
+                    temperature=0.3
+                )
+                return resp.choices[0].message.content
+
+            for attempt in range(retries):
+                try:
+                    text = await loop.run_in_executor(None, _make_call)
+                    self._last_call_time = asyncio.get_event_loop().time()
+                    return text
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    if "410" in error_msg:
+                         print(f"❌ HF Endpoint Gone (410) for {self.HF_MODEL}. This usually means HF moved the model.")
+                         raise e
+                    if "403" in error_msg:
+                        print(f"❌ HF Access Forbidden (403). Check if {self.HF_MODEL} requires gating approval.")
+                        raise e
+                    
+                    print(f"⚠️ HF Call failed (Attempt {attempt+1}/{retries}): {e}")
+                    if attempt == retries - 1: raise e
+                    await asyncio.sleep(2 * (attempt + 1))
             return ""
 
     async def generate(
@@ -1732,7 +1721,10 @@ OUTPUT JSON FORMAT:
                         motion_description=vid_prompt,
                         background_description=img_prompt,
                         camera_angle=shot_type,
-                        dialogue=clean_audio if "(SFX" not in dialogue_raw else None,
+                        # CRITICAL: If voiceover explicitly says "no voiceover", clear dialogue
+                        # so the frontend doesn't treat it as TTS narration text.
+                        # The dialogue is already preserved inside image_to_video_prompt for video generation.
+                        dialogue=(clean_audio if not is_none_vo and "(SFX" not in dialogue_raw else None),
                         sound_effect=sfx,
                         emotion=emotion,
                         duration_in_seconds=5,
@@ -1756,31 +1748,8 @@ OUTPUT JSON FORMAT:
         return TechnicalBreakdownOutput(characters=characters, scenes=scenes)
 
     async def _call_hf_completion(self, prompt: str) -> str:
-        """Call Hugging Face Inference API for chat completion."""
-        from huggingface_hub import InferenceClient
-        import os
-        import asyncio
-        
-        hf_token = os.getenv("HF_TOKEN")
-        if not hf_token:
-            raise ValueError("HF_TOKEN not found in environment")
-            
-        # Using a reliable instruction tuned model
-        client = InferenceClient(
-            model="meta-llama/Llama-3.3-70B-Instruct",
-            token=hf_token
-        )
-        
-        loop = asyncio.get_event_loop()
-        def _make_call():
-            response = client.chat_completion(
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=2000,
-                temperature=0.3
-            )
-            return response.choices[0].message.content
-
-        return await loop.run_in_executor(None, _make_call)
+        """Call Hugging Face Inference API for chat completion (Legacy wrapper)."""
+        return await self._call_huggingface(prompt)
 
     async def compute_scene_durations(self, scenes: list[dict]) -> list[dict]:
         """
@@ -1798,21 +1767,36 @@ OUTPUT JSON FORMAT:
         # Build prompt payload
         scene_texts = []
         for s in scenes:
-            vo = s.get('voiceover_text') or s.get('voiceover', '')
-            dialogue = s.get('dialogue', '')
+            vo = (s.get('voiceover_text') or s.get('voiceover') or "").strip()
+            dialogue = (s.get('dialogue') or "").strip()
+            
             # Fallback to dialogue if no voiceover
-            text_to_analyze = vo if vo and vo.strip() else dialogue
+            text_to_analyze = vo if vo else dialogue
+            
+            # NEW FALLBACK: extract dialogue from textToVideo if standard fields are empty
+            if not text_to_analyze:
+                v_prompt = s.get('image_to_video_prompt') or s.get('textToVideo') or ""
+                if "Dialogue:" in v_prompt:
+                    d_match = re.search(r'Dialogue:\s*["\']?(.*?)["\']?$', v_prompt, re.IGNORECASE)
+                    if d_match:
+                        text_to_analyze = d_match.group(1).strip()
+            
+            # Count words accurately in Python (better for Urdu/Non-English)
+            word_count = len(text_to_analyze.split()) if text_to_analyze else 0
+
             scene_texts.append({
                 "scene_number": s.get('scene_number', 1),
-                "text_to_analyze": text_to_analyze.strip()
+                "word_count": word_count,
+                "text_to_analyze": text_to_analyze[:300]
             })
             
-        prompt = f"""You are a video editor AI. Compute the required video clip duration for each scene based on its spoken text length (voiceover or dialogue).
+        prompt = f"""You are a video editor AI. Compute the required video clip duration for each scene based on the provided WORD COUNT.
 
 RULES:
-- If text is empty or very short (<= 15 words) -> "5s" clip, needs_extend=false
-- If text is medium (16-40 words) -> "10s" clip, needs_extend=false
-- If text is long (41-70 words) -> "10s" clip, needs_extend=true, extend_duration="5s" (Total ~15s max)
+- If word_count is 0-15 -> 6s clip, needs_extend=false, total_clip_time=6
+- If word_count is 16-40 -> 10s clip, needs_extend=false, total_clip_time=10
+- If word_count is 41-70 -> 10s clip, needs_extend=true, extend_duration="6s", total_clip_time=16
+- If word_count is > 70 -> 10s clip, needs_extend=true, extend_duration="10s", total_clip_time=20
 
 SCENES TO ANALYZE:
 ---
@@ -1825,10 +1809,10 @@ OUTPUT STRICT JSON FORMAT ONLY:
   "durations": [
     {{
       "scene_number": 1,
-      "clip_duration": "5s",
+      "clip_duration": "6s",
       "needs_extend": false,
       "extend_duration": null,
-      "total_clip_time": 5
+      "total_clip_time": 6
     }}
   ]
 }}
@@ -1852,16 +1836,22 @@ OUTPUT STRICT JSON FORMAT ONLY:
                 print(f"   ✅ Computed durations via Gemini for {len(durations)} scenes.")
             except Exception as e2:
                 print(f"   ❌ Both LLMs failed for duration computation: {e2}. Using safe defaults.")
-                # Safe default fallback
+                # Safe default fallback based on pre-calculated word counts
                 durations = []
                 for st in scene_texts:
-                    durations.append({
-                        "scene_number": st["scene_number"],
-                        "clip_duration": "10s",
-                        "needs_extend": False,
-                        "extend_duration": None,
-                        "total_clip_time": 10
-                    })
+                    wc = st.get("word_count", 0)
+                    if wc <= 15:
+                        d = {"clip_duration": "6s", "needs_extend": False, "extend_duration": None, "total_clip_time": 6}
+                    elif wc <= 40:
+                        d = {"clip_duration": "10s", "needs_extend": False, "extend_duration": None, "total_clip_time": 10}
+                    elif wc <= 70:
+                        d = {"clip_duration": "10s", "needs_extend": True, "extend_duration": "6s", "total_clip_time": 16}
+                    else:
+                        d = {"clip_duration": "10s", "needs_extend": True, "extend_duration": "10s", "total_clip_time": 20}
+                    
+                    d["scene_number"] = st["scene_number"]
+                    d["word_count"] = wc # Keep for debugging
+                    durations.append(d)
 
         # Map back to scenes list
         for scene in scenes:
@@ -1870,14 +1860,16 @@ OUTPUT STRICT JSON FORMAT ONLY:
             if match:
                 scene['duration_config'] = match
                 scene['duration_in_seconds'] = match.get('total_clip_time', 10)
+                scene['duration'] = scene['duration_in_seconds']
             else:
                 scene['duration_config'] = {
-                    "clip_duration": "10s",
+                    "clip_duration": "6s",
                     "needs_extend": False,
                     "extend_duration": None,
-                    "total_clip_time": 10
+                    "total_clip_time": 6
                 }
                 scene['duration_in_seconds'] = 10
+                scene['duration'] = 10
                 
         return scenes
 

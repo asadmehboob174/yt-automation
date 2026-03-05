@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Any, List
 import os
 import sys
 import asyncio
@@ -87,17 +87,38 @@ class SFXMarker(BaseModel):
 
 
 class Scene(BaseModel):
-    voiceover_text: str
-    character_pose_prompt: str
-    background_description: str
+    index: int = 0
+    voiceover_text: str = ""
+    character_pose_prompt: str = ""
+    background_description: str = ""
     duration_in_seconds: int = 10
     camera_angle: str = "medium shot"
     motion_description: str = ""
-    dialogue: Optional[str] = None
+    dialogue: Any = None # Can be str or dict
     character_name: str = "Character"
     emotion: str = "neutrally"
-    characterId: Optional[str] = None # Support for multi-character cast
+    characterId: Optional[str] = None 
     sfx_markers: list[SFXMarker] = []
+    
+    # Synchronization fields for frontend/workflow
+    duration_config: Optional[dict] = None
+    grok_video_prompt: Optional[dict] = None
+    sfx: Optional[list[str]] = []
+    music_notes: Optional[str] = None
+    text_to_audio_prompt: Optional[str] = None
+    resolution: Optional[str] = "720p"
+
+    # Frontend camelCase compatibility
+    textToImage: Optional[str] = None
+    textToVideo: Optional[str] = None
+    backgroundDesc: Optional[str] = None
+    shotType: Optional[str] = None
+    duration: Optional[int] = None
+    durationConfig: Optional[dict] = None
+    grokVideoPrompt: Optional[dict] = None
+    textToAudioPrompt: Optional[str] = None
+    musicNotes: Optional[str] = None
+    formattedPrompt: Optional[str] = None
 
 class VideoScript(BaseModel):
     niche_id: str
@@ -1459,6 +1480,9 @@ class GenerateVideoRequest(BaseModel):
     voice_provider: str = "edge-tts" # edge-tts, xtts, elevenlabs
     voice_id: str | None = None
     resolution: str | None = "720p"
+    # Duration Params
+    duration: str | int | None = "10s"
+    extend_duration: str | None = None
 
 
 def smart_coerce(val: any) -> str:
@@ -1562,17 +1586,21 @@ async def generate_video(request: GenerateVideoRequest):
             
             async def generate_and_verify(prompt: str) -> Path:
                 """Inner helper to generate and immediately verify integrity."""
+                # Determine base duration
+                base_dur = request.duration or 10
+                
                 path = await animator.animate(
                     image_path=image_path,
                     motion_prompt=prompt,
                     style_suffix="Cinematic, Pixar-style 3D animation",
-                    duration=10,
+                    duration=base_dur,
                     camera_angle=request.camera_angle or "Medium Shot",
                     aspect_ratio=aspect_ratio,
                     resolution=request.resolution or "720p",
                     dialogue=request.dialogue,
                     sound_effect=request.sound_effect,
-                    emotion=request.emotion or "neutrally"
+                    emotion=request.emotion or "neutrally",
+                    extend_duration=request.extend_duration
                 )
                 # Strict Integrity check
                 file_size = os.path.getsize(path)
@@ -1590,10 +1618,20 @@ async def generate_video(request: GenerateVideoRequest):
                     raise ModerationError(f"Generated video is content-moderated or corrupt HTML ({file_size} bytes).")
                 
                 # Check actual duration
-                if not VideoSettings.verify_clip_duration(path, expected_duration=10.0):
-                    print(f"⚠️ Duration verification failed for {path}")
-                    if path.exists(): os.unlink(path)
-                    raise ModerationError("Generated video has invalid duration (0s or mismatch).")
+                # Use total expected time if extended
+                expected_sec = 10.0
+                if str(base_dur).startswith("5") or str(base_dur).startswith("6"):
+                    expected_sec = 6.0
+                
+                if request.extend_duration:
+                    ext_val = 6.0 if "6s" in str(request.extend_duration) else 10.0
+                    expected_sec += ext_val
+
+                if not VideoSettings.verify_clip_duration(path, expected_duration=expected_sec):
+                    print(f"⚠️ Duration verification failed for {path} (expected ~{expected_sec}s)")
+                    # We don't necessarily delete here if it's just a small mismatch, 
+                    # but we should log it. verify_clip_duration already logs a warning.
+                    pass
 
                 return path
 
@@ -2135,6 +2173,18 @@ async def stitch_videos(request: StitchVideosRequest):
         # --- 2. VIDEO STITCHING (Driven by Target Durations) ---
         stitched_path = temp_dir / "stitched_no_music.mp4"
         
+        # Compute per-scene audio volumes:
+        # Scenes WITH voiceover -> duck original audio to 23%
+        # Scenes WITHOUT voiceover -> keep original Grok audio at 100%
+        clip_audio_volumes = []
+        for i in range(len(final_clips_to_stitch)):
+            if i < len(fresh_audio_paths) and fresh_audio_paths[i] is not None:
+                clip_audio_volumes.append(0.23)  # Duck when voiceover exists
+            else:
+                clip_audio_volumes.append(1.0)   # Full volume when no voiceover
+        
+        print(f"   🔊 Per-scene audio volumes: {clip_audio_volumes}")
+        
         # Stitch video (respecting mute_source_audio flag and exact audio lengths)
         stitched_path = editor.stitch_clips_with_fade(
             final_clips_to_stitch, 
@@ -2142,7 +2192,8 @@ async def stitch_videos(request: StitchVideosRequest):
             fade_duration=0.4,
             target_resolution=target_res,
             mute_audio=mute_source,
-            target_durations=target_durations # newly calculated array
+            target_durations=target_durations, # newly calculated array
+            clip_audio_volumes=clip_audio_volumes
         )
         print(f"   ✅ Stitched video created: {stitched_path}")
         

@@ -71,7 +71,8 @@ class PromptBuilder:
         emotion: str = "neutrally",
         grok_video_prompt: Optional[dict] = None,
         sfx: Optional[list[str]] = None,
-        music_notes: Optional[str] = None
+        music_notes: Optional[str] = None,
+        duration: Optional[str] = None
     ) -> str:
         """
         Builds the prompt in the "Director's Script" format for Grok Imagine 1.0.
@@ -130,10 +131,21 @@ class PromptBuilder:
         # Final assembly — motion-only prompt for Grok
         final_prompt = base_prompt.strip()
         
-        # Ensure it starts with the duration if not present (e.g. "10s: ")
-        if not re.search(r'^[0-9]+s:', final_prompt):
-             duration_prefix = "10s: " # Default to 10s for Grok Imagine
-             final_prompt = duration_prefix + final_prompt
+        # --- Strictly Enforce Duration Prefix ---
+        # Remove any existing duration prefix (e.g. "10s: " or "6s: ")
+        import re
+        final_prompt = re.sub(r'^[0-9]+s:?\s*', '', final_prompt)
+        
+        # Add the target duration
+        duration_val = str(duration or "10s")
+        if not duration_val.endswith("s"): duration_val += "s"
+        
+        # Ensure it's exactly one of "6s" or "10s" (Grok's supported values)
+        if duration_val not in ["6s", "10s"]:
+            logger.warning(f"⚠️ PromptBuilder: Unsupported duration {duration_val}, defaulting to 10s prefix.")
+            duration_val = "10s"
+            
+        final_prompt = f"{duration_val}: {final_prompt}"
 
         return final_prompt
 
@@ -174,152 +186,275 @@ class URLListener:
 class VideoSettings:
     """Detect and select duration/aspect ratio before generation."""
     
+    # NOTE: Selectors now use :text-is() for EXACT matching (not substring)
     DURATION_SELECTORS = {
-        "5s": ["[data-duration='5']", "button:has-text('5s')", ".duration-5", "[data-duration='6']", "button:has-text('6s')", ".duration-6"],
-        "6s": ["[data-duration='5']", "button:has-text('5s')", ".duration-5", "[data-duration='6']", "button:has-text('6s')", ".duration-6"],
-        "10s": ["[data-duration='10']", "button:has-text('10s')", ".duration-10"],
+        "6s": ["button:text-is('6s')", "button:has-text('6s')", "[data-duration='6']", "button:text-is('5s')", "[data-duration='5']"],
+        "5s": ["button:text-is('5s')", "[data-duration='5']", "button:text-is('6s')", "[data-duration='6']"],
+        "10s": ["button:text-is('10s')", "button:has-text('10s')", "[data-duration='10']"],
     }
     
-    # Updated selectors based on actual Grok UI HTML (Feb 2026)
-    # Buttons may have aria-label="9:16" OR text like "Vertical"/"Landscape"
+    # These are highly robust locators based on the DOM structure provided by the user.
     ASPECT_SELECTORS = {
-        "9:16": [
-            "button[aria-label='9:16']",
-            "button[aria-label*='Vertical']",
-            "button[aria-label*='Portrait']",
-            "[aria-label='9:16']",
-            "button:has-text('9:16')",
-            "button:has-text('Vertical')",
-            "button:has-text('Portrait')",
-            ".aspect-vertical",
-            "button:has-text('9')", # Partial match fallback
-            "svg:has-text('9:16')", # Sometimes it's an SVG text
-            "button:has(svg[aria-label='9:16'])",
-            # Broader matches for text inside any clickable element
-            "text=9:16",
-            "div:text-is('9:16')",
-            "span:text-is('9:16')",
-        ],
-        "16:9": [
-            "button[aria-label='16:9']",
-            "button[aria-label*='Landscape']",
-            "button[aria-label*='Horizontal']",
-            "[aria-label='16:9']",
-            "button:has-text('16:9')",
-            "button:has-text('Landscape')",
-            "button:has-text('Horizontal')",
-            ".aspect-landscape",
-            "button:has-text('16')", # Partial match fallback
-            "svg:has-text('16:9')",
-            "button:has(svg[aria-label='16:9'])",
-            "text=16:9",
-            "div:text-is('16:9')",
-            "span:text-is('16:9')",
-        ],
-        "1:1": [
-            "button[aria-label='1:1']",
-            "button[aria-label*='Square']",
-            "[aria-label='1:1']",
-            "button:has-text('1:1')",
-            "button:has-text('Square')",
-        ],
-    }
-
-    RESOLUTION_SELECTORS = {
-        "720p": ["button:has-text('720p')", "[data-resolution='720']"],
-        "480p": ["button:has-text('480p')", "[data-resolution='480']"],
+        "16:9": ["button[role='option']:has-text('16:9')", "[role='menuitem']:has-text('16:9')"],
+        "9:16": ["button[role='option']:has-text('9:16')", "[role='menuitem']:has-text('9:16')"],
+        "1:1":  ["button[role='option']:has-text('1:1')",  "[role='menuitem']:has-text('1:1')"]
     }
     
-    @classmethod
-    async def configure(cls, page: Page, duration: str = "10s", aspect: str = "9:16", resolution: str = "720p"):
-        """Set duration and aspect ratio before generating."""
-        logger.info(f"⚙️ Configuring video settings: duration={duration}, aspect={aspect}")
+    # We will favor custom JS exact-text matching for speed and reliability,
+    # but keep these for generic references.
+    DURATION_SELECTORS  = { "6s": [""], "10s": [""] }
+    RESOLUTION_SELECTORS= { "480p": [""], "720p": [""] }
+
+    @staticmethod
+    async def configure(page: Page, duration: str = "10s", aspect: str = "9:16", resolution: str = "720p"):
+        """Sets the video generation parameters in the Grok UI row."""
+        logger.info(f"⚙️ VideoSettings.configure: duration={duration}, aspect={aspect}, resolution={resolution}")
         
-        # ── Step 1: Open the "Video/Image" icon popup ──
-        # The user says: "set aspect ratio by clicking video/image icon to open pop"
-        dropdown_opened = False
+        # ── Step 0: Ensure "Video" mode is active ──
         try:
-            toggle_selectors = [
-                 "button:has-text('Video')",
-                 "button:has-text('Image')",
-                 "button[aria-label='Model select']",
-                 "button[aria-label='Settings']",
-                 "[data-testid='settings-button']",
-            ]
+            video_tab = page.locator('button[role="radio"][aria-selected="false"]:has-text("Video"), button:not([aria-selected="true"]):has-text("Video")').first
+            if await video_tab.count() > 0:
+                is_selected = await video_tab.evaluate("el => el.getAttribute('aria-selected') === 'true' || el.classList.contains('bg-white') || el.classList.contains('active')")
+                if not is_selected:
+                    logger.info("🎬 Mode: Switching to 'Video' mode...")
+                    await video_tab.click()
+                    await asyncio.sleep(0.5)
+        except: pass
+
+        duration_key = str(duration)
+        if not duration_key.endswith("s"): duration_key += "s"
+
+        # ═══════════════════════════════════════════════════════════
+        # CORE FIX: Use a single JS function that finds AND clicks
+        # the exact button by strict text equality. This avoids:
+        # 1. Playwright's `has-text` substring matching (9:16 vs 16:9)
+        # 2. `is_active` stale state from previous scenes
+        # We use a localized JS function to perform strict exact-matches on the button text
+        # inside the specific radiogroup container to avoid substring collisions.
+        async def js_strict_click(target: str, setting_name: str) -> bool:
+            # setting_name maps to the aria-label of the radiogroup: "Video duration" or "Video resolution"
+            aria_label = "Video duration" if setting_name == "Duration" else "Video resolution"
             
-            for selector in toggle_selectors:
-                btn = page.locator(selector).first
-                if await btn.count() > 0 and await btn.is_visible():
-                    logger.info(f"📂 Clicking toggle icon to open popup: {selector}")
-                    await btn.click()
-                    dropdown_opened = True
+            # First check if it's already selected
+            is_already_active = await page.evaluate(f"""([target, ariaLabel]) => {{
+                const group = document.querySelector(`div[role="radiogroup"][aria-label="${{ariaLabel}}"]`);
+                if (!group) return false;
+                
+                const activeBtn = group.querySelector('button[role="radio"][aria-checked="true"]');
+                if (activeBtn) {{
+                    const text = (activeBtn.innerText || activeBtn.textContent || "").trim();
+                    return text === target;
+                }}
+                return false;
+            }}""", [target, aria_label])
+            
+            if is_already_active:
+                logger.info(f"✅ {setting_name} {target} is already selected.")
+                return True
+                
+            # If not active, find and click it
+            clicked = await page.evaluate(f"""([target, ariaLabel]) => {{
+                const group = document.querySelector(`div[role="radiogroup"][aria-label="${{ariaLabel}}"]`);
+                if (!group) return false;
+                
+                const buttons = Array.from(group.querySelectorAll('button[role="radio"]'));
+                const match = buttons.find(b => {{
+                    const text = (b.innerText || b.textContent || "").trim();
+                    return text === target && b.offsetWidth > 0;
+                }});
+                
+                if (match) {{
+                    match.click();
+                    return true;
+                }}
+                return false;
+            }}""", [target, aria_label])
+            
+            if clicked:
+                logger.info(f"✅ Set {setting_name}: {target} (via exact JS match in group)")
+                return True
+                
+            return False
+
+        # ── Step 1: Handle Duration & Resolution via exact match in their radiogroup ──
+        dur_ok = await js_strict_click(duration_key, "Duration")
+        res_ok = await js_strict_click(resolution, "Resolution")
+        # ── Step 2: Handle Aspect Ratio (it's a DROPDOWN, not a direct button) ──
+        # The aspect ratio button shows the CURRENT value (e.g. "16:9 ∧")
+        # Clicking it opens a dropdown menu with options like 2:3, 3:2, 1:1, 9:16, 16:9
+        # So we need to: (a) open the dropdown, (b) click the exact option inside
+        
+        aspect_ok = False
+        
+        # 2a: Check if the desired aspect is already the active one shown on the button
+        current_aspect = await page.evaluate("""() => {
+            // The user provided HTML: <button aria-label="Aspect Ratio">...<span>16:9</span>...</button>
+            const aspectBtn = document.querySelector('button[aria-label="Aspect Ratio"], button[aria-label*="Aspect"]');
+            
+            if (aspectBtn) {
+                const text = (aspectBtn.innerText || "").trim().toLowerCase();
+                // Match exact tokens to avoid '16:9' matching '16'
+                if (text === '16:9' || text.endsWith('16:9')) return '16:9';
+                if (text === '9:16' || text.endsWith('9:16')) return '9:16';
+                if (text === '1:1'  || text.endsWith('1:1'))  return '1:1';
+                
+                // Try looking specifically at span inside
+                const span = aspectBtn.querySelector('span:last-child');
+                if (span) {
+                    const spanText = (span.innerText || "").trim();
+                    if (spanText === '16:9') return '16:9';
+                    if (spanText === '9:16') return '9:16';
+                    if (spanText === '1:1') return '1:1';
+                }
+            }
+            
+            // Fallback to searching all buttons if aria-label changed
+            const buttons = Array.from(document.querySelectorAll('button, div[role="button"]'));
+            const fallbackBtn = buttons.find(b => {
+                const text = (b.innerText || "").trim().toLowerCase();
+                return (text.includes('16:9') || text.includes('9:16') || text.includes('1:1')) && b.offsetWidth > 0;
+            });
+            
+            if (fallbackBtn) {
+                const text = fallbackBtn.innerText.trim();
+                // Ensure we don't return '16:9' just because we found '16'
+                if (text.includes('16:9')) return '16:9';
+                if (text.includes('9:16')) return '9:16';
+                if (text.includes('1:1')) return '1:1';
+            }
+            return null;
+        }""")
+        
+        logger.info(f"📐 Current aspect ratio on button: {current_aspect}")
+        
+        if current_aspect == aspect:
+            logger.info(f"✅ Aspect ratio {aspect} is already selected.")
+            aspect_ok = True
+        else:
+            # 2b: Open the dropdown by clicking the aspect ratio button
+            logger.info(f"📂 Opening aspect ratio dropdown (current={current_aspect}, target={aspect})...")
+            
+            opened = False
+            try:
+                # Radix UI often ignores JS .click() because it listens for pointerdown.
+                # Native Playwright click dispatches all correct trusted events.
+                aspect_btn = page.locator('button[aria-label="Aspect Ratio"]').first
+                if await aspect_btn.count() > 0:
+                    await aspect_btn.click(timeout=3000)
+                    opened = True
+                else:
+                    # Fallback locator
+                    buttons = page.locator('button')
+                    for i in range(await buttons.count()):
+                        btn = buttons.nth(i)
+                        text = await btn.inner_text()
+                        if ":" in text and await btn.is_visible():
+                            await btn.click(timeout=3000)
+                            opened = True
+                            break
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to open aspect ratio dropdown natively: {e}")
+            
+            if opened:
+                logger.info("⏳ Waiting for aspect ratio dropdown to animate open...")
+                await page.wait_for_timeout(800) # Give Radix UI time to animate and mount
+                
+            # 2c: Click the target ratio in the popup
+            logger.info(f"🎯 Clicking {aspect} inside dropdown/popup...")
+            
+            # 2c: Click the target ratio in the popup
+            logger.info(f"🎯 Clicking {aspect} inside dropdown/popup...")
+            
+            aspect_ok = False
+            try:
+                # The user provided HTML indicates it uses role="menuitem" inside a Radix UI portal.
+                menu_item = page.locator(f'[role="menuitem"]:has-text("{aspect}"), [role="option"]:has-text("{aspect}")').first
+                if await menu_item.count() > 0:
+                    await menu_item.click(timeout=2000)
+                    aspect_ok = True
+                else:
+                    # Fallback to general text match inside the portal
+                    portal_item = page.locator('[data-radix-popper-content-wrapper], [role="menu"]').locator(f'text="{aspect}"').first
+                    if await portal_item.count() > 0:
+                        await portal_item.click(timeout=2000)
+                        aspect_ok = True
+                        
+                if aspect_ok:
+                    logger.info(f"✅ Set aspect ratio via native Playwright locator: {aspect}")
+                else:
+                    logger.warning(f"⚠️ Could not find {aspect} in the dropdown DOM.")
                     
-                    # DYNAMIC WAIT: Wait for any aspect ratio selector to become visible
-                    # instead of a fixed 1.5s sleep.
-                    all_aspect_selectors = [sel for sublist in cls.ASPECT_SELECTORS.values() for sel in sublist]
-                    try:
-                        # Wait for at least one aspect ratio button to appear (indicating popup is open)
-                        # We use a combined selector for efficiency
-                        combined_aspect_selector = ", ".join(all_aspect_selectors[:5]) # Focus on primary ones
-                        await page.wait_for_selector(combined_aspect_selector, state="visible", timeout=3000)
-                    except:
-                        # Fallback to short sleep if selector wait fails
+            except Exception as e:
+                logger.warning(f"⚠️ Playwright native click failed for {aspect}: {e}")
+                
+            if not aspect_ok:
+                logger.warning(f"⚠️ Playwright native click failed for {aspect}, trying keyboard navigation...")
+                
+                # Ultimate fallback: Keyboard Navigation
+                # Radix UI and most modern comboboxes support arrow keys
+                aspect_ok = await page.evaluate(f"""async (target) => {{
+                    const wait = (ms) => new Promise(r => setTimeout(r, ms));
+                    
+                    // The dropdown should be open and focused.
+                    for (let i = 0; i < 5; i++) {{
+                        // Simulate ArrowDown
+                        document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'ArrowDown', code: 'ArrowDown', bubbles: true }}));
+                        await wait(100);
+                        
+                        // Check what is currently highlighted
+                        const activeEl = document.querySelector('[data-highlighted], [aria-selected="true"], :focus');
+                        if (activeEl) {{
+                            const text = (activeEl.innerText || activeEl.textContent || "").trim();
+                            if (text === target || (text.includes(target) && text.length < target.length + 5)) {{
+                                // Found it, press Enter!
+                                document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'Enter', code: 'Enter', bubbles: true }}));
+                                activeEl.click(); // Also dispatch a physical click just in case
+                                await wait(200);
+                                return true;
+                            }}
+                        }}
+                    }}
+                    return false;
+                }}""", aspect)
+                
+                if aspect_ok:
+                    logger.info(f"✅ Set aspect ratio via Keyboard Navigation: {aspect}")
+                else:
+                    logger.error(f"❌ Could not set aspect ratio {aspect} after all attempts.")
+                    
+                    # Capture the DOM of the popup for debugging
+                    dom = await page.evaluate("""() => {
+                        const portal = document.querySelector('[data-radix-popper-content-wrapper], [role="menu"], [role="listbox"], .z-50');
+                        return portal ? portal.outerHTML : document.body.innerHTML.substring(0, 1000);
+                    }""")
+                    logger.debug(f"Popup DOM during failure:\n{dom}")
+        if not dur_ok:
+            logger.info("📂 Duration not found in row, trying settings popup...")
+            # Some UI layouts put duration inside a popup
+            menu_open = await page.locator("div[role='menu'], .absolute.z-50, [data-testid='popover-content']").count() > 0
+            if not menu_open:
+                try:
+                    settings_btn = page.locator("button[aria-label='Settings'], button:has-text('Settings')").first
+                    if await settings_btn.count() > 0:
+                        await settings_btn.click()
                         await asyncio.sleep(0.5)
-                    break
-        except Exception as e:
-            logger.warning(f"Failed to open settings popup: {e}")
-        
-        # ── Step 2: Set Aspect Ratio inside popup ──
-        aspect_clicked = False
-        for selector in cls.ASPECT_SELECTORS.get(aspect, []):
-            try:
-                btn = page.locator(selector).first
-                if await btn.count() > 0 and await btn.is_visible():
-                    await btn.click(timeout=1000)
-                    logger.info(f"✅ Set aspect ratio: {aspect}")
-                    aspect_clicked = True
-                    break
-            except: continue
-        
-        # ── Step 3: Set Duration ──
-        duration_key = f"{duration}s" if isinstance(duration, (int, float)) else str(duration)
-        if not duration_key.endswith("s"):
-            duration_key += "s"
-            
-        duration_clicked = False
-        for selector in cls.DURATION_SELECTORS.get(duration_key, []):
-            try:
-                btn = page.locator(selector).first
-                if await btn.count() > 0 and await btn.is_visible():
-                    await btn.click(timeout=1000)
-                    logger.info(f"✅ Set duration: {duration_key}")
-                    duration_clicked = True
-                    break
-            except: continue
-            
-        if not duration_clicked:
-            # Fallback if specific button isn't found, maybe click a raw toggle if available
-            logger.warning(f"⚠️ Could not find duration button for {duration_key} inside popup.")
+                except: pass
+            dur_ok = await js_strict_click(duration_key, "Duration (popup)")
 
-        # ── Step 4: Set Resolution ──
-        for selector in cls.RESOLUTION_SELECTORS.get(resolution, []):
-            try:
-                btn = page.locator(selector).first
-                if await btn.count() > 0 and await btn.is_visible():
-                    await btn.click(timeout=1000)
-                    logger.info(f"✅ Set resolution: {resolution}")
-                    break
-            except: continue
-
-        # ── Step 5: Close popup ──
-        if dropdown_opened:
-            try:
+        # ── Step 4: Close any open popup ──
+        try:
+            if await page.locator("div[role='menu'], .absolute.z-50, [data-testid='popover-content']").count() > 0:
                 await page.keyboard.press("Escape")
-                await asyncio.sleep(0.5)
-            except: pass
+                await asyncio.sleep(0.3)
+        except: pass
         
-        if not aspect_clicked:
-            logger.warning(f"⚠️ Could not find aspect ratio button for {aspect} inside popup.")
+        # ── Step 5: Final status ──
+        if not dur_ok:
+            logger.warning(f"⚠️ FAILED to set duration to {duration_key}! Video may use wrong duration.")
+        if not aspect_ok:
+            logger.warning(f"⚠️ FAILED to set aspect ratio to {aspect}!")
+        if not res_ok:
+            logger.info(f"ℹ️ Resolution {resolution} not found (may use default).")
 
     @staticmethod
     def verify_clip_duration(clip_path: Path, expected_duration: float) -> bool:
@@ -474,6 +609,7 @@ async def generate_single_clip(
     needs_extend: bool = False,
     extend_duration: Optional[str] = None
 ) -> Path:
+    logger.info(f"🎬 generate_single_clip: Starting for duration={duration}, aspect={aspect}, resolution={resolution}")
     browser = None
     pw = None
     page = external_page
@@ -517,6 +653,14 @@ async def generate_single_clip(
             except:
                 logger.warning("Timeout waiting for prompt area, continuing anyway...")
             
+            # MANDATORY: Close any leftover popups from previous runs/failed settings
+            try:
+                if await page.locator("div[role='menu'], .absolute.z-50").count() > 0:
+                    logger.info("🧹 Clearing leftover overlays before starting...")
+                    await page.keyboard.press("Escape")
+                    await asyncio.sleep(0.5)
+            except: pass
+
             if await check_rate_limit(page):
                 raise RateLimitError("Rate limit detected")
 
@@ -531,11 +675,18 @@ async def generate_single_clip(
                 character_name=character_name, emotion=emotion, sound_effect=sound_effect,
                 grok_video_prompt=grok_video_prompt,
                 sfx=sfx,
-                music_notes=music_notes
+                music_notes=music_notes,
+                duration=duration
             )
-            # Ensure it starts with duration for the refinement pass
-            if not re.search(r'^[0-9]+s:', prompt):
-                 prompt = f"{duration} {prompt}"
+            # Strictly enforce the correct duration prefix (e.g. "6s: ")
+            # We override any default that PromptBuilder might have added if it's wrong
+            duration_val = duration.replace("s", "")
+            target_prefix = f"{duration_val}s: "
+            
+            if not prompt.startswith(target_prefix):
+                # Remove any existing duration prefix ([0-9]+s:)
+                prompt = re.sub(r'^[0-9]+s:?\s*', '', prompt)
+                prompt = target_prefix + prompt
             
             print(f"\n🚀 FINAL REFINEMENT PROMPT:\n{prompt}\n")
 
@@ -578,63 +729,149 @@ async def generate_single_clip(
                 logger.warning("🕒 Upload confirmation (Remove button) timed out, attempting click anyway...")
 
             make_video_clicked = False
+            # Broad selectors covering button, div, span, and role variants
             make_video_selectors = [
-                 # 1. Direct aria-label (Most stable if it exists)
                 "button[aria-label='Make video']",
-                # 2. Text match inside a button, excluding the search bar
-                "button:has-text('Make video'):not([aria-label='Search'])",
-                # 3. Floating action button parent (Bottom right corner of prompt area)
-                ".absolute.bottom-4.right-4 button:has-text('Make video')", 
-                ".absolute.bottom-3.right-3 button:has-text('Make video')",
-                # 4. Role-based matching
-                "div[role='button']:has-text('Make video')",
-                # 5. Icon + Text wrapper
+                "button:has-text('Make video')",
+                "button[data-slot='button']:has-text('Make video')",
+                "button[data-slot='button'][aria-label='Make video']",
+                "button[data-testid='make-video-button']",
+                "[data-testid='submit-button']",
+                "button[aria-label='Submit']",
+                "div:has-text('Make video')",
+                "span:has-text('Make video')",
+                "[role='button']:has-text('Make video')",
+                ".absolute.bottom-4.right-4 button", 
+                ".absolute.bottom-4.right-4 div",
                 "button:has(svg):has-text('Make video')",
-                # 6. Ultra-generic fallback
                 "text='Make video'"
             ]
             combined_selector = ", ".join(make_video_selectors)
             
-            for attempt in range(15): 
+            for attempt in range(25): 
                 try:
-                    # Check if button is visible and enabled
-                    btn = await page.wait_for_selector(combined_selector, state="visible", timeout=3000)
+                    # 1. Try Playwright Locator first
+                    btn = await page.wait_for_selector(combined_selector, state="visible", timeout=1500)
                     if btn:
-                        # Ensure it's not disabled
-                        is_disabled = await btn.evaluate("el => el.disabled || el.getAttribute('aria-disabled') === 'true'")
+                        # Check disabled state
+                        is_disabled = await btn.evaluate("""el => {
+                            const style = window.getComputedStyle(el);
+                            const text = (el.innerText || "").toLowerCase();
+                            // If it's the search button, ignore it
+                            if (text.includes('search') || el.getAttribute('aria-label') === 'Search') return true;
+                            
+                            return el.disabled || 
+                                   el.getAttribute('aria-disabled') === 'true' || 
+                                   el.classList.contains('opacity-50') ||
+                                   el.classList.contains('disabled') ||
+                                   style.pointerEvents === 'none';
+                        }""")
+                        
                         if is_disabled:
-                            logger.info(f"⏳ 'Make video' button is disabled (Attempt {attempt+1}), waiting...")
+                            if attempt % 5 == 0:
+                                logger.info(f"⏳ 'Make video' button is disabled (Attempt {attempt+1}). Waking up UI...")
+                                try:
+                                    # More aggressive wake up: Click input, type something, select all, delete
+                                    prompt_area = page.locator(".ProseMirror, textarea, [contenteditable='true']").first
+                                    await prompt_area.click()
+                                    await page.keyboard.press("Control+a")
+                                    await page.keyboard.press("Backspace")
+                                    await page.keyboard.type(".")
+                                    await asyncio.sleep(0.5)
+                                    await page.keyboard.press("Control+a")
+                                    await page.keyboard.press("Backspace")
+                                    logger.info("⌨️ Performed aggressive UI wake-up (Type/Delete).")
+                                except: pass
+                            
                             await asyncio.sleep(1)
                             continue
 
                         await btn.scroll_into_view_if_needed()
-                        await btn.click(force=True, timeout=5000)
-                        logger.info("✅ Successfully clicked 'Make video' via Playwright locator.")
+                        await btn.click(force=True, timeout=3000)
+                        logger.info("✅ Successfully clicked 'Make video' via Playwright.")
                         make_video_clicked = True
                         break
                 except:
-                    # JS Fallback - very aggressive
-                    clicked = await page.evaluate("""() => {
-                        const findBtn = () => {
-                            const candidates = Array.from(document.querySelectorAll('button, [role="button"], span, div'));
-                            return candidates.find(b => 
-                                b.innerText && 
-                                b.innerText.toLowerCase().includes('make video') &&
-                                b.getBoundingClientRect().width > 0
-                            );
-                        };
-                        const b = findBtn();
-                        if (b && !b.disabled && b.getAttribute('aria-disabled') !== 'true') {
-                            b.scrollIntoView();
-                            b.click(); return true;
+                    # 2. JS Fallback (Aggressive text/attribute search)
+                    res = await page.evaluate("""() => {
+                        const candidates = Array.from(document.querySelectorAll('button, div, span, [role="button"]'));
+                        // Prioritize buttons
+                        const findMatch = (tag) => candidates.find(el => {
+                            if (tag && el.tagName !== tag.toUpperCase()) return false;
+                            const text = (el.innerText || "").trim().toLowerCase();
+                            const aria = (el.getAttribute('aria-label') || "").toLowerCase();
+                            const isVisible = el.offsetWidth > 0 && el.offsetHeight > 0 && window.getComputedStyle(el).visibility !== 'hidden';
+                            
+                            // Filter out search/other unrelated buttons
+                            if (text.includes('search') || aria.includes('search')) return false;
+                            
+                            // Match 'make video'
+                            const isMakeVideo = text.includes('make video') || aria.includes('make video') || aria === 'make video';
+                            return isVisible && isMakeVideo;
+                        });
+
+                        const b = findMatch('BUTTON') || findMatch();
+                        
+                        if (b) {
+                            const style = window.getComputedStyle(b);
+                            // IMPORTANT: Check for disabled on the element itself OR any parent button
+                            const parentBtn = b.closest('button');
+                            const target = parentBtn || b;
+                            
+                            if (target.disabled || target.getAttribute('aria-disabled') === 'true' || style.pointerEvents === 'none') {
+                                return { found: true, disabled: true, tag: target.tagName };
+                            }
+                            
+                            target.scrollIntoView();
+                            // Dispatch mouse events for more reliability
+                            const box = target.getBoundingClientRect();
+                            const clickEvent = new MouseEvent('click', {
+                                view: window,
+                                bubbles: true,
+                                cancelable: true,
+                                clientX: box.left + box.width / 2,
+                                clientY: box.top + box.height / 2
+                            });
+                            target.dispatchEvent(clickEvent);
+                            target.click(); // Standard click as well
+                            
+                            return { found: true, clicked: true, tag: target.tagName, text: target.innerText };
                         }
-                        return false;
+                        return { found: false };
                     }""")
-                    if clicked:
-                        logger.info("✅ Successfully clicked 'Make video' via JS fallback.")
-                        make_video_clicked = True
-                        break
-                await asyncio.sleep(1)
+                    
+                    if res.get("clicked"):
+                        logger.info(f"✅ Triggered 'Make video' click via JS ({res.get('tag')}). Verifying...")
+                        # Verification: Wait a moment and see if the button disappears or state changes
+                        await asyncio.sleep(2)
+                        btn_still_there = False
+                        try:
+                           btn_still_there = await page.locator(combined_selector).first.is_visible(timeout=500)
+                        except: pass
+                        
+                        if not btn_still_there:
+                            logger.info("✅ Click confirmed (Button is no longer visible).")
+                            make_video_clicked = True
+                            break
+                        else:
+                            logger.warning("⚠️ Button still visible after JS click. Retrying...")
+                    elif res.get("disabled"):
+                        logger.info(f"⏳ Button found ({res.get('tag')}) but it is DISABLED. Retrying...")
+                        
+                    # 3. Coordinate-Based Last Resort (Attempt 10+)
+                    if attempt >= 10:
+                        try:
+                            # Search for the text content and get its box
+                            # Use text selector strictly
+                            box = await page.locator("text='Make video'").first.bounding_box()
+                            if box:
+                                logger.info(f"🎯 Coordinate Fallback: Clicking at ({box['x'] + box['width']/2}, {box['y'] + box['height']/2})")
+                                await page.mouse.click(box['x'] + box['width']/2, box['y'] + box['height']/2)
+                                make_video_clicked = True
+                                break
+                        except: pass
+
+                await asyncio.sleep(0.5)
 
             # ── Step 4: Multi-Pass Polling (Seed -> Extend -> Refine -> Download) ──
             logger.info("⏳ Starting Multi-Pass Polling (Seed + Refine)...")
@@ -755,7 +992,23 @@ async def generate_single_clip(
                             
                             # Prefix with "Continue this frame" as per user request
                             refine_text = f"Continue this frame. {prompt}"
-                            await prompt_input.fill(refine_text)
+                            
+                            logger.info(f"⌨️ Injecting refinement prompt: {refine_text[:50]}...")
+                            try:
+                                await prompt_input.fill("") # Clear first
+                                await prompt_input.fill(refine_text)
+                            except:
+                                # JS Fallback for filling
+                                await page.evaluate(f"""(text) => {{
+                                    const el = document.querySelector('.ProseMirror, textarea, [contenteditable="true"]');
+                                    if (el) {{
+                                        if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') el.value = text;
+                                        else el.innerText = text;
+                                        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                                    }}
+                                }}""", refine_text)
+                            
                             await asyncio.sleep(1)
                             
                             # 2. Click the 'Submit' (Up Arrow) button
@@ -781,8 +1034,21 @@ async def generate_single_clip(
                                 # Final Keyboard Fallback
                                 await page.keyboard.press("Enter")
                                 submit_clicked = True
+                                logger.info("⌨️ Submitted via Enter key.")
                             
-                            logger.info("💎 Refinement Pass submitted. Waiting for FINAL high-quality clip...")
+                            if not submit_clicked:
+                                # LAST RESORT: Coordinate click based on typical arrow position
+                                try:
+                                    logger.info("🚜 Last Resort: Coordinate click for Send arrow...")
+                                    # Often it's near the bottom right of the .ProseMirror
+                                    area = page.locator(".ProseMirror, textarea").first
+                                    box = await area.bounding_box()
+                                    if box:
+                                        # Click 20px in from the right and 20px up from the bottom of the input container
+                                        await page.mouse.click(box['x'] + box['width'] - 25, box['y'] + box['height'] - 20)
+                                        submit_clicked = True
+                                        logger.info("✅ Coordinate clicked Send arrow.")
+                                except: pass
                             current_pass = "DOWNLOADING" 
                             is_refined = True
                             start_time = asyncio.get_event_loop().time() 
@@ -999,8 +1265,15 @@ class GrokAnimator:
         # CRITICAL: Hold the lock for the ENTIRE duration of the generation.
         # This prevents concurrent Grok requests from fighting over the same profile.
         async with _grok_lock:
-            # Handle both int and string durations
-            duration_str = str(duration) if isinstance(duration, str) and duration.endswith('s') else f"{duration}s"
+            # Handle both int and string durations with strict '6s'/'10s' mapping
+            d_val = str(duration).lower().strip()
+            if '6' in d_val:
+                duration_str = "6s"
+            elif '10' in d_val:
+                duration_str = "10s"
+            else:
+                logger.warning(f"⚠️ GrokAnimator: Ambiguous duration '{duration}', defaulting to '10s'")
+                duration_str = "10s"
             
             MAX_RETRIES = 3
             for attempt in range(MAX_RETRIES):

@@ -41,6 +41,13 @@ export interface Scene {
     textToVideo: string;
     dialogue?: string;
     shotType?: string;  // e.g., "Medium Shot", "Close-up"
+    duration?: number;  // Scene duration in seconds (e.g., 5, 10, 16)
+    durationConfig?: {
+        clip_duration: string;
+        needs_extend: boolean;
+        extend_duration: string | null;
+        total_clip_time: number;
+    };
     imageUrl?: string;
     videoUrl?: string;
     isValidVideo?: boolean;
