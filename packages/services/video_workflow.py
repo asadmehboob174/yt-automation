@@ -663,12 +663,23 @@ async def render_final_video(
         tc = assembly["title_cards"]
         style = "horror" if "horror" in script.get("niche_id", "") else "standard"
         
-        if tc.get("opening"):
+        # Sanitization function for title cards
+        def should_skip_title(text: str) -> bool:
+            if not text: return True
+            t = text.strip().lower()
+            # Skip if it's just an aspect ratio or resolution
+            if re.match(r'^\d+:\d+$', t): return True
+            if re.match(r'^\d+p$', t): return True
+            # Skip very short content which is likely metadata
+            if len(t) < 3: return True
+            return False
+
+        if tc.get("opening") and not should_skip_title(tc["opening"]):
             opener = editor.render_title_card(tc["opening"], style=style, output_path=Path("/tmp/title_opener.mp4"))
             local_clips.insert(0, opener)
             # Adjust audio keys index? Title cards have no audio usually.
             
-        if tc.get("closing"):
+        if tc.get("closing") and not should_skip_title(tc["closing"]):
             closer = editor.render_title_card(tc["closing"], style=style, output_path=Path("/tmp/title_closer.mp4"))
             local_clips.append(closer)
 

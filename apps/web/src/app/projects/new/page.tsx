@@ -1028,7 +1028,7 @@ function Step3SceneImages() {
                                             </div>
                                             {scene.dialogue && (
                                                 <div className="pt-1">
-                                                    <p className="text-[10px] uppercase font-bold text-muted-foreground/70 mb-1">🎤 Voiceover/Dialogue</p>
+                                                    <p className="text-[10px] uppercase font-bold text-muted-foreground/70 mb-1">🎤 Voiceover</p>
                                                     <div className="bg-background/50 border rounded px-3 py-1.5 text-sm">
                                                         {typeof scene.dialogue === 'object' 
                                                             ? Object.entries(scene.dialogue).map(([char, text]) => `${char}: "${text}"`).join(' ')
@@ -1341,7 +1341,7 @@ function Step5Final() {
         scenes, channelId, finalVideoUrl, setFinalVideoUrl, 
         thumbnailUrl, thumbnailPrompt, setStep, reset, format, breakdown,
         audioConfig, setAudioConfig, selectedMusicId, setMusicId,
-        videoResolution 
+        videoResolution, customBgmEnabled
     } = useProjectStore();
     const [isStitching, setIsStitching] = useState(false);
     const [isUploading, setIsUploading] = useState(false);
@@ -1487,8 +1487,8 @@ function Step5Final() {
                 video_urls: scenes.map((s) => s.videoUrl).filter(url => !!url),
                 niche_id: channelId,
                 title: breakdown?.title || 'Stitched Video',
-                music: musicOption,
-                music_id: selectedMusicId,
+                music: customBgmEnabled ? musicOption : 'none',
+                music_id: customBgmEnabled ? selectedMusicId : undefined,
                 is_shorts: format === 'short',
                 video_resolution: videoResolution,
                 script: breakdown?.scenes.map(s => s.dialogue).join("\n\n"),

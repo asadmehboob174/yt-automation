@@ -136,6 +136,24 @@ class PromptBuilder:
         import re
         final_prompt = re.sub(r'^[0-9]+s:?\s*', '', final_prompt)
         
+        # --- Strip Aspect Ratio Keywords ---
+        # Grok sometimes literalizes '16:9' or 'Landscape' if it's in the prompt text.
+        # Since we set these via the UI buttons, we should strip them from the prompt string.
+        ar_keywords = [
+            r'16:9', r'9:16', r'1:1', r'21:9', r'4:3', r'3:2', r'2:3',
+            r'landscape', r'portrait', r'widescreen', r'cinematic wide', r'vertical video', r'shorts'
+        ]
+        for kw in ar_keywords:
+            # Match word boundaries or start/end of string to be safe
+            final_prompt = re.sub(rf'(?i)(?:\s*,?\s*|\s*-\s*|\s*\|\s*){kw}(?:\s*,?\s*|\s*-\s*|\s*\|\s*)', ', ', final_prompt)
+            # Second pass for remaining standalone instances
+            final_prompt = re.sub(rf'(?i)\b{kw}\b', '', final_prompt)
+
+        # Cleanup whitespace and commas
+        final_prompt = re.sub(r',\s*,', ',', final_prompt)
+        final_prompt = re.sub(r'^\s*,\s*|\s*,\s*$', '', final_prompt)
+        final_prompt = re.sub(r'\s+', ' ', final_prompt).strip()
+
         # Add the target duration
         duration_val = str(duration or "10s")
         if not duration_val.endswith("s"): duration_val += "s"
@@ -258,9 +276,10 @@ class VideoSettings:
                 if (!group) return false;
                 
                 const buttons = Array.from(group.querySelectorAll('button[role="radio"]'));
+                // Match either the exact target (e.g. "10s") or the target with a "+" prefix (e.g. "+10s")
                 const match = buttons.find(b => {{
                     const text = (b.innerText || b.textContent || "").trim();
-                    return text === target && b.offsetWidth > 0;
+                    return (text === target || text === "+" + target) && b.offsetWidth > 0;
                 }});
                 
                 if (match) {{
@@ -882,6 +901,7 @@ async def generate_single_clip(
             
             # Multi-Pass State Management
             current_pass = "SEED" 
+            pass_start_time = asyncio.get_event_loop().time()
             is_extended = False
             is_refined = False
             last_video_src = None # Track URL to detect NEW generation
@@ -934,6 +954,54 @@ async def generate_single_clip(
                 is_new_video = video_ready.get("src") != last_video_src
                 ready = video_ready.get("ready") and video_ready.get("duration", 0) > 0 and not is_generating and is_new_video
 
+                # --- STALL DETECTION FALLBACK ---
+                # If we've been in a pass for > 30s and NOT generating, but video isn't "Ready" (often stuck in UI)
+                pass_elapsed = asyncio.get_event_loop().time() - (pass_start_time if 'pass_start_time' in locals() else start_time)
+                
+                if pass_elapsed > 70 and not is_generating and not ready:
+                    logger.warning(f"🚜 SEVERE STALL detected ({current_pass} pass, {int(pass_elapsed)}s). Hard-resetting via Submit/Retry click...")
+                    try:
+                        # 1. Try the Submit (Up Arrow) button - usually on the right
+                        # 2. Try any button to the LEFT of the input area (user's "white arrow on left")
+                        retry_selectors = [
+                            "button[aria-label='Submit']",
+                            "button:has(svg.fa-arrow-up)", 
+                            ".ProseMirror-parent button", # Circular buttons around input
+                            "button:has(svg):left-of(.ProseMirror)", # Playwright pseudo-selector
+                            "button.rounded-full:has(svg)"
+                        ]
+                        for sel in retry_selectors:
+                            try:
+                                btn = page.locator(sel).first
+                                if await btn.count() > 0:
+                                    await btn.click(force=True)
+                                    logger.info(f"✅ Hard-clicked retry button ({sel}). Waiting for recovery...")
+                                    await asyncio.sleep(8)
+                                    pass_start_time = asyncio.get_event_loop().time() # Reset pass timer
+                                    break
+                            except: continue
+                        continue
+                    except Exception as e:
+                        logger.debug(f"Severe retry fallback failed: {e}")
+
+                elif pass_elapsed > 30 and not is_generating and not ready:
+                    logger.warning(f"⚠️ Video load stall detected ({current_pass} pass, {int(pass_elapsed)}s). Force-clicking 2nd sidebar thumbnail...")
+                    try:
+                        # Target the small status/percentage boxes on the left
+                        # Logic: Grok usually puts the current generation as the 2nd item in history/sidebar
+                        # We look for text matching "##%"
+                        sidebar_items = page.locator("div, button, span").filter(has_text=re.compile(r"^\d+%$"))
+                        count = await sidebar_items.count()
+                        if count >= 2:
+                            # 2nd item is almost always the current one that got 'stuck'
+                            await sidebar_items.nth(1).click()
+                            logger.info("✅ Force-clicked 2nd sidebar thumbnail. Waiting for UI refresh...")
+                            await asyncio.sleep(5)
+                            # Re-poll immediately after click
+                            continue
+                    except Exception as e:
+                        logger.debug(f"Sidebar click fallback failed: {e}")
+
                 if ready:
                     # --- BRANCH A: Handle Initial Seed Complete ---
                     if current_pass == "SEED":
@@ -964,12 +1032,14 @@ async def generate_single_clip(
                                 
                                 logger.info(f"🎬 Extension ({ext_dur}) started. Waiting for EXTENDED clip...")
                                 current_pass = "EXTENDING"
+                                pass_start_time = asyncio.get_event_loop().time()
                                 start_time = asyncio.get_event_loop().time()
                                 await asyncio.sleep(5) 
                                 continue
                         
                         # Move directly to Refinement if no extension
                         current_pass = "REFINING"
+                        pass_start_time = asyncio.get_event_loop().time()
                         is_extended = True
                         # Don't 'continue' here, fall through to click REFINEMENT immediately
                     
@@ -978,6 +1048,7 @@ async def generate_single_clip(
                         last_video_src = video_ready.get("src")
                         logger.info(f"✅ Extension Complete (src={last_video_src[:40]}...). Moving to Refinement...")
                         current_pass = "REFINING"
+                        pass_start_time = asyncio.get_event_loop().time()
                         is_extended = True
                         # Fall through to click REFINEMENT
 
@@ -1050,6 +1121,7 @@ async def generate_single_clip(
                                         logger.info("✅ Coordinate clicked Send arrow.")
                                 except: pass
                             current_pass = "DOWNLOADING" 
+                            pass_start_time = asyncio.get_event_loop().time()
                             is_refined = True
                             start_time = asyncio.get_event_loop().time() 
                             last_video_src = video_ready.get("src") # Capture to wait for CHANGE

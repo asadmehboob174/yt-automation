@@ -77,11 +77,18 @@ class AudioEngine:
 
         # 4. Final Edge-TTS Fallback
         active_voice = voice_id
+        
+        # Detect if the voice_id is likely an ElevenLabs/XTTS ID (no dashes, or too long)
+        # Edge-TTS voices always have the format 'lang-country-NameNeural'
+        is_standard_edge = "-" in active_voice and "Neural" in active_voice
+        
         if is_arabic_script:
              logger.info(f"🌐 Urdu script detected. Using Edge-TTS (ur-PK-UzmaNeural).")
              active_voice = "ur-PK-UzmaNeural"
-        elif is_path_voice:
-             active_voice = "en-GB-RyanNeural"
+        elif is_path_voice or not is_standard_edge:
+             default_fallback = "en-GB-RyanNeural"
+             logger.info(f"🔄 Voice ID '{active_voice}' incompatible with Edge-TTS. Defaulting to '{default_fallback}'.")
+             active_voice = default_fallback
         
         try:
             logger.info(f"🛡️ Using Edge-TTS fallback: {active_voice}")

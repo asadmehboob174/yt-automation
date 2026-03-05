@@ -117,14 +117,14 @@ class FFmpegVideoEditor:
             target_dur = round(target_dur, 3)
             durations[i] = target_dur # Actual duration we use
             
-            # Input: Loop infinitely
-            inputs.extend(['-stream_loop', '-1', '-i', str(clip)])
+            # Input: NO LOOPING (Fixed looping issue)
+            inputs.extend(['-i', str(clip)])
             
             # Video Graph: Scale -> Crop -> Trim
             v_label = f"vraw{i}"
             filter_parts.append(
                 f"[{i}:v]scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
-                f"crop={target_w}:{target_h},setsar=1,trim=duration={target_dur},setpts=PTS-STARTPTS[{v_label}]"
+                f"crop={target_w}:{target_h},setsar=1,tpad=stop_mode=clone:stop=-1,trim=duration={target_dur},setpts=PTS-STARTPTS[{v_label}]"
             )
             v_labels.append(f"[{v_label}]")
             
@@ -146,7 +146,7 @@ class FFmpegVideoEditor:
                 
                 a_label = f"async{i}"
                 filter_parts.append(
-                    f"[{i}:a]aresample=44100,{f_in}{f_out}volume={0.23 if mute_audio else (clip_audio_volumes[i] if clip_audio_volumes and i < len(clip_audio_volumes) else 1.0)},"
+                    f"[{i}:a]aresample=44100,{f_in}{f_out}volume={0.0 if mute_audio else (clip_audio_volumes[i] if clip_audio_volumes and i < len(clip_audio_volumes) else 1.0)},"
                     f"adelay={delay_ms}|{delay_ms},atrim=duration={round(cumulative_offset + target_dur, 3)},asetpts=PTS-STARTPTS[{a_label}]"
                 )
                 a_labels.append(f"[{a_label}]")
@@ -519,11 +519,11 @@ class FFmpegVideoEditor:
         
         if has_audio:
             # Normalize both inputs to 44.1kHz Stereo to prevent mixing errors
-            # [0:a] is the video audio (Grok SFX/BGM) -> Duct it heavily to 23% volume
+            # [0:a] is the video audio (Grok SFX/BGM) -> Duct it to 35% volume (audible SFX)
             # [1:a] is the music track (ElevenLabs +/- BGM) -> Set to requested music_volume
             filter_complex = (
                 f"[1:a]aresample=44100,aformat=channel_layouts=stereo,volume={music_volume}[music];"
-                f"[0:a]aresample=44100,aformat=channel_layouts=stereo,volume=0.23[vid_a];"
+                f"[0:a]aresample=44100,aformat=channel_layouts=stereo,volume=0.35[vid_a];"
                 # CRITICAL: normalize=0 prevents main audio from being dropped to 50%
                 f"[vid_a][music]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[aout]"
             )

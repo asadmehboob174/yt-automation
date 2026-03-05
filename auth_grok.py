@@ -4,33 +4,50 @@ from playwright.async_api import async_playwright
 import os
 from pathlib import Path
 import sys
+import argparse
 
 async def main():
+    parser = argparse.ArgumentParser(description="Grok Authentication Script")
+    parser.add_argument("--no-ext", action="store_true", help="Skip extension loading and prompts")
+    parser.add_argument("--ext-paths", type=str, help="Comma-separated paths to unpacked extensions")
+    args_cli = parser.parse_args()
+
     profile_dir = Path.home() / ".grok-profile"
     
-    print("\n🧩 Grok Extension & Developer Mode")
-    print("---------------------------------------")
-    print("Please provide the paths to your unpacked extensions (folders).")
-    print("Example: C:\\Users\\pc\\Downloads\\Ex 01, C:\\Users\\pc\\Downloads\\Ex 02")
-    
-    paths_input = input("\nExtension Path(s): ").strip()
-    
     extension_paths = []
-    if paths_input:
-        # Split by comma and clean up quotes/whitespace
-        raw_paths = [p.strip().replace('"', '') for p in paths_input.split(',')]
-        for p in raw_paths:
-            full_path = os.path.abspath(p)
-            if os.path.isdir(full_path):
-                extension_paths.append(full_path)
-            else:
-                print(f"⚠️ Warning: Path not found: {full_path}")
+
+    if args_cli.no_ext:
+        print("\n🚀 Skipping extensions as requested by --no-ext")
+    else:
+        print("\n🧩 Grok Extension & Developer Mode")
+        print("---------------------------------------")
+        
+        paths_input = ""
+        if args_cli.ext_paths:
+            paths_input = args_cli.ext_paths
+            print(f"Using extensions from CLI: {paths_input}")
+        else:
+            print("Please provide the paths to your unpacked extensions (folders).")
+            print("Example: C:\\Users\\pc\\Downloads\\Ex 01, C:\\Users\\pc\\Downloads\\Ex 02")
+            print("💡 TIP: Press Enter to skip and login WITHOUT extensions.")
+            
+            paths_input = input("\nExtension Path(s): ").strip()
+        
+        if paths_input:
+            # Split by comma and clean up quotes/whitespace
+            raw_paths = [p.strip().replace('"', '') for p in paths_input.split(',')]
+            for p in raw_paths:
+                full_path = os.path.abspath(p)
+                if os.path.isdir(full_path):
+                    extension_paths.append(full_path)
+                else:
+                    print(f"⚠️ Warning: Path not found: {full_path}")
 
     print(f"\n🚀 Launching browser with DEVELOPER MODE active...")
     print(f"📁 Profile: {profile_dir}")
     
     # Advanced flags to "un-crip" the browser for developers
-    args = [
+    browser_args = [
         "--start-maximized",
         "--disable-blink-features=AutomationControlled",
         "--no-sandbox",
@@ -43,15 +60,15 @@ async def main():
     if extension_paths:
         print(f"✅ Auto-loading {len(extension_paths)} extension(s)...")
         load_arg = ",".join(extension_paths)
-        args.append(f"--disable-extensions-except={load_arg}")
-        args.append(f"--load-extension={load_arg}")
+        browser_args.append(f"--disable-extensions-except={load_arg}")
+        browser_args.append(f"--load-extension={load_arg}")
 
     async with async_playwright() as p:
         context = await p.chromium.launch_persistent_context(
             user_data_dir=str(profile_dir),
             headless=False,
             ignore_default_args=["--enable-automation"], # This helps keep Dev Mode stable
-            args=args
+            args=browser_args
         )
         
         # Reuse the first page if it exists (persistent context often opens one)

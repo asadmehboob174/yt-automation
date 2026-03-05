@@ -2142,14 +2142,14 @@ async def stitch_videos(request: StitchVideosRequest):
                     audio_probe = ffprobe_lib.probe(str(scene_audio_path), cmd=ffprobe_cmd)
                     audio_dur = float(audio_probe['streams'][0]['duration'])
                     
-                    # Padding logic: tts + 0.6, but at least as long as script intended
-                    final_dur = max(audio_dur + 0.6, script_val)
+                    # Padding logic: tts + 0.4s for tighter cuts, no minimum floor
+                    final_dur = audio_dur + 0.4
                     
                     fresh_audio_paths.append(scene_audio_path)
                     narration_texts.append({"index": i, "text": clean_text, "duration": audio_dur})
                     target_durations.append(final_dur)
                     
-                    print(f"   ✅ Scene {i+1}: TTS generated ({audio_dur:.2f}s -> Setting Video Loop to {final_dur:.2f}s)")
+                    print(f"   ✅ Scene {i+1}: TTS generated ({audio_dur:.2f}s -> Setting Scene Duration to {final_dur:.2f}s)")
                 except Exception as e:
                     print(f"   ❌ Scene {i+1}: TTS failed: {e}")
                     narration_texts.append({"index": i, "text": clean_text, "duration": script_val - 0.4})
@@ -2178,10 +2178,7 @@ async def stitch_videos(request: StitchVideosRequest):
         # Scenes WITHOUT voiceover -> keep original Grok audio at 100%
         clip_audio_volumes = []
         for i in range(len(final_clips_to_stitch)):
-            if i < len(fresh_audio_paths) and fresh_audio_paths[i] is not None:
-                clip_audio_volumes.append(0.23)  # Duck when voiceover exists
-            else:
-                clip_audio_volumes.append(1.0)   # Full volume when no voiceover
+            clip_audio_volumes.append(1.0) # Original SFX at 100% (ducked to 35% later)
         
         print(f"   🔊 Per-scene audio volumes: {clip_audio_volumes}")
         
@@ -2267,7 +2264,7 @@ async def stitch_videos(request: StitchVideosRequest):
                 music_path = None
 
         # 0. Check if Music is Disabled
-        if not music_path and music_selection.lower() == "none":
+        if music_selection.lower() == "none":
             print("🚫 Music explicitly disabled by user.")
             music_path = None
             music_mood = "none"
@@ -2313,13 +2310,16 @@ async def stitch_videos(request: StitchVideosRequest):
              except Exception as e:
                  print(f"   ⚠️ Failed to download manual BGM: {e}")
         
+        # 5. Final validation: If file doesn't exist on disk, reset music_path to None
+        if music_path and not music_path.exists():
+            print(f"   ⚠️ Music file '{music_path.name}' not found on disk. Disabling BGM.")
+            music_path = None
+        
         if music_path:
             music_size = music_path.stat().st_size / 1024
-            print(f"   ✅ Generated {video_duration:.1f}s of '{music_mood}' ambient music ({music_size:.1f} KB)")
-            # Log for user tracking
-            print(f"🎵 [BG MUSIC] Selected: {music_mood}")
+            print(f"   ✅ Using '{music_mood}' background music ({music_size:.1f} KB)")
         else:
-            print(f"   🚫 No background music generated/selected.")
+            print(f"   🚫 No background music will be applied.")
         
         # 4. Mix background music with video (low volume: 30%)
         final_path = temp_dir / "final_with_music.mp4"

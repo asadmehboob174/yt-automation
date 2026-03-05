@@ -898,15 +898,48 @@ Return ONLY valid JSON.
                 except Exception as e:
                     print(f"⚠️ Skipping invalid final_assembly: {e}")
 
-            return TechnicalBreakdownOutput(
+            # 4. Final Cleanup: Enforce silence markers
+            return self._cleanup_scenes_silence(TechnicalBreakdownOutput(
                 characters=characters,
                 scenes=scenes,
                 youtube_upload=youtube_upload,
                 final_assembly=final_assembly
-            )
+            ))
         except Exception as e:
             print(f"❌ JSON Model Validation failed: {e}")
             raise ValueError(f"Invalid JSON structure: {e}")
+
+    def _cleanup_scenes_silence(self, breakdown: TechnicalBreakdownOutput) -> TechnicalBreakdownOutput:
+        """
+        Post-processing to enforce silence when 'no voiceover' or similar markers are found.
+        Clears both voiceover_text and dialogue fields if silence is detected.
+        """
+        silence_markers = [
+            "no voiceover", "none", "no voiceover.", "n/a", "-", "—", 
+            "no dialogue", "no dialogue.", "no narration", "no narration.",
+            "silent", "silence", "no voice", "no voice."
+        ]
+        
+        for scene in breakdown.scenes:
+            # Check voiceover field
+            vo = (scene.voiceover or "").strip().lower()
+            if vo in silence_markers:
+                scene.voiceover = ""
+                scene.voiceover_text = ""
+                scene.dialogue = None
+            
+            # Check voiceover_text field (some LLMs might put it here)
+            vot = (scene.voiceover_text or "").strip().lower()
+            if vot in silence_markers:
+                scene.voiceover = ""
+                scene.voiceover_text = ""
+                scene.dialogue = None
+                
+            # Final safety: If both are empty but dialogue was "" (not None), ensure it stays None 
+            # so the frontend doesn't accidentally show empty speech bubbles if not intended.
+            # But usually we want dialogue=None for pure silence.
+            
+        return breakdown
 
     async def parse_manual_script_llm(self, raw_text: str) -> TechnicalBreakdownOutput:
         """
@@ -928,6 +961,7 @@ SCRIPT TO ANALYZE:
 ### TASK 1: EXTRACT ALL CHARACTERS
 Find EVERY character defined in the script. Characters can appear in many formats:
 - "CHARACTER NAME: description..." 
+- "CHARACTER NAME — description..." (using dash, em-dash, or en-dash)
 - "CHARACTER NAME (Role): description..."
 - "[CHARACTER NAME] - description..."
 - "Character 1: NAME - description..."
@@ -954,8 +988,9 @@ For EACH scene, you MUST extract these fields SEPARATELY:
 |-------|------------------|----------|
 | **text_to_image_prompt** | Visual/image description | "Text to Image Prompt:", "Visual:", "Image:", "Setting:", "Description:" |
 | **image_to_video_prompt** | Motion/animation description. MUST include the Dialogue EXACTLY as it appears. | "Text to Video Prompt:", "Motion:", "Animation:", "Action:", "Dialogue:" |
-| **voiceover** | Narrator speech, separate from character dialogue | "Voiceover:", "VO:", "Narration:", "Narrator:" |
-| **dialogue** | Leave empty unless specifically requested | "" |
+| **voiceover** | Narrator speech. If script says "no voiceover", leave EMPTY "". | "Voiceover: no voiceover" -> "" |
+| **voiceover_text** | Same as voiceover. If "no voiceover", leave EMPTY "". | "" |
+| **dialogue** | CHARACTER speech. Leave empty "" UNLESS specifically separate from voiceover. If script says "no voiceover", this should ALSO be empty. | "" |
 | **camera_angle** | Shot type/camera info | "Shot Type:", "Short Type:", "Shot:", "Camera:", "Angle:", or embedded like "Medium shot of..." |
 
 CRITICAL RULES FOR SCENE EXTRACTION:
@@ -964,7 +999,8 @@ CRITICAL RULES FOR SCENE EXTRACTION:
 3. **DO NOT REMOVE DIALOGUE FROM THE VIDEO PROMPT**. If there is "Dialogue: 'Hi'", keep it inside `image_to_video_prompt`.
 4. Look for shot type at START of visual descriptions (e.g., "Wide shot of...", "Close-up of...")
 5. Extract EVERY scene, even if there are 10, 12, or more scenes
-6. Copy text EXACTLY as written (preserve the original wording)
+6. **VOICEOVER HANDLING**: If the script says "Voiceover: no voiceover", you MUST set both `voiceover` and `voiceover_text` to an EMPTY STRING "". Do NOT use character dialogue as a fallback for the voiceover field. STICK TO THIS RULE: Video Prompt dialogue is for animation ONLY, not for audio.
+7. Copy text EXACTLY as written (preserve the original wording)
 
 ### TASK 3: GENERATE YOUTUBE UPLOAD DATA
 Even if not in the script, you MUST generate a 'youtube_upload' object based on the script's content:
@@ -1006,8 +1042,8 @@ Return ONLY this JSON structure, nothing else:
       "scene_title": "Scene title if any",
       "text_to_image_prompt": "ONLY the visual/image description",
       "image_to_video_prompt": "ONLY the motion/animation description, ENSURE YOU KEEP THE DIALOGUE HERE exactly as written", 
-      "voiceover_text": "Narrator speech or voiceover",
-      "voiceover": "Same as voiceover_text",
+      "voiceover_text": "Narrator speech or empty string '' if 'no voiceover' or if the SCENE IS SILENT",
+      "voiceover": "Narrator speech or empty string '' if 'no voiceover' or if the SCENE IS SILENT",
       "dialogue": "",
       "camera_angle": "Wide Shot, Medium Shot, Close-up, etc.",
       "motion_description": "Same as image_to_video_prompt",
@@ -1039,7 +1075,8 @@ Return ONLY this JSON structure, nothing else:
 - Extract ALL characters (look for 3+)
 - Extract ALL scenes (look for 10+)
 - Keep fields SEPARATE (don't mix image and video prompts)
-- ALWAYS KEEP DIALOGUE INSIDE `image_to_video_prompt`. Do not put it in the `dialogue` field.
+- ALWAYS KEEP DIALOGUE INSIDE `image_to_video_prompt`. Do not put it in the `dialogue` field unless specifically labeled as 'Dialogue:' in the script.
+- NEVER copy dialogue from the motion/video description into narration/voiceover fields.
 - If a field is not found, use empty string ""
 - Preserve original text exactly as written
 """
@@ -1156,7 +1193,7 @@ Return ONLY this JSON structure, nothing else:
                     if field not in scene or scene[field] is None:
                         scene[field] = ''
                 
-            return TechnicalBreakdownOutput(**data)
+            return self._cleanup_scenes_silence(TechnicalBreakdownOutput(**data))
         except Exception as e:
             print(f"❌ LLM Extraction Failed: {e}")
             # Return empty structure instead of brittle regex fallback
@@ -1180,7 +1217,10 @@ INSTRUCTIONS:
 1. Extract ALL characters (Name + Visual Description).
 2. Extract ALL scenes (Scene Number + Visuals + Audio).
 3. Be precise with "Text-to-Image" vs "Text-to-Video" vs "Dialogue".
-4. If a field is missing, use empty string "".
+4. If the script says "no voiceover", set both `voiceover` and `voiceover_text` to "".
+5. **CHARACTER EXTRACTION**: Look for characters in formats like "NAME — Description" or "NAME: Description". Extract the FULL visual description.
+6. **CRITICAL**: Do NOT copy dialogue from the "image_to_video_prompt" into the "voiceover" or "dialogue" fields. Narration is separate from animation dialogue.
+7. If a field is missing, use empty string "".
 
 OUTPUT JSON FORMAT:
 {{
@@ -1192,7 +1232,7 @@ OUTPUT JSON FORMAT:
       "scene_number": 1,
       "text_to_image_prompt": "...",
       "image_to_video_prompt": "Include motion AND keep the dialogue here exactly as written",
-      "voiceover": "Narrator speech",
+      "voiceover": "Narrator speech or empty string if silent",
       "dialogue": "",
       "voiceover_text": "Same as voiceover",
       "camera_angle": "Medium Shot",
@@ -1217,7 +1257,7 @@ OUTPUT JSON FORMAT:
                  for field in ['text_to_image_prompt', 'image_to_video_prompt', 'dialogue', 'character_pose_prompt']:
                      if field not in scene: scene[field] = ""
 
-            return TechnicalBreakdownOutput(**data)
+            return self._cleanup_scenes_silence(TechnicalBreakdownOutput(**data))
 
         except Exception as e:
             print(f"❌ Gemini Extraction Failed: {e}")
@@ -1503,6 +1543,35 @@ OUTPUT JSON FORMAT:
                 
                 if characters:
                     print(f"✅ Format 8 found {len(characters)} characters")
+
+            # Format 10 (Direct Dash Simplified): "UPPERCASE NAME — Description"
+            # This matches the user's specific format: WHITE CAT — Slender anthropomorphic...
+            if len(characters) == 0:
+                print("DEBUG: Detecting Format 10 (UPPERCASE NAME — Description)")
+                # Pattern: Starts with uppercase name + dash/en-dash/em-dash, takes everything until next similar pattern or section
+                # Optimization: Use (?:^|\n) and exclude common header words from the start of the name match
+                fmt10_iter = re.finditer(
+                    r'(?:^|\n)\s*(?!(?:CHARACTER|MASTER|STEP|SCENE|PART|PROMPTS|BIOS)\b)\s*([A-Z][A-Z\s]+?)\s*[—–-]\s*(.*?)(?=\n\s*[A-Z][A-Z\s]+\s*[—–-]|Step\s+\d+|Scene\s+\d+|\Z)',
+                    bio_text + "\n",
+                    re.DOTALL | re.IGNORECASE
+                )
+                for m in fmt10_iter:
+                    name = m.group(1).strip()
+                    content = m.group(2).strip()
+                    
+                    # Clean multi-line content into single para
+                    content = re.sub(r'\n+', ' ', content).strip()
+                    
+                    # Final safety check on name
+                    if re.match(r'^(?:CHARACTER|MASTER|STEP|SCENE|PART|PROMPTS|BIOS)$', name, re.IGNORECASE):
+                        continue
+                        
+                    print(f"DEBUG: Found Character (fmt10): {name}")
+                    if name and content and len(content) > 15:
+                        characters.append(MasterCharacter(name=name, prompt=content))
+                
+                if characters:
+                    print(f"✅ Format 10 found {len(characters)} characters")
             
             # Format 9 (LOCKED Characters): "LOCKED Name (info)\nDescription..."
             # Example: LOCKED Boy (125cm)
@@ -1578,8 +1647,8 @@ OUTPUT JSON FORMAT:
         # We replace the emoji to standard "SCENE" first for easier splitting
         clean_text_for_scenes = re.sub(r'🎞️\s*', '', text)
         
-        # Split by "SCENE X" with optional indentation
-        scene_blocks = re.split(r'(?i)\n+\s*SCENE\s+(\d+)', clean_text_for_scenes)
+        # Split by "SCENE X" with optional indentation and handling start of string
+        scene_blocks = re.split(r'(?i)(?:\n+|^)\s*SCENE\s+(\d+)', clean_text_for_scenes)
         
         found_scenes = 0
         
@@ -1694,9 +1763,12 @@ OUTPUT JSON FORMAT:
                             # CRITICAL FIX: DO NOT REMOVE DIALOGUE FROM THE VIDEO PROMPT.
                             # We want the video generation API to process the dialogue as part of the prompt.
                             
-                    # Use dialogue from prompt if we don't already have one from the dedicated field
-                    if dialogue_in_prompt and not clean_audio:
-                        clean_audio = dialogue_in_prompt
+                    # [FIXED] REMOVED REDUNDANT FALLBACK: 
+                    # We no longer copy dialogue from the image_to_video_prompt into clean_audio/voiceover fields. 
+                    # The video generation API already handles extracting Dialogue from the prompt string.
+                    # This prevents duplication where dialogue would be spoken twice (once by Grok, once by TTS).
+                    
+                    # (Removed lines 1733-1734 which were duplicating dialogue into clean_audio)
 
                     # Shot Type Inference
                     shot_type = "Medium Shot"
@@ -1739,13 +1811,16 @@ OUTPUT JSON FORMAT:
         else:
              print(f"✅ Extracted {found_scenes} scenes.")
 
-        # --- 5. Final Validation ---
+        # --- 5. Final Validation & Silence Cleanup ---
+        breakdown = TechnicalBreakdownOutput(characters=characters, scenes=scenes)
+        breakdown = self._cleanup_scenes_silence(breakdown)
+        
         if not characters:
             logger.error("🛑 [PARSER] No characters found in script breakdown. Automation will likely fail.")
         if not scenes:
             logger.error("🛑 [PARSER] No scenes found in script breakdown. Automation will likely fail.")
             
-        return TechnicalBreakdownOutput(characters=characters, scenes=scenes)
+        return breakdown
 
     async def _call_hf_completion(self, prompt: str) -> str:
         """Call Hugging Face Inference API for chat completion (Legacy wrapper)."""
@@ -1793,8 +1868,8 @@ OUTPUT JSON FORMAT:
         prompt = f"""You are a video editor AI. Compute the required video clip duration for each scene based on the provided WORD COUNT.
 
 RULES:
-- If word_count is 0-15 -> 6s clip, needs_extend=false, total_clip_time=6
-- If word_count is 16-40 -> 10s clip, needs_extend=false, total_clip_time=10
+- If word_count is 0-13 -> 6s clip, needs_extend=false, total_clip_time=6
+- If word_count is 14-40 -> 10s clip, needs_extend=false, total_clip_time=10
 - If word_count is 41-70 -> 10s clip, needs_extend=true, extend_duration="6s", total_clip_time=16
 - If word_count is > 70 -> 10s clip, needs_extend=true, extend_duration="10s", total_clip_time=20
 
@@ -1840,7 +1915,7 @@ OUTPUT STRICT JSON FORMAT ONLY:
                 durations = []
                 for st in scene_texts:
                     wc = st.get("word_count", 0)
-                    if wc <= 15:
+                    if wc <= 13:
                         d = {"clip_duration": "6s", "needs_extend": False, "extend_duration": None, "total_clip_time": 6}
                     elif wc <= 40:
                         d = {"clip_duration": "10s", "needs_extend": False, "extend_duration": None, "total_clip_time": 10}
