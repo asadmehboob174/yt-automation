@@ -9,6 +9,7 @@ Handles 5 critical automation loopholes:
 5. Inngest-Driven Rate Limit Recovery
 """
 import os
+import json
 import asyncio
 import random
 import tempfile
@@ -486,6 +487,271 @@ async def check_rate_limit(page: Page) -> bool:
 
 
 # ============================================
+# Cancel-Trick Helpers (Verified Click + Prompt Injection)# ============================================
+async def _verify_generation_started(page: Page, timeout_s: float = 5) -> bool:
+    """
+    After clicking the submit arrow, verify that Grok actually started generating.
+    Returns True only when generation indicators are confirmed visible.
+    """
+    for _ in range(int(timeout_s * 4)):  # check every 250ms
+        try:
+            body_text = await page.evaluate("() => document.body.innerText")
+            indicators = ["Generating", "Cancel Video", "Thinking", "Finalizing"]
+            if any(ind.lower() in body_text.lower() for ind in indicators):
+                return True
+        except:
+            pass
+        # Also check for animation elements
+        try:
+            if await page.locator(".animate-pulse, svg.animate-spin, div[role='progressbar']").first.is_visible(timeout=150):
+                return True
+        except:
+            pass
+        await asyncio.sleep(0.25)
+    return False
+
+
+async def verified_make_video_click(page_obj: Page, timeout_s: int = 20, verify: bool = True) -> bool:
+    """
+    Click the submit/arrow button and optionally VERIFY that generation started.
+    
+    This replaces the old robust_make_video_click which clicked blindly.
+    The key improvement: we confirm that the click actually triggered generation
+    by checking for 'Generating' / 'Cancel Video' indicators.
+    
+    Args:
+        page_obj: Playwright Page
+        timeout_s: Total seconds to keep retrying
+        verify: If True, confirm generation started after click
+    
+    Returns:
+        True if button was clicked (and generation verified if verify=True)
+    """
+    submit_selectors = [
+        # Aria-label based (most stable)
+        "button[aria-label='Submit']",
+        "button[aria-label='Send']",
+        "button[aria-label='Generate']",
+        "button[aria-label='Make video']",
+        # Test ID based
+        "button[data-testid='send-chat-message-button']",
+        "button[data-testid='submit-button']",
+        # Visual: dark circle buttons with SVG (the arrow icon)
+        "button.bg-neutral-900.rounded-full",
+        "button.rounded-full:has(svg)",
+        # Generic: any button with an SVG arrow near the prompt
+        "button:has(svg path[d*='M6'])",
+        "button:has(svg path[d*='M12'])",
+    ]
+    
+    for attempt in range(timeout_s):
+        # Strategy 1: Try Playwright selectors
+        for sel in submit_selectors:
+            try:
+                btn = page_obj.locator(sel).last
+                if await btn.count() > 0 and await btn.is_visible(timeout=400):
+                    # Check if button is NOT disabled
+                    is_disabled = False
+                    try:
+                        disabled_attr = await btn.get_attribute("disabled")
+                        aria_disabled = await btn.get_attribute("aria-disabled")
+                        is_disabled = disabled_attr is not None or aria_disabled == "true"
+                    except:
+                        pass
+                    
+                    if not is_disabled:
+                        await btn.scroll_into_view_if_needed()
+                        await btn.click(force=True, timeout=2000)
+                        logger.info(f"🖱️ Clicked submit button via: {sel}")
+                        if verify:
+                            if await _verify_generation_started(page_obj, timeout_s=4):
+                                logger.info("✅ Generation VERIFIED after click.")
+                                return True
+                            else:
+                                logger.warning(f"⚠️ Clicked {sel} but generation NOT detected. Retrying...")
+                                continue  # Try next selector
+                        else:
+                            return True
+            except:
+                continue
+        
+        # Strategy 2: JS fallback - find the enabled round submit button near the textarea
+        try:
+            js_clicked = await page_obj.evaluate("""() => {
+                // Find the prompt area first
+                const promptArea = document.querySelector('.ProseMirror, textarea, [contenteditable="true"]');
+                if (!promptArea) return false;
+                
+                // Find all visible buttons
+                const buttons = Array.from(document.querySelectorAll('button'));
+                
+                // Score buttons by likelihood of being the submit button
+                const candidates = buttons.filter(btn => {
+                    if (btn.offsetWidth === 0 || btn.offsetHeight === 0) return false;
+                    if (btn.disabled) return false;
+                    if (btn.getAttribute('aria-disabled') === 'true') return false;
+                    // Must have SVG (arrow icon) or be a round button
+                    const hasSvg = btn.querySelector('svg') !== null;
+                    const isRound = btn.className.includes('rounded-full') || btn.className.includes('rounded-circle');
+                    return hasSvg || isRound;
+                });
+                
+                if (candidates.length === 0) return false;
+                
+                // Pick the last candidate (usually the submit button is last)
+                const target = candidates[candidates.length - 1];
+                
+                // Dispatch full pointer event sequence
+                const rect = target.getBoundingClientRect();
+                const cx = rect.left + rect.width / 2;
+                const cy = rect.top + rect.height / 2;
+                const opts = { bubbles: true, cancelable: true, clientX: cx, clientY: cy };
+                target.dispatchEvent(new PointerEvent('pointerdown', opts));
+                target.dispatchEvent(new PointerEvent('pointerup', opts));
+                target.dispatchEvent(new MouseEvent('click', opts));
+                return true;
+            }""")
+            
+            if js_clicked:
+                logger.info("🖱️ Clicked submit button via JS fallback.")
+                if verify:
+                    if await _verify_generation_started(page_obj, timeout_s=4):
+                        logger.info("✅ Generation VERIFIED after JS click.")
+                        return True
+                    else:
+                        logger.warning("⚠️ JS click didn't trigger generation. Retrying...")
+                else:
+                    return True
+        except Exception as e:
+            logger.debug(f"JS fallback click error: {e}")
+        
+        # Strategy 3: Coordinate-based click relative to prompt area
+        try:
+            coords = await page_obj.evaluate("""() => {
+                const pm = document.querySelector('.ProseMirror, textarea');
+                if (!pm) return null;
+                const pmRect = pm.getBoundingClientRect();
+                // The arrow button is typically to the right of the prompt area
+                // or at the bottom-right of the input container
+                const parent = pm.closest('form, div[class*="input"], div[class*="prompt"], div[class*="editor"]') || pm.parentElement;
+                if (parent) {
+                    const pRect = parent.getBoundingClientRect();
+                    return { x: pRect.right - 25, y: pRect.bottom - 25 };
+                }
+                return { x: pmRect.right + 30, y: pmRect.top + pmRect.height / 2 };
+            }""")
+            if coords:
+                await page_obj.mouse.click(coords['x'], coords['y'])
+                logger.info(f"🖱️ Coordinate click at ({coords['x']:.0f}, {coords['y']:.0f})")
+                if verify:
+                    if await _verify_generation_started(page_obj, timeout_s=4):
+                        logger.info("✅ Generation VERIFIED after coordinate click.")
+                        return True
+                else:
+                    return True
+        except:
+            pass
+        
+        await asyncio.sleep(1)
+    
+    logger.error(f"❌ verified_make_video_click: Failed after {timeout_s} attempts.")
+    return False
+
+
+async def _inject_prompt(page: Page, prompt: str) -> bool:
+    """
+    Reliably inject a prompt into the Grok ProseMirror editor.
+    
+    Uses multiple strategies:
+    1. Clear + keyboard type (most reliable for ProseMirror)
+    2. JS innerHTML injection + input event dispatch
+    3. fill() as last resort
+    
+    Returns True if prompt was injected successfully.
+    """
+    logger.info(f"⌨️ Injecting prompt: {prompt[:60]}...")
+    
+    # Strategy 1: Clear via JS, then type via keyboard (bypasses ProseMirror quirks)
+    try:
+        prompt_area = page.locator(".ProseMirror, textarea, [contenteditable='true']").first
+        await prompt_area.click()
+        await asyncio.sleep(0.3)
+        
+        # Clear existing content
+        await page.evaluate("""() => {
+            const el = document.querySelector('.ProseMirror');
+            if (el) {
+                el.innerHTML = '<p><br></p>';
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+            const ta = document.querySelector('textarea');
+            if (ta) { ta.value = ''; ta.dispatchEvent(new Event('input', { bubbles: true })); }
+        }""")
+        await asyncio.sleep(0.2)
+        
+        # Select all and delete (backup clear)
+        await page.keyboard.press("Control+A")
+        await page.keyboard.press("Backspace")
+        await asyncio.sleep(0.2)
+        
+        # Type the prompt character by character (most reliable for ProseMirror)
+        # But for long prompts, use a chunked approach
+        if len(prompt) <= 200:
+            await page.keyboard.type(prompt, delay=5)
+        else:
+            # For long prompts: set via JS then dispatch events
+            escaped = json.dumps(prompt)
+            await page.evaluate(f"""(text) => {{
+                const el = document.querySelector('.ProseMirror');
+                if (el) {{
+                    el.innerHTML = '<p>' + text.replace(/\n/g, '</p><p>') + '</p>';
+                    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    // Also trigger React's synthetic handler
+                    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLElement.prototype, 'textContent');
+                    if (nativeInputValueSetter && nativeInputValueSetter.set) {{
+                        nativeInputValueSetter.set.call(el, text);
+                    }}
+                    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                }}
+                const ta = document.querySelector('textarea');
+                if (ta) {{
+                    ta.value = text;
+                    ta.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                }}
+            }}""", prompt)
+        
+        await asyncio.sleep(0.5)
+        
+        # Verify prompt was injected
+        injected_text = await page.evaluate("""() => {
+            const el = document.querySelector('.ProseMirror');
+            if (el) return el.innerText.trim();
+            const ta = document.querySelector('textarea');
+            if (ta) return ta.value.trim();
+            return '';
+        }""")
+        
+        if len(injected_text) > 10:
+            logger.info(f"✅ Prompt injected successfully ({len(injected_text)} chars)")
+            return True
+        else:
+            logger.warning(f"⚠️ Prompt injection may have failed. Got: '{injected_text[:30]}'")
+    except Exception as e:
+        logger.warning(f"⚠️ Strategy 1 prompt injection failed: {e}")
+    
+    # Strategy 2: Direct fill() as fallback
+    try:
+        prompt_area = page.locator(".ProseMirror, textarea, [contenteditable='true']").first
+        await prompt_area.click()
+        await prompt_area.fill(prompt)
+        logger.info("✅ Prompt injected via fill() fallback")
+        return True
+    except Exception as e:
+        logger.error(f"❌ All prompt injection strategies failed: {e}")
+        return False
+
+
+# ============================================
 # Core Generation Function
 # ============================================
 async def generate_single_clip(
@@ -729,160 +995,179 @@ async def generate_single_clip(
                 except Exception as e:
                     logger.warning(f"⚠️ UI-driven upload sequence failed entirely: {e}")
             
-            # ── Step 3.5: Click "Make video" for the Seed ──
-            # GROK UI FIX: The arrow button is DISABLED if the prompt is empty.
-            # We MUST type a tiny character (like '.') to enable it, THEN start.
+            # ══════════════════════════════════════════════════════════
+            # CANCEL-TRICK WORKFLOW (State Machine)
+            #
+            # STATE 1: Type "." seed character → enable arrow button
+            # STATE 2: Click arrow → VERIFY generation started
+            # STATE 3: Wait 2-3s → Cancel Video button appears
+            # STATE 4: Click Cancel Video → VERIFY overlay cleared
+            # STATE 5: Inject full prompt
+            # STATE 6: Click arrow again → VERIFY final generation started
+            # STATE 7: Wait for download
+            # ══════════════════════════════════════════════════════════
+
+            # ── STATE 1: Type "." to enable the arrow button ──
+            logger.info("📝 STATE 1: Typing '.' to enable the submit button for seed...")
             try:
-                # 3.5.1: Stabilize UI
-                await asyncio.sleep(2)
+                await asyncio.sleep(2)  # Let UI stabilize after upload
                 prompt_input = page.locator(".ProseMirror, textarea, [contenteditable='true']").first
                 await prompt_input.click()
-                await prompt_input.fill("") # Clear any junk
-                await page.keyboard.type(".")
-                logger.info("⌨️ Typed '.' to enable the 'Make video' button for the seed.")
-            except: pass
-
-            async def robust_make_video_click(page_obj, attempt_num):
-                # Aggressive locator: look for the black circle button with up arrow
-                submit_selectors = [
-                    "button.bg-neutral-900.rounded-full",
-                    "button[aria-label='Submit']",
-                    "button[data-testid='send-chat-message-button']",
-                    "button:has(svg:has(path[d*='M6']))",
-                    "button:right-of('.ProseMirror')"
-                ]
-                for sel in submit_selectors:
-                    try:
-                        btn = page_obj.locator(sel).last
-                        if await btn.count() > 0 and await btn.is_visible(timeout=500):
-                            await btn.scroll_into_view_if_needed()
-                            await btn.click(force=True, timeout=2000)
-                            return True
-                    except: continue
-                # Coordinate Fallback relative to prompt container
-                try:
-                    pm = page_obj.locator(".ProseMirror, textarea").first
-                    box = await pm.bounding_box()
-                    if box:
-                        # Click near the bottom right of the prompt box where the button is
-                        await page_obj.mouse.click(box['x'] + box['width'] - 20, box['y'] + box['height'] - 20)
-                        return True
-                except: pass
-                return False
-
-            logger.info("🎬 Pass 1/2: Clicking 'Make video' for the initial Seed animation...")
-            make_video_clicked = False
-            for attempt in range(15): 
-                if await robust_make_video_click(page, attempt):
-                    logger.info("✅ Successfully clicked 'Make video' for seed.")
-                    make_video_clicked = True
-                    break
-                await asyncio.sleep(1)
-            
-            if not make_video_clicked:
-                logger.error("❌ Failed to click 'Make video' for seed after all attempts.")
-
-            # ── NEW WORKFLOW: Cancel-Trick Injection ──
-            logger.info("⚡ Executing Cancel-Trick: Cancelling initial seed to attach image context...")
-            
-            # Wait for text "Generating" or the Cancel button
-            for i in range(20):
-                try:
-                    if await page.locator("button:has-text('Cancel Video'), text='Generating', .animate-pulse").first.is_visible(timeout=500):
-                        break
-                except: pass
-                await asyncio.sleep(0.5)
-
-            # Click the Cancel Video button with ultra-robust strategy (Native + Coordinates + JS)
-            cancel_clicked = False
-            for attempt in range(25):
-                try:
-                    # 1. Primary: Text locator filtered for visibility
-                    btn = page.locator("text='Cancel Video'").last
-                    if await btn.count() > 0 and await btn.is_visible(timeout=500):
-                        await btn.scroll_into_view_if_needed()
-                        await btn.hover() # Trigger any hover states
-                        await btn.click(force=True, timeout=2000)
-                        cancel_clicked = True
-                        break
-                    
-                    # 2. Secondary: Find coordinates via JS for precise mouse action
-                    coords = await page.evaluate("""() => {
-                        const els = Array.from(document.querySelectorAll('*'));
-                        const target = els.find(el => {
-                            if (el.offsetWidth === 0 || el.offsetHeight === 0) return false;
-                            const text = (el.innerText || "").toLowerCase();
-                            return text.includes("cancel video") || text.includes("cancel");
-                        });
-                        if (target) {
-                            const rect = target.getBoundingClientRect();
-                            return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, found: true };
-                        }
-                        return { found: false };
-                    }""")
-                    
-                    if coords and coords['found']:
-                        logger.info(f"🖱️ Found Cancel button at ({coords['x']}, {coords['y']}). Force clicking via Mouse...")
-                        await page.mouse.move(coords['x'], coords['y'])
-                        await page.mouse.down()
-                        await page.mouse.up()
-                        cancel_clicked = True
-                        break
-                except: pass
+                # Clear any stale content
+                await page.keyboard.press("Control+A")
+                await page.keyboard.press("Backspace")
                 await asyncio.sleep(0.3)
+                await page.keyboard.type(".", delay=50)
+                logger.info("✅ Typed '.' — arrow button should now be enabled.")
+            except Exception as e:
+                logger.warning(f"⚠️ STATE 1 warning: {e}")
             
-            if cancel_clicked:
-                logger.info("✅ Cancel button clicked. ⏳ Waiting for generation overlay to disappear...")
-                # Synchronization: Wait until the button is GONE to avoid double-gen
-                for i in range(30):
+            await asyncio.sleep(1)  # Let the UI react to the typed character
+
+            # ── STATE 2: Click arrow button + VERIFY generation started ──
+            logger.info("🎬 STATE 2: Clicking arrow button for SEED generation...")
+            seed_started = await verified_make_video_click(page, timeout_s=20, verify=True)
+            
+            if not seed_started:
+                # Emergency: try typing '.' again and retrying
+                logger.warning("⚠️ Seed generation didn't start. Re-typing '.' and retrying...")
+                try:
+                    prompt_input = page.locator(".ProseMirror, textarea, [contenteditable='true']").first
+                    await prompt_input.click()
+                    await page.keyboard.type(".", delay=50)
+                    await asyncio.sleep(1)
+                except: pass
+                seed_started = await verified_make_video_click(page, timeout_s=15, verify=True)
+            
+            if not seed_started:
+                logger.error("❌ STATE 2 FAILED: Could not start seed generation after all attempts.")
+                # Continue anyway — the image is attached, prompt injection may still work
+
+            # ── STATE 3: Wait 2-3 seconds for generation to be in progress ──
+            if seed_started:
+                logger.info("⏳ STATE 3: Waiting 2-3s for generation to be in progress...")
+                await asyncio.sleep(random.uniform(2.0, 3.0))
+
+            # ── STATE 4: Click Cancel Video button ──
+            if seed_started:
+                logger.info("⚡ STATE 4: Clicking 'Cancel Video' to stop seed generation...")
+                cancel_clicked = False
+                
+                for attempt in range(20):
+                    # Strategy 1: Playwright text locator
                     try:
-                        still_there = await page.evaluate("""() => {
-                            const text = document.body.innerText.toLowerCase();
-                            // Check for the "Generating" pill or "Cancel" text
-                            return text.includes("cancel video") || text.includes("generating");
+                        cancel_btn = page.locator("button:has-text('Cancel Video'), button:has-text('Cancel')").last
+                        if await cancel_btn.count() > 0 and await cancel_btn.is_visible(timeout=500):
+                            await cancel_btn.scroll_into_view_if_needed()
+                            await cancel_btn.click(force=True, timeout=2000)
+                            cancel_clicked = True
+                            logger.info("✅ Cancel Video clicked via Playwright.")
+                            break
+                    except:
+                        pass
+                    
+                    # Strategy 2: JS coordinate-based click
+                    try:
+                        coords = await page.evaluate("""() => {
+                            const els = Array.from(document.querySelectorAll('button, div, span'));
+                            const target = els.find(el => {
+                                if (el.offsetWidth === 0 || el.offsetHeight === 0) return false;
+                                const text = (el.innerText || "").trim().toLowerCase();
+                                return text === "cancel video" || text === "cancel";
+                            });
+                            if (target) {
+                                const rect = target.getBoundingClientRect();
+                                return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, found: true };
+                            }
+                            return { found: false };
                         }""")
-                        if not still_there:
-                            logger.info("✅ Generation overlay is gone.")
+                        
+                        if coords and coords.get('found'):
+                            logger.info(f"🖱️ Cancel button at ({coords['x']:.0f}, {coords['y']:.0f}). Clicking...")
+                            await page.mouse.click(coords['x'], coords['y'])
+                            cancel_clicked = True
                             break
-                        # Also check if it's already flipped to a video element
-                        if await page.locator("video").first.is_visible(timeout=100):
+                    except:
+                        pass
+                    
+                    # Strategy 3: JS dispatchEvent click
+                    try:
+                        js_cancel = await page.evaluate("""() => {
+                            const els = Array.from(document.querySelectorAll('button, div, span'));
+                            const target = els.find(el => {
+                                if (el.offsetWidth === 0 || el.offsetHeight === 0) return false;
+                                const text = (el.innerText || "").trim().toLowerCase();
+                                return text.includes("cancel");
+                            });
+                            if (target) {
+                                target.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+                                target.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
+                                target.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                                return true;
+                            }
+                            return false;
+                        }""")
+                        if js_cancel:
+                            cancel_clicked = True
+                            logger.info("✅ Cancel Video clicked via JS dispatchEvent.")
                             break
-                    except: break
+                    except:
+                        pass
+                    
                     await asyncio.sleep(0.3)
+                
+                # Wait for generation overlay to fully clear
+                if cancel_clicked:
+                    logger.info("⏳ Waiting for generation overlay to clear...")
+                    for i in range(40):
+                        try:
+                            still_generating = await page.evaluate("""() => {
+                                const text = document.body.innerText.toLowerCase();
+                                return text.includes("cancel video") || text.includes("generating") || text.includes("thinking");
+                            }""")
+                            if not still_generating:
+                                logger.info("✅ Generation overlay cleared.")
+                                break
+                        except:
+                            break
+                        await asyncio.sleep(0.3)
+                    
+                    # Extra stabilization wait
+                    await asyncio.sleep(1.5)
+                else:
+                    logger.warning("⚠️ Cancel button not found. Proceeding to inject prompt anyway...")
+                    await asyncio.sleep(2)
             else:
-                logger.warning("⚠️ Could not find Cancel button. Proceeding to inject prompt anyway...")
-                
-            await asyncio.sleep(1)
-            
-            # ── Paste Final Prompt ──
-            logger.info(f"⌨️ Injecting full prompt: {prompt[:50]}...")
-            try:
-                prompt_area = page.locator(".ProseMirror, textarea, [contenteditable='true']").first
-                await prompt_area.click()
-                await prompt_area.fill("")
-                # Use evaluate to force clear just in case
-                await page.evaluate("() => { const el = document.querySelector('.ProseMirror'); if(el) el.innerHTML = '<p></p>'; }")
-                await prompt_area.fill(prompt)
-            except:
-                await page.evaluate(f"((p)=>{{ const el=document.querySelector('.ProseMirror, textarea'); if(el) el.innerText=p; }})('{prompt}')")
-            
-            await asyncio.sleep(1)
-            
-            # ── Click Make Video Again ──
-            logger.info("🎬 Clicking 'Make video' for Final Generation...")
-            final_clicked = False
-            for attempt in range(10):
-                if await robust_make_video_click(page, attempt):
-                    logger.info("✅ Successfully clicked 'Make video' for Final Generation.")
-                    final_clicked = True
-                    break
+                logger.info("ℹ️ Seed generation was not started, skipping cancel. Injecting prompt directly...")
                 await asyncio.sleep(1)
-                
-            if not final_clicked:
-                logger.error("❌ Failed to trigger Final Generation!")
-                
-            # ── Step 4: Simple Polling until Download Ready ──
-            logger.info("⏳ Waiting for Final Generation to complete...")
+
+            # ── STATE 5: Inject full prompt ──
+            logger.info(f"📝 STATE 5: Injecting full prompt ({len(prompt)} chars)...")
+            prompt_injected = await _inject_prompt(page, prompt)
+            if not prompt_injected:
+                logger.error("❌ STATE 5 FAILED: Could not inject prompt!")
+            
+            await asyncio.sleep(1)
+
+            # ── STATE 6: Click arrow button for FINAL generation ──
+            logger.info("🎬 STATE 6: Clicking arrow button for FINAL generation...")
+            final_started = await verified_make_video_click(page, timeout_s=15, verify=True)
+            
+            if not final_started:
+                # Try one more time with a fresh keyboard type to ensure button is enabled
+                logger.warning("⚠️ Final generation didn't start. Adding a space and retrying...")
+                try:
+                    await page.keyboard.press("End")
+                    await page.keyboard.type(" ", delay=50)
+                    await asyncio.sleep(0.5)
+                except: pass
+                final_started = await verified_make_video_click(page, timeout_s=10, verify=True)
+            
+            if not final_started:
+                logger.error("❌ STATE 6 FAILED: Could not start final generation!")
+
+            # ── STATE 7: Wait for video download ──
+            logger.info("⏳ STATE 7: Waiting for Final Generation to complete...")
             output_dir = Path(os.getcwd()) / "generated_videos"
             output_dir.mkdir(exist_ok=True)
             output = output_dir / f"clip_{uuid4()}.mp4"
