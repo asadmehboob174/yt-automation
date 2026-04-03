@@ -752,6 +752,258 @@ async def _inject_prompt(page: Page, prompt: str) -> bool:
 
 
 # ============================================
+# Extend Video Helper
+# ============================================
+async def _extend_video(page, extend_duration: str, prompt: str, output: "Path") -> bool:
+    """
+    After a base clip is generated, uses Grok's 'Extend video' UI to append
+    more footage. Steps:
+      1. Seek the video player to the last frame
+      2. Click the '+' button next to the video controls
+      3. Click 'Extend video' from the popup menu
+      4. Inject the original prompt again
+      5. Click the duration button (+6s or +10s)
+      6. Wait for generation to finish and download the result
+    Returns True on success, False on any failure.
+    """
+    import asyncio as _asyncio
+
+    logger.info(f"🔁 Starting extend flow: extend_duration={extend_duration}...")
+
+
+    # ── Step 1: Seek video to the very end ──────────────────────────────────
+    try:
+        await page.evaluate("""() => {
+            const v = document.querySelector('video');
+            if (v && isFinite(v.duration) && v.duration > 0) {
+                v.currentTime = v.duration;
+            }
+        }""")
+        await _asyncio.sleep(1)
+        logger.info("⏩ Seeked video to last frame")
+    except Exception as e:
+        logger.warning(f"⚠️ Could not seek video: {e}")
+
+    # ── Step 2: Click the Settings/presets button (aria-label='Settings') ───
+    # This is the button with the + icon and chevron that opens the
+    # "Video Presets" popup (Spicy / Normal / Extend video / Redo).
+    # DOM: <button aria-label="Settings" id="radix-_r_9p_" ...>
+    clicked_plus = False
+
+    # Strategy A: Playwright — target the exact aria-label from the DOM
+    for sel in [
+        "button[aria-label='Settings'][aria-haspopup='menu']",
+        "button[aria-label='Settings']",
+        "button[aria-haspopup='menu']",
+    ]:
+        try:
+            loc = page.locator(sel).last
+            if await loc.count() > 0 and await loc.is_visible():
+                await loc.click()
+                clicked_plus = True
+                logger.info(f"✅ Clicked Settings/presets button via: {sel}")
+                break
+        except Exception:
+            continue
+
+    # Strategy B: JS — find visible button with aria-haspopup="menu" near the video
+    if not clicked_plus:
+        try:
+            found = await page.evaluate("""() => {
+                const btns = document.querySelectorAll('button[aria-haspopup="menu"]');
+                for (const btn of btns) {
+                    const rect = btn.getBoundingClientRect();
+                    if (rect.width === 0 || rect.height === 0) continue;
+                    btn.click();
+                    return btn.getAttribute('aria-label') || 'unknown';
+                }
+                return null;
+            }""")
+            if found:
+                clicked_plus = True
+                logger.info(f"✅ Clicked presets button via JS (label={found})")
+        except Exception as e:
+            logger.warning(f"⚠️ JS presets button click failed: {e}")
+
+    if not clicked_plus:
+        logger.error("❌ Could not find/click the Settings/presets button")
+        return False
+
+    await _asyncio.sleep(1.5)
+
+    # ── Step 3: Click 'Extend video' from the popup menu ────────────────────
+    # DOM: <div role="menuitem" ...><span class="font-semibold text-sm">Extend video</span>
+    extend_clicked = False
+
+    for sel in [
+        "div[role='menuitem']:has-text('Extend video')",
+        "[role='menuitem']:has-text('Extend video')",
+        "[data-radix-menu-content] [role='menuitem']:has-text('Extend video')",
+    ]:
+        try:
+            await page.wait_for_selector(sel, timeout=6000)
+            await page.locator(sel).first.click()
+            extend_clicked = True
+            logger.info("✅ Clicked 'Extend video' menu item")
+            break
+        except Exception:
+            continue
+
+    # JS fallback — find menuitem whose span text matches "Extend video"
+    if not extend_clicked:
+        try:
+            found = await page.evaluate("""() => {
+                const items = document.querySelectorAll('[role="menuitem"]');
+                for (const item of items) {
+                    const spans = item.querySelectorAll('span');
+                    for (const span of spans) {
+                        if ((span.innerText || span.textContent || '').trim().toLowerCase() === 'extend video') {
+                            item.click();
+                            return true;
+                        }
+                    }
+                    const txt = (item.innerText || item.textContent || '').trim().toLowerCase();
+                    if (txt.includes('extend video')) { item.click(); return true; }
+                }
+                return false;
+            }""")
+            if found:
+                extend_clicked = True
+                logger.info("✅ Clicked 'Extend video' via JS fallback")
+        except Exception as e:
+            logger.warning(f"⚠️ JS 'Extend video' fallback failed: {e}")
+
+    if not extend_clicked:
+        logger.error("❌ Could not find/click 'Extend video' menu item")
+        return False
+
+    # Wait for the UI to settle
+    await _asyncio.sleep(1)
+
+    # ── Step 3.5: Add prompt again ──────────────────────────────────────────
+    logger.info(f"📝 Injecting original prompt again for extend...")
+    await _inject_prompt(page, prompt)
+    await _asyncio.sleep(1)
+
+    # ── Step 4: Click the duration button (+6s or +10s) ─────────────────────
+    dur_num = extend_duration.strip().lower().replace("s", "")  # "6" or "10"
+    
+    clicked_dur = False
+    for text_var in [f"+{dur_num}s", f"{dur_num}s"]:
+        for sel in [
+            f"button:has-text('{text_var}')",
+            f"div[role='button']:has-text('{text_var}')"
+        ]:
+            try:
+                loc = page.locator(sel).last
+                if await loc.count() > 0 and await loc.is_visible(timeout=500):
+                    await loc.scroll_into_view_if_needed()
+                    await loc.click()
+                    logger.info(f"✅ Selected duration {text_var} via {sel}")
+                    clicked_dur = True
+                    break
+            except:
+                pass
+        if clicked_dur:
+            break
+            
+    if not clicked_dur:
+        logger.warning(f"⚠️ Could not find {extend_duration} duration toggle — proceeding anyway")
+
+    await _asyncio.sleep(1)
+
+    # ── Step 5: Click the up-arrow submit button to start the extend generation ──
+    # After "Extend video" is selected from the menu, the UI shows the same
+    # prompt bar with the big circular up-arrow button (same as normal generation).
+    # Use verified_make_video_click which handles all submit button selectors.
+    logger.info("⬆️ Clicking up-arrow submit button to start extend generation...")
+    submit_clicked = await verified_make_video_click(page, timeout_s=15, verify=False)
+
+    if not submit_clicked:
+        logger.error("❌ Could not click the up-arrow submit button for extend")
+        return False
+
+    # Hard wait to let Grok process the click and start the new generation.
+    # Without this the poll loop sees the old video as "ready" and downloads it.
+    logger.info("⏳ Waiting 12s for extend generation to start...")
+    await _asyncio.sleep(12)
+
+    # Confirm generation is underway (optional — proceed either way)
+    generation_started = False
+    for ind in [
+        "text='Generating...'", "text='Thinking...'", "text='Finalizing...'",
+        ".animate-pulse", "button:has-text('Cancel Video')",
+        "div[role='progressbar']", "svg.animate-spin",
+    ]:
+        try:
+            if await page.locator(ind).first.is_visible():
+                generation_started = True
+                logger.info(f"✅ Extend generation confirmed in progress")
+                break
+        except Exception:
+            continue
+
+    if not generation_started:
+        logger.warning("⚠️ No generation indicator visible — will still poll for completion")
+
+    max_wait = 400
+    poll_interval = 4
+
+    # Now poll until generation finishes and new extended video is ready
+    start_time = _asyncio.get_event_loop().time()
+    logger.info(f"⏳ Waiting for extended video to finish (up to {max_wait}s)...")
+
+    while (_asyncio.get_event_loop().time() - start_time) < max_wait:
+        if page.is_closed():
+            break
+        elapsed = int(_asyncio.get_event_loop().time() - start_time)
+
+        is_generating = False
+        for ind in [
+            "text='Generating...'", "text='Thinking...'", "text='Finalizing...'",
+            ".animate-pulse", "button:has-text('Cancel Video')",
+            "div[role='progressbar']", "svg.animate-spin",
+        ]:
+            try:
+                if await page.locator(ind).first.is_visible():
+                    is_generating = True
+                    if elapsed % 20 == 0:
+                        logger.info("⏳ Grok is extending the video...")
+                    break
+            except Exception:
+                continue
+
+        video_ready = await page.evaluate("""() => {
+            const v = document.querySelector('video');
+            if (!v) return { ready: false };
+            return { ready: v.readyState >= 3, duration: v.duration, src: v.src };
+        }""")
+
+        ready = video_ready.get("ready") and video_ready.get("duration", 0) > 0 and not is_generating
+
+        if ready:
+            logger.info("🎯 Extended video is ready! Downloading...")
+            for sel in ["button[aria-label='Download']", "button:has-text('Download')", "[data-testid='download-button']"]:
+                try:
+                    btn = page.locator(sel).first
+                    if await btn.count() > 0:
+                        async with page.expect_download(timeout=30000) as dl_info:
+                            await btn.click()
+                        download = await dl_info.value
+                        await download.save_as(output)
+                        if output.exists() and output.stat().st_size > 150000:
+                            logger.info(f"✅ Extended video downloaded! ({output.stat().st_size} bytes)")
+                            return True
+                except Exception:
+                    continue
+
+        await _asyncio.sleep(poll_interval)
+
+    logger.error(f"❌ Extended video generation timed out after {max_wait}s")
+    return False
+
+
+# ============================================
 # Core Generation Function
 # ============================================
 async def generate_single_clip(
@@ -1211,6 +1463,14 @@ async def generate_single_clip(
                 ready = video_ready.get("ready") and video_ready.get("duration", 0) > 0 and not is_generating
                 
                 if ready:
+                    # If we need to extend, skip downloading the base clip — go straight to extend
+                    if needs_extend and extend_duration:
+                        logger.info(f"🔁 Base clip ready — skipping download, extending by {extend_duration}...")
+                        extended = await _extend_video(page, extend_duration, prompt, output)
+                        if extended:
+                            return output
+                        logger.warning("⚠️ Extension failed — falling back to downloading base clip")
+
                     logger.info("🎯 Final Video is ready! Starting download...")
                     for sel in ["button[aria-label='Download']", "button:has-text('Download')", "[data-testid='download-button']"]:
                         try:
@@ -1220,9 +1480,9 @@ async def generate_single_clip(
                                     await btn.click()
                                 download = await dl_info.value
                                 await download.save_as(output)
-                                
+
                                 if output.exists() and output.stat().st_size > 150000:
-                                    logger.info(f"✅ Final Video generated and downloaded! ({output.stat().st_size} bytes)")
+                                    logger.info(f"✅ Clip downloaded! ({output.stat().st_size} bytes)")
                                     return output
                         except: continue
                     
@@ -1420,14 +1680,22 @@ class GrokAnimator:
         # This prevents concurrent Grok requests from fighting over the same profile.
         async with _grok_lock:
             # Handle both int and string durations with strict '6s'/'10s' mapping
-            d_val = str(duration).lower().strip()
-            if '6' in d_val:
+            d_val = str(duration).lower().strip().replace('s', '')
+            # Extract just the numeric part for exact comparison
+            d_numeric = ''.join(c for c in d_val if c.isdigit())
+            if d_numeric == '6':
                 duration_str = "6s"
-            elif '10' in d_val:
+            elif d_numeric == '10':
                 duration_str = "10s"
             else:
-                logger.warning(f"⚠️ GrokAnimator: Ambiguous duration '{duration}', defaulting to '10s'")
+                # For values like 16, 20 etc (total durations), always use 10s base
+                logger.warning(f"⚠️ GrokAnimator: Duration '{duration}' is not 6s/10s, using '10s' as base clip")
                 duration_str = "10s"
+            
+            # Auto-enable needs_extend if extend_duration is provided
+            if extend_duration and not needs_extend:
+                needs_extend = True
+                logger.info(f"🔁 Auto-enabled needs_extend because extend_duration='{extend_duration}' was provided")
             
             MAX_RETRIES = 3
             for attempt in range(MAX_RETRIES):

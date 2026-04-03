@@ -567,7 +567,9 @@ class FFmpegVideoEditor:
         clip_paths: list[Path],
         output_path: Optional[Path] = None,
         transition_duration: float = 0.5,
-        target_resolution: tuple[int, int] = (1920, 1080)
+        target_resolution: tuple[int, int] = (1920, 1080),
+        clip_audio_volumes: Optional[list[float]] = None,
+        **kwargs
     ) -> Path:
         """Stitch clips with crossfade transitions (alias for workflow)."""
         # Call the sophisticated stitcher with fades and resolution forcing
@@ -575,7 +577,9 @@ class FFmpegVideoEditor:
             clip_paths, 
             output_path, 
             fade_duration=transition_duration,
-            target_resolution=target_resolution
+            target_resolution=target_resolution,
+            clip_audio_volumes=clip_audio_volumes,
+            **kwargs
         )
     
     def mix_audio(
@@ -813,14 +817,18 @@ class FFmpegVideoEditor:
         clip_paths: list[Path],
         output_path: Optional[Path] = None,
         transition_duration: float = 0.5,
-        target_resolution: tuple[int, int] = (1920, 1080)
+        target_resolution: tuple[int, int] = (1920, 1080),
+        clip_audio_volumes: Optional[list[float]] = None,
+        **kwargs
     ) -> Path:
         """Stitch clips with crossfade transitions (alias for workflow)."""
         return self.stitch_clips_with_fade(
             clip_paths, 
             output_path, 
             fade_duration=transition_duration, 
-            target_resolution=target_resolution
+            target_resolution=target_resolution,
+            clip_audio_volumes=clip_audio_volumes,
+            **kwargs
         )
 
     def apply_color_grading(
@@ -952,7 +960,14 @@ class FFmpegVideoEditor:
                 
             # result is a tuple: (status_text, dict_with_video_path)
             loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(None, run_gradio)
+            
+            # Wrap the blocking executor in a timeout (3 mins = 180 seconds)
+            try:
+                result = await asyncio.wait_for(loop.run_in_executor(None, run_gradio), timeout=180.0)
+            except asyncio.TimeoutError:
+                logger.error("❌ HF Space 4K Upscale timed out after 3 minutes. Queue might be full.")
+                shutil.copy(input_path, output_path)
+                return output_path
             
             # Extract video path from result
             if isinstance(result, tuple) and len(result) == 2:

@@ -126,7 +126,7 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
             // Navigate to Characters tab (Step 2) so user can see progress
             useProjectStore.getState().setStep(2);
             updateStep(2, 'running');
-            const characterImages: Array<{ name: string; imageUrl: string }> = [];
+            const characterImages: Array<{ name: string; prompt: string; imageUrl: string }> = [];
 
             const charactersToGenerate = characters.map((c: any, i: number) => ({
                 index: i,
@@ -189,8 +189,9 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
                                     const { index, imageUrl } = result;
                                     if (imageUrl) {
                                         const charName = characters[index].name;
+                                        const charPrompt = characters[index].prompt || '';
                                         updateProgress(`Character ${charName} image generated.`);
-                                        characterImages.push({ name: charName, imageUrl });
+                                        characterImages.push({ name: charName, prompt: charPrompt, imageUrl });
 
                                         // Update UI in real-time
                                         useProjectStore.getState().updateCharacter(index, {
@@ -299,8 +300,8 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
                                             emotion: ensureString(sceneData.emotion || sceneData.grok_video_prompt?.emotion || sceneData.grokVideoPrompt?.emotion),
                                             text_to_audio_prompt: ensureString(sceneData.text_to_audio_prompt || sceneData.textToAudioPrompt),
                                             resolution: useProjectStore.getState().videoResolution,
-                                            duration: sceneData.duration || sceneData.duration_in_seconds || 10,
-                                            duration_config: sceneData.duration_config || sceneData.durationConfig,
+                                            duration: sceneData.duration_config?.clip_duration || sceneData.durationConfig?.clip_duration || sceneData.duration || sceneData.duration_in_seconds || 10,
+                                            extend_duration: sceneData.duration_config?.extend_duration || sceneData.durationConfig?.extend_duration,
                                         });
                                         useProjectStore.getState().updateScene(index, {
                                             videoUrl: videoResult.videoUrl,
@@ -370,8 +371,7 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
                             emotion: ensureString(sceneData.emotion || sceneData.grok_video_prompt?.emotion || sceneData.grokVideoPrompt?.emotion),
                             text_to_audio_prompt: ensureString(sceneData.text_to_audio_prompt || sceneData.textToAudioPrompt),
                             resolution: useProjectStore.getState().videoResolution,
-                            duration: sceneData.duration || sceneData.duration_in_seconds || 10,
-                            duration_config: sceneData.duration_config || sceneData.durationConfig,
+                            duration: sceneData.duration_config?.clip_duration || sceneData.durationConfig?.clip_duration || sceneData.duration || sceneData.duration_in_seconds || 10,
                             extend_duration: sceneData.duration_config?.extend_duration || sceneData.durationConfig?.extend_duration
                         });
                         currentVideoUrl = repairResult.videoUrl;

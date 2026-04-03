@@ -853,198 +853,144 @@ class GenerateBatchRequest(BaseModel):
 
 @app.post("/scenes/generate-batch")
 async def generate_scene_batch(request: GenerateBatchRequest):
-    """Generate multiple scene images using WhiskAgent (Bulk Mode)."""
+    """Generate multiple scene images using HuggingFace FLUX (Bulk Mode)."""
     try:
-        from services.whisk_agent import WhiskAgent
+        from services.image_generator_factory import get_image_generator
         from services.cloud_storage import R2Storage
         import uuid
-        
-        print(f"🚀 Starting Batch Generation for {len(request.prompts)} scenes...")
-        
-        # Initialize Agent
-        # headless=False allows user to see/debug, but for pure automation True is better.
-        # headless=False allows user to see/debug.
-        # For bulk stability, we can run headless, but visible is often safer for Whisk.
-        # Let's verify WhiskAgent default. It defaults to False (Headful).
-        agent = WhiskAgent(headless=False) 
-        
-        # Character Reference Downloads
-        char_local_paths = []
-        import httpx
-        import tempfile
-        from pathlib import Path
-        
-        if request.character_images:
-            print(f"📥 Downloading {len(request.character_images)} character references for bulk run...")
-            async with httpx.AsyncClient() as client:
-                for char in request.character_images:
-                    url = char.get("imageUrl")
-                    if not url: continue
-                    try:
-                        resp = await client.get(url, follow_redirects=True)
-                        resp.raise_for_status()
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-                            tmp.write(resp.content)
-                            char_local_paths.append(Path(tmp.name))
-                    except Exception as e:
-                        print(f"⚠️ Failed to download character ref {url}: {e}")
 
-        # Run Batch
-        images_bytes = await agent.generate_batch(
-            prompts=request.prompts,
-            is_shorts=request.is_shorts,
-            style_suffix=request.style_suffix,
-            delay_seconds=5,
-            character_paths=char_local_paths
-        )
-        
-        # Process & Upload Results
+        print(f"🚀 Starting Image Batch Generation for {len(request.prompts)} scenes...")
+
+        generator = get_image_generator()
         storage = R2Storage()
         results = []
-        
-        for i, img_bytes in enumerate(images_bytes):
-            if not img_bytes:
+
+        # Compute seed from first character name for consistency
+        seed = 42
+        if request.character_images:
+            first_name = request.character_images[0].get("name", "")
+            if first_name:
+                seed = generator._get_character_seed(first_name)
+
+        for i, prompt in enumerate(request.prompts):
+            scene_prompt = generator.build_scene_prompt(
+                scene_prompt=prompt,
+                character_images=request.character_images,
+                style_suffix=request.style_suffix,
+            )
+            try:
+                img_bytes = await generator.generate(
+                    prompt=scene_prompt,
+                    style_suffix=request.style_suffix,
+                    seed=seed,
+                    is_shorts=request.is_shorts,
+                )
+                image_key = f"scenes/{request.niche_id}/batch_{uuid.uuid4().hex[:8]}_scene_{i}.png"
+                storage.upload_asset(img_bytes, image_key, content_type="image/png")
+                image_url = storage.get_url(image_key)
+                results.append(image_url)
+                print(f"✅ Batch Image {i+1} uploaded: {image_url}")
+            except Exception as e:
+                print(f"⚠️ Scene {i+1} failed: {e}")
                 results.append(None)
-                continue
-                
-            image_key = f"scenes/{request.niche_id}/batch_{uuid.uuid4().hex[:8]}_scene_{i}.png"
-            storage.upload_asset(img_bytes, image_key, content_type="image/png")
-            image_url = storage.get_url(image_key)
-            results.append(image_url)
-            print(f"✅ Batch Image {i+1} uploaded: {image_url}")
-            
+
         return {"imageUrls": results}
-        
+
     except Exception as e:
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        await agent.close()
-        # Clean up character temp files
-        for p in char_local_paths:
-            if p.exists():
-                try: p.unlink() 
-                except: pass
 
 @app.post("/characters/generate-image")
 async def generate_character_image(request: GenerateImageRequest):
-    """Generate a character reference image using WhiskAgent."""
-    agent = None
+    """Generate a character reference image using HuggingFace FLUX."""
     try:
-        from services.whisk_agent import WhiskAgent
+        from services.image_generator_factory import get_image_generator
         from services.cloud_storage import R2Storage
         import uuid
-        
+
         print(f"🎨 Generating master character image for: {request.character_name}")
         print(f"   Prompt: {request.prompt[:100]}...")
-        
+
         # Determine Style Suffix (Fetch from DB based on Niche)
         channel = await db.channel.find_unique(where={"nicheId": request.niche_id})
         style_suffix = channel.styleSuffix if (channel and channel.styleSuffix) else ""
-        
-        # Initialize Agent and Generate with Global Lock
-        async with BROWSER_LOCK:
-            agent = WhiskAgent(headless=False)
-            image_bytes = await agent.generate_image(
-                prompt=request.prompt,
-                is_shorts=request.is_shorts,
-                style_suffix=style_suffix
-            )
-        
-        if not image_bytes:
-            raise HTTPException(status_code=500, detail="Whisk failed to generate character image")
 
-        # Upload
+        generator = get_image_generator()
+        image_bytes = await generator.generate_character_image(
+            name=request.character_name,
+            prompt=request.prompt,
+            niche_id=request.niche_id,
+            style_suffix=style_suffix,
+            is_shorts=request.is_shorts,
+        )
+
+        # Upload to R2
         storage = R2Storage()
-        image_key = f"characters/{request.niche_id}/{request.character_name.lower().replace(' ', '_')}_{uuid.uuid4().hex[:8]}.png"
+        safe_name = request.character_name.lower().replace(" ", "_")
+        image_key = f"characters/{request.niche_id}/{safe_name}_{uuid.uuid4().hex[:8]}.png"
         storage.upload_asset(image_bytes, image_key, content_type="image/png")
         image_url = storage.get_url(image_key)
-        
+
         print(f"✅ Character image uploaded: {image_url}")
-        
+
         return {"image_url": image_url}
-        
+
     except Exception as e:
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error generating character image: {e}")
-    finally:
-        if agent:
-            await agent.close()
 
+@app.post("/scenes/generate-image")
 async def generate_scene_image(request: GenerateSceneImageRequest):
-    """Generate scene image using WhiskAgent (Single Mode)."""
-    agent = None
+    """Generate scene image using HuggingFace FLUX (Single Mode)."""
     try:
-        from services.whisk_agent import WhiskAgent
+        from services.image_generator_factory import get_image_generator
         from services.cloud_storage import R2Storage
         import uuid
-        
+
         print(f"🎨 Generating single scene image for scene {request.scene_index}")
         print(f"   Prompt: {request.prompt[:100]}...")
-        
-        # Determine Style Suffix (Fetch from DB based on Niche)
+
         channel = await db.channel.find_unique(where={"nicheId": request.niche_id})
         style_suffix = channel.styleSuffix if (channel and channel.styleSuffix) else ""
-        
-        # Character Reference Downloads
-        char_local_paths = []
-        import httpx
-        import tempfile
-        from pathlib import Path
-        
-        if request.character_images:
-            print(f"📥 Downloading {len(request.character_images)} character references...")
-            async with httpx.AsyncClient() as client:
-                for char in request.character_images:
-                    url = char.get("imageUrl")
-                    if not url: continue
-                    try:
-                        resp = await client.get(url, follow_redirects=True)
-                        resp.raise_for_status()
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-                            tmp.write(resp.content)
-                            char_local_paths.append(Path(tmp.name))
-                    except Exception as e:
-                        print(f"⚠️ Failed to download character ref {url}: {e}")
 
-        # Initialize Agent
-        agent = WhiskAgent(headless=False)
-        
-        # Generate
-        image_bytes = await agent.generate_image(
-            prompt=request.prompt,
-            is_shorts=request.is_shorts, # Use passed value
+        generator = get_image_generator()
+
+        # Embed character descriptions for visual consistency
+        scene_prompt = generator.build_scene_prompt(
+            scene_prompt=request.prompt,
+            character_images=request.character_images,
             style_suffix=style_suffix,
-            character_paths=char_local_paths
         )
-        
-        if not image_bytes:
-            raise HTTPException(status_code=500, detail="Whisk failed to generate image")
 
-        # Upload
+        # Use deterministic seed from first character name for consistency
+        seed = 42
+        if request.character_images:
+            first_name = request.character_images[0].get("name", "")
+            if first_name:
+                seed = generator._get_character_seed(first_name)
+
+        image_bytes = await generator.generate(
+            prompt=scene_prompt,
+            style_suffix=style_suffix,
+            seed=seed,
+            is_shorts=request.is_shorts,
+        )
+
         storage = R2Storage()
         image_key = f"scenes/{request.niche_id}/{uuid.uuid4().hex[:8]}_scene_{request.scene_index}.png"
         storage.upload_asset(image_bytes, image_key, content_type="image/png")
         image_url = storage.get_url(image_key)
-        
+
         print(f"✅ Image uploaded: {image_url}")
-        
+
         return {"imageUrl": image_url}
-        
+
     except Exception as e:
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error generating scene image: {e}")
-    finally:
-        if agent:
-            await agent.close()
-        # Clean up character temp files
-        for p in char_local_paths:
-            if p.is_file():
-                try: os.unlink(str(p))
-                except: pass
 
 
 
@@ -1062,133 +1008,87 @@ class GenerateCharacterBatchRequest(BaseModel):
 
 @app.post("/scenes/generate-images-batch")
 async def generate_images_batch(request: GenerateBatchSceneImagesRequest):
-    """Generate multiple scene images in one browser session."""
-    agent = None
+    """Generate multiple scene images using HuggingFace FLUX."""
     results = []
-    
+
     try:
-        from services.whisk_agent import WhiskAgent
+        from services.image_generator_factory import get_image_generator
         from services.cloud_storage import R2Storage
         import uuid
-        import httpx
-        import tempfile
-        from pathlib import Path
+        import asyncio
 
-        print(f"🎨 Starting Batch Generation for {len(request.scenes)} scenes...")
+        print(f"🎨 Starting Image Batch Generation for {len(request.scenes)} scenes...")
 
-        # Determine Style Suffix
         channel = await db.channel.find_unique(where={"nicheId": request.niche_id})
         style_suffix = channel.styleSuffix if (channel and channel.styleSuffix) else ""
-        
-        # Determine format
-        is_shorts = request.video_type and "short" in request.video_type.lower()
+
+        is_shorts = bool(request.video_type and "short" in request.video_type.lower())
         print(f"   📐 Batch Format: {'Shorts (9:16)' if is_shorts else 'Landscape (16:9)'}")
 
-        # Download Character References (Once for all scenes)
-        char_local_paths = []
-        if request.character_images:
-            print(f"📥 Downloading {len(request.character_images)} character references...")
-            async with httpx.AsyncClient() as client:
-                for char in request.character_images:
-                    url = char.get("imageUrl")
-                    if not url: continue
-                    try:
-                        resp = await client.get(url, follow_redirects=True)
-                        resp.raise_for_status()
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-                            tmp.write(resp.content)
-                            char_local_paths.append(Path(tmp.name))
-                    except Exception as e:
-                        print(f"⚠️ Failed to download character ref {url}: {e}")
-
-        # Initialize Agent (Single Session)
-        agent = WhiskAgent(headless=False)
+        generator = get_image_generator()
         storage = R2Storage()
 
-        # Track if setup (login, upload, etc) has been done successfully
-        setup_done = False
+        # Compute seed from first character name for consistency across all scenes
+        seed = 42
+        if request.character_images:
+            first_name = request.character_images[0].get("name", "")
+            if first_name:
+                seed = generator._get_character_seed(first_name)
 
         for i, scene in enumerate(request.scenes):
             idx = scene.get("index")
-            prompt = scene.get("prompt")
-            # DEBUG: Log what we're receiving to diagnose empty prompts
-            print(f"   > Generating Scene {idx+1} (Batch {i+1}/{len(request.scenes)})...")
-            print(f"     DEBUG: Scene keys: {list(scene.keys())}")
-            print(f"     DEBUG: Prompt value: '{prompt}' (type: {type(prompt).__name__}, len: {len(prompt) if prompt else 0})")
-            
-            # Retry loop for robust generation
+            raw_prompt = scene.get("prompt", "")
+            print(f"   > Generating Scene {idx+1} ({i+1}/{len(request.scenes)})...")
+
+            # Embed character descriptions for visual consistency
+            scene_prompt = generator.build_scene_prompt(
+                scene_prompt=raw_prompt,
+                character_images=request.character_images,
+                style_suffix=style_suffix,
+            )
+
             MAX_RETRIES = 3
-            
             for attempt in range(MAX_RETRIES):
                 try:
                     if attempt > 0:
-                        print(f"     🔄 Retry Attempt {attempt+1}/{MAX_RETRIES} for Scene {idx+1}...")
-                        import asyncio
-                        await asyncio.sleep(2) # Wait a bit before retry
+                        print(f"     🔄 Retry {attempt+1}/{MAX_RETRIES} for Scene {idx+1}...")
+                        await asyncio.sleep(2)
 
-                    # Reuse agent for each scene. 
-                    # Skip setup (refresh + uploads) if we have already done it once in this batch.
-                    # BUT if we are retrying, maybe forcing setup (skip_setup=False) is safer?
-                    # For now, let's trust the page state unless it crashes hard.
-                    should_skip_setup = setup_done
-                    
-                    image_bytes = await agent.generate_image(
-                        prompt=prompt,
-                        is_shorts=is_shorts, # Pass correct ratio
+                    image_bytes = await generator.generate(
+                        prompt=scene_prompt,
                         style_suffix=style_suffix,
-                        character_paths=char_local_paths,
-                        skip_setup=should_skip_setup
+                        seed=seed,
+                        is_shorts=is_shorts,
                     )
-                    
-                    if image_bytes:
-                        image_key = f"scenes/{request.niche_id}/{uuid.uuid4().hex[:8]}_scene_{idx}.png"
-                        storage.upload_asset(image_bytes, image_key, content_type="image/png")
-                        image_url = storage.get_url(image_key)
-                        results.append({"index": idx, "imageUrl": image_url})
-                        print(f"     ✅ Scene {idx+1} done: {image_url}")
-                        
-                        # Mark setup as done since we successfully generated an image (implies setup worked)
-                        setup_done = True
-                        break # Success, exit retry loop
-                    
-                    else:
-                        print(f"     ⚠️ Scene {idx+1} returned no bytes (Attempt {attempt+1})")
-                        if attempt == MAX_RETRIES - 1:
-                            results.append({"index": idx, "error": "No image generated after retries"})
-                        
-                        # If failed, we might keep setup_done as True if we believe session is okay,
-                        # or set to False to force refresh? 
-                        # Let's keep it True to avoid re-uploading characters needlessly.
-                        
+                    image_key = f"scenes/{request.niche_id}/{uuid.uuid4().hex[:8]}_scene_{idx}.png"
+                    storage.upload_asset(image_bytes, image_key, content_type="image/png")
+                    image_url = storage.get_url(image_key)
+                    results.append({"index": idx, "imageUrl": image_url})
+                    print(f"     ✅ Scene {idx+1} done: {image_url}")
+                    break
+
                 except Exception as e:
                     print(f"     ❌ Scene {idx+1} failed (Attempt {attempt+1}): {e}")
                     if attempt == MAX_RETRIES - 1:
                         results.append({"index": idx, "error": str(e)})
-                    # Wait before next attempt
-            
-            # End of retry loop
-
-
 
         # --- THUMBNAIL GENERATION ---
         if request.thumbnail_prompt:
-            print(f"🖼️ Transitioning to Thumbnail Generation for Batch. (setup_done={setup_done})")
+            print(f"🖼️ Generating Thumbnail...")
             try:
-                thumb_bytes = await agent.generate_image(
+                thumb_bytes = await generator.generate(
                     prompt=request.thumbnail_prompt,
-                    is_shorts=is_shorts,
                     style_suffix=style_suffix,
-                    character_paths=char_local_paths,
-                    skip_setup=setup_done
+                    seed=42,
+                    is_shorts=False,  # thumbnails are always 16:9
                 )
-                if thumb_bytes:
-                    thumb_key = f"thumbnails/{request.niche_id}/{uuid.uuid4().hex[:8]}_thumb.png"
-                    storage.upload_asset(thumb_bytes, thumb_key, content_type="image/png")
-                    thumb_url = storage.get_url(thumb_key)
-                    results.append({"index": -1, "type": "thumbnail", "imageUrl": thumb_url})
-                    print(f"✅ Batch Thumbnail done: {thumb_url}")
+                thumb_key = f"thumbnails/{request.niche_id}/{uuid.uuid4().hex[:8]}_thumb.png"
+                storage.upload_asset(thumb_bytes, thumb_key, content_type="image/png")
+                thumb_url = storage.get_url(thumb_key)
+                results.append({"index": -1, "type": "thumbnail", "imageUrl": thumb_url})
+                print(f"✅ Thumbnail done: {thumb_url}")
             except Exception as e:
-                print(f"⚠️ Batch Thumbnail failed: {e}")
+                print(f"⚠️ Thumbnail failed: {e}")
 
         return {"results": results}
 
@@ -1196,81 +1096,56 @@ async def generate_images_batch(request: GenerateBatchSceneImagesRequest):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Batch generation failed: {e}")
-    finally:
-        if agent:
-            # Add a tiny delay before closing to ensure any pending network activity is settled
-            import asyncio
-            await asyncio.sleep(1)
-            await agent.close()
-        # Clean up character temp files
-        for p in char_local_paths:
-            if p.is_file():
-                try: os.unlink(str(p))
-                except: pass
 
 
 @app.post("/characters/generate-images-stream")
 async def generate_character_images_stream(request: GenerateCharacterBatchRequest):
-    """Generate all master cast images in one chrome session and stream results."""
-    from services.whisk_agent import WhiskAgent
+    """Generate all master cast images using HuggingFace FLUX and stream results."""
+    from services.image_generator_factory import get_image_generator
     from services.cloud_storage import R2Storage
     import json
     import asyncio
     import uuid
-    import httpx
-    import tempfile
-    from pathlib import Path
 
     async def generate_generator():
-        agent = None
         try:
             print(f"🚀 [Streaming] Starting Character Batch Generation for {len(request.characters)} characters...")
 
-            # Determine Style Suffix
             channel = await db.channel.find_unique(where={"nicheId": request.niche_id})
             style_suffix = channel.styleSuffix if (channel and channel.styleSuffix) else ""
-            
-            # Determine format
-            is_shorts = request.video_type and "short" in request.video_type.lower()
+            is_shorts = bool(request.video_type and "short" in request.video_type.lower())
 
-            # Initialize Agent
-            agent = WhiskAgent(headless=False)
+            generator = get_image_generator()
             storage = R2Storage()
-            setup_done = False
 
-            for i, char_req in enumerate(request.characters):
-                idx = char_req.get("index") # Character index
+            for char_req in request.characters:
+                idx = char_req.get("index")
                 char_name = char_req.get("name", f"Character_{idx}")
-                prompt = char_req.get("prompt")
-                
-                # Retry loop
+                prompt = char_req.get("prompt", "")
+
                 MAX_RETRIES = 3
                 success = False
-                
+
                 for attempt in range(MAX_RETRIES):
                     try:
                         if attempt > 0:
                             await asyncio.sleep(2)
 
-                        image_bytes = await agent.generate_image(
+                        image_bytes = await generator.generate_character_image(
+                            name=char_name,
                             prompt=prompt,
-                            is_shorts=is_shorts,
+                            niche_id=request.niche_id,
                             style_suffix=style_suffix,
-                            skip_setup=setup_done
+                            is_shorts=is_shorts,
                         )
-                        
-                        if image_bytes:
-                            # Use character-specific key
-                            image_key = f"characters/{request.niche_id}/{char_name.lower().replace(' ', '_')}_{uuid.uuid4().hex[:8]}.png"
-                            storage.upload_asset(image_bytes, image_key, content_type="image/png")
-                            image_url = storage.get_url(image_key)
-                            
-                            # Yield result
-                            yield json.dumps({"index": idx, "imageUrl": image_url}) + "\n"
-                            
-                            setup_done = True
-                            success = True
-                            break
+                        safe_name = char_name.lower().replace(" ", "_")
+                        image_key = f"characters/{request.niche_id}/{safe_name}_{uuid.uuid4().hex[:8]}.png"
+                        storage.upload_asset(image_bytes, image_key, content_type="image/png")
+                        image_url = storage.get_url(image_key)
+
+                        yield json.dumps({"index": idx, "imageUrl": image_url}) + "\n"
+                        success = True
+                        break
                     except Exception as e:
                         print(f"❌ Character {char_name} failed (Attempt {attempt+1}): {e}")
 
@@ -1281,151 +1156,100 @@ async def generate_character_images_stream(request: GenerateCharacterBatchReques
             import traceback
             traceback.print_exc()
             yield json.dumps({"error": str(e)}) + "\n"
-        finally:
-            if agent:
-                await asyncio.sleep(1)
-                await agent.close()
 
     return StreamingResponse(generate_generator(), media_type="application/x-ndjson")
 
 
 @app.post("/scenes/generate-images-stream")
 async def generate_images_stream(request: GenerateBatchSceneImagesRequest):
-    """Generate multiple scene images in one browser session and stream results."""
-    from services.whisk_agent import WhiskAgent
+    """Generate multiple scene images using HuggingFace FLUX and stream results."""
+    from services.image_generator_factory import get_image_generator
     from services.cloud_storage import R2Storage
     import json
     import asyncio
     import uuid
-    import httpx
-    import tempfile
-    from pathlib import Path
 
     async def generate_generator():
-        agent = None
-        char_local_paths = []
         try:
-            print(f"🚀 [Streaming] Starting Batch Generation for {len(request.scenes)} scenes...")
-            print(f"   🖼️ Thumbnail Prompt Status: {'PRESET' if request.thumbnail_prompt else 'EMPTY'}")
+            print(f"🚀 [Streaming] Starting Image Batch Generation for {len(request.scenes)} scenes...")
 
-            # Determine Style Suffix
             channel = await db.channel.find_unique(where={"nicheId": request.niche_id})
             style_suffix = channel.styleSuffix if (channel and channel.styleSuffix) else ""
-            
-            # Determine format
-            is_shorts = request.video_type and "short" in request.video_type.lower()
+            is_shorts = bool(request.video_type and "short" in request.video_type.lower())
 
-            # Download Character References
-            if request.character_images:
-                async with httpx.AsyncClient() as client:
-                    for char in request.character_images:
-                        url = char.get("imageUrl")
-                        if not url: continue
-                        try:
-                            resp = await client.get(url, follow_redirects=True)
-                            resp.raise_for_status()
-                            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-                                tmp.write(resp.content)
-                                char_local_paths.append(Path(tmp.name))
-                        except Exception as e:
-                            print(f"⚠️ Failed to download character ref {url}: {e}")
-
-            # Initialize Agent
-            agent = WhiskAgent(headless=False)
+            generator = get_image_generator()
             storage = R2Storage()
-            setup_done = False
+
+            # Compute seed from first character name for consistency across all scenes
+            seed = 42
+            if request.character_images:
+                first_name = request.character_images[0].get("name", "")
+                if first_name:
+                    seed = generator._get_character_seed(first_name)
 
             for i, scene in enumerate(request.scenes):
                 idx = scene.get("index")
-                prompt = scene.get("prompt")
+                raw_prompt = scene.get("prompt", "")
                 print(f"[STREAM] Generating Scene {i+1}/{len(request.scenes)} (Index {idx})...")
-                
-                # Retry loop
+
+                scene_prompt = generator.build_scene_prompt(
+                    scene_prompt=raw_prompt,
+                    character_images=request.character_images,
+                    style_suffix=style_suffix,
+                )
+
                 MAX_RETRIES = 3
                 success = False
-                
+
                 for attempt in range(MAX_RETRIES):
                     try:
                         if attempt > 0:
                             await asyncio.sleep(2)
 
-                        image_bytes = await agent.generate_image(
-                            prompt=prompt,
-                            is_shorts=is_shorts,
+                        image_bytes = await generator.generate(
+                            prompt=scene_prompt,
                             style_suffix=style_suffix,
-                            character_paths=char_local_paths,
-                            skip_setup=setup_done
+                            seed=seed,
+                            is_shorts=is_shorts,
                         )
-                        
-                        if image_bytes:
-                            image_key = f"scenes/{request.niche_id}/{uuid.uuid4().hex[:8]}_scene_{idx}.png"
-                            storage.upload_asset(image_bytes, image_key, content_type="image/png")
-                            image_url = storage.get_url(image_key)
-                            
-                            # Yield result as individual JSON object per line
-                            yield json.dumps({"index": idx, "imageUrl": image_url}) + "\n"
-                            print(f"[SUCCESS] Scene {idx} generated: {image_url}")
-                            
-                            setup_done = True
-                            success = True
-                            break
-                        else:
-                            print(f"⚠️ Scene {idx} attempt {attempt+1} returned no bytes")
+                        image_key = f"scenes/{request.niche_id}/{uuid.uuid4().hex[:8]}_scene_{idx}.png"
+                        storage.upload_asset(image_bytes, image_key, content_type="image/png")
+                        image_url = storage.get_url(image_key)
+
+                        yield json.dumps({"index": idx, "imageUrl": image_url}) + "\n"
+                        print(f"[SUCCESS] Scene {idx} generated: {image_url}")
+                        success = True
+                        break
                     except Exception as e:
-                        print(f"❌ Scene {idx+1} failed (Attempt {attempt+1}): {e}")
+                        print(f"❌ Scene {idx} failed (Attempt {attempt+1}): {e}")
 
                 if not success:
-                    print(f"[ERROR] Scene {idx} failed after all retries")
                     yield json.dumps({"index": idx, "error": "Failed after retries"}) + "\n"
 
             # --- THUMBNAIL GENERATION ---
             if request.thumbnail_prompt:
-                print(f"[STREAM] Transitioning to Thumbnail Generation. (setup_done={setup_done})")
+                print(f"[STREAM] Generating Thumbnail...")
                 try:
-                    # YouTube thumbnails are always 16:9 (1280x720)
-                    thumb_bytes = await agent.generate_image(
+                    thumb_bytes = await generator.generate(
                         prompt=request.thumbnail_prompt,
-                        is_shorts=is_shorts,
                         style_suffix=style_suffix,
-                        character_paths=char_local_paths,
-                        skip_setup=setup_done
+                        seed=42,
+                        is_shorts=False,  # thumbnails are always 16:9
                     )
-                    
-                    if thumb_bytes:
-                        thumb_key = f"thumbnails/{request.niche_id}/{uuid.uuid4().hex[:8]}_thumb.png"
-                        storage.upload_asset(thumb_bytes, thumb_key, content_type="image/png")
-                        thumb_url = storage.get_url(thumb_key)
-                        
-                        # Yield special thumbnail event
-                        yield json.dumps({"type": "thumbnail", "imageUrl": thumb_url}) + "\n"
-                        print(f"[SUCCESS] Thumbnail generated: {thumb_url}")
-                    else:
-                        print("⚠️ Thumbnail generation returned no bytes")
-                        yield json.dumps({"type": "thumbnail", "error": "Failed to generate thumbnail"}) + "\n"
-                        
+                    thumb_key = f"thumbnails/{request.niche_id}/{uuid.uuid4().hex[:8]}_thumb.png"
+                    storage.upload_asset(thumb_bytes, thumb_key, content_type="image/png")
+                    thumb_url = storage.get_url(thumb_key)
+                    yield json.dumps({"type": "thumbnail", "imageUrl": thumb_url}) + "\n"
+                    print(f"[SUCCESS] Thumbnail generated: {thumb_url}")
                 except Exception as e:
                     print(f"❌ Thumbnail generation failed: {e}")
-                    import traceback
-                    traceback.print_exc()
                     yield json.dumps({"type": "thumbnail", "error": str(e)}) + "\n"
-            else:
-                print("ℹ️ No thumbnail_prompt requested, skipping thumbnail phase.")
 
         except Exception as e:
             print(f"❌ Global streaming error: {e}")
             import traceback
             traceback.print_exc()
             yield json.dumps({"error": str(e)}) + "\n"
-        finally:
-            print("🛑 [Streaming] Generation stream ending. Cleaning up agent...")
-            if agent:
-                await asyncio.sleep(1)
-                await agent.close()
-            for p in char_local_paths:
-                if p.is_file():
-                    try: os.unlink(str(p))
-                    except: pass
-
 
     return StreamingResponse(generate_generator(), media_type="application/x-ndjson")
 
@@ -1586,8 +1410,16 @@ async def generate_video(request: GenerateVideoRequest):
             
             async def generate_and_verify(prompt: str) -> Path:
                 """Inner helper to generate and immediately verify integrity."""
-                # Determine base duration
-                base_dur = request.duration or 10
+                # Determine base duration — Grok only supports 6s or 10s
+                raw_dur = str(request.duration or 10).lower().strip().replace('s', '')
+                dur_numeric = ''.join(c for c in raw_dur if c.isdigit())
+                if dur_numeric == '6':
+                    base_dur = "6s"
+                else:
+                    base_dur = "10s"  # 10, 16, 20 etc all use 10s base
+                
+                # Auto-detect needs_extend from extend_duration
+                needs_extend = bool(request.extend_duration)
                 
                 path = await animator.animate(
                     image_path=image_path,
@@ -1600,6 +1432,7 @@ async def generate_video(request: GenerateVideoRequest):
                     dialogue=request.dialogue,
                     sound_effect=request.sound_effect,
                     emotion=request.emotion or "neutrally",
+                    needs_extend=needs_extend,
                     extend_duration=request.extend_duration
                 )
                 # Strict Integrity check
@@ -2026,10 +1859,36 @@ async def stitch_videos(request: StitchVideosRequest):
 
         except Exception as e:
             print(f"⚠️ Error fetching channel config: {e}. Defaulting to Landscape.")
-        
-        print(f"🔧 Stitching {len(local_clips)} clips with 0.4s black fade transitions (Target: {target_res})...")
+            
         editor = FFmpegVideoEditor(output_dir=temp_dir)
         ffprobe_cmd = os.getenv("FFPROBE_PATH", "ffprobe")
+
+        # --- High Quality Stage: 4K Upscale BEFORE Stitching ---
+        if request.video_resolution == '480p':
+            # Determine target 4K resolution (Landscape vs Vertical)
+            target_4k = (2160, 3840) if target_res[1] > target_res[0] else (3840, 2160)
+            print(f"🚀 Found 4K Upscale Request! Processing {len(final_clips_to_stitch)} clips 1-by-1 (Target: {target_4k})...")
+            
+            upscaled_clips = []
+            for idx, clip_path in enumerate(final_clips_to_stitch):
+                out_path = temp_dir / f"upscaled_clip_{idx:03d}.mp4"
+                try:
+                    print(f"   🔼 Upscaling clip {idx+1}/{len(final_clips_to_stitch)}...")
+                    await editor.upscale_video(clip_path, out_path, target_resolution=target_4k)
+                    if out_path.exists():
+                        upscaled_clips.append(out_path)
+                    else:
+                        print(f"   ⚠️ Upscale failed for clip {idx+1}, using original.")
+                        upscaled_clips.append(clip_path)
+                except Exception as e:
+                    print(f"   ⚠️ Exception upscaling clip {idx+1}: {e}")
+                    upscaled_clips.append(clip_path)
+            
+            final_clips_to_stitch = upscaled_clips
+            target_res = target_4k
+            print(f"✅ Upscale complete. Target resolution forced to {target_res}")
+
+        print(f"🔧 Stitching {len(local_clips)} clips with 0.4s black fade transitions (Target: {target_res})...")
         
         audio_config = request.audio_config or {}
         mute_source = audio_config.get("mute_source_audio", False)
@@ -2200,23 +2059,6 @@ async def stitch_videos(request: StitchVideosRequest):
         
 
 
-        # --- High Quality Stage: 4K Upscale ---
-        if request.video_resolution == '480p':
-            try:
-                # Determine target 4K resolution (Landscape vs Vertical)
-                target_4k = (2160, 3840) if target_res[1] > target_res[0] else (3840, 2160)
-                print(f"🚀 Starting 4K Upscale (Target: {target_4k})...")
-                upscaled_path = temp_dir / "stitched_4k.mp4"
-                await editor.upscale_video(current_video_path, upscaled_path, target_resolution=target_4k)
-                
-                if upscaled_path.exists():
-                    current_video_path = upscaled_path
-                    print(f"   ✅ Upscale to 4K successful.")
-                else:
-                    print(f"   ⚠️ Upscale failed to produce output file.")
-            except Exception as e:
-                print(f"   ⚠️ 4K Upscale failed: {e}")
-
         # --- FINAL ASSEMBLY (Color Grading) ---
         if request.final_assembly and request.final_assembly.get("color_grading"):
             print(f"🎨 Applying Color Grading...")
@@ -2299,7 +2141,7 @@ async def stitch_videos(request: StitchVideosRequest):
                 music_path = None
 
         # 3. Check for Channel Config Override (Fallback if AI failed or skipped)
-        if not music_path and channel_config and channel_config.bgMusic:
+        if not music_path and music_mood != "none" and channel_config and channel_config.bgMusic:
              print(f"🎵 Found manual background music override for channel (Using as fallback).")
              try:
                  storage_downloader = R2Storage()

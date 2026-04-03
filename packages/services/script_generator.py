@@ -1828,124 +1828,61 @@ OUTPUT JSON FORMAT:
 
     async def compute_scene_durations(self, scenes: list[dict]) -> list[dict]:
         """
-        Use LLM (HF first, Gemini fallback) to compute the required video duration 
-        for each scene based on its voiceover or dialogue length.
+        Compute the required video duration for each scene deterministically 
+        based on its voiceover or dialogue length.
         Rules:
-        - Voiceover length <= 15 words -> 6s
-        - Voiceover length 16-40 words -> 10s
-        - Voiceover length 41-70 words -> 10s + 6s extend (max 16s)
-        - If no voiceover, use dialogue length instead
-        - If no voiceover and no dialogue, default to 6s
+        - We estimate speaking time based on characters and words (to handle cross-language variants like Urdu)
+        - < 5.5s fits a 6s clip
+        - < 9.5s fits a 10s clip
+        - < 15.5s needs 10s + 6s
+        - > 15.5s needs 10s + 10s
         """
-        print("⏱️ Computing optimal scene durations using LLM...")
+        print("⏱️ Computing optimal scene durations deterministically...")
         
-        # Build prompt payload
-        scene_texts = []
-        for s in scenes:
-            vo = (s.get('voiceover_text') or s.get('voiceover') or "").strip()
-            dialogue = (s.get('dialogue') or "").strip()
+        for scene in scenes:
+            vo = (scene.get('voiceover_text') or scene.get('voiceover') or "").strip()
+            dialogue = (scene.get('dialogue') or "").strip()
             
             # Fallback to dialogue if no voiceover
             text_to_analyze = vo if vo else dialogue
             
             # NEW FALLBACK: extract dialogue from textToVideo if standard fields are empty
             if not text_to_analyze:
-                v_prompt = s.get('image_to_video_prompt') or s.get('textToVideo') or ""
+                v_prompt = scene.get('image_to_video_prompt') or scene.get('textToVideo') or ""
                 if "Dialogue:" in v_prompt:
                     d_match = re.search(r'Dialogue:\s*["\']?(.*?)["\']?$', v_prompt, re.IGNORECASE)
                     if d_match:
                         text_to_analyze = d_match.group(1).strip()
             
-            # Count words accurately in Python (better for Urdu/Non-English)
+            # Calculate character count and word count
+            # Removing whitespace helps normalize character counting across languages
+            char_len = len(re.sub(r'\s+', '', text_to_analyze)) if text_to_analyze else 0
             word_count = len(text_to_analyze.split()) if text_to_analyze else 0
 
-            scene_texts.append({
-                "scene_number": s.get('scene_number', 1),
-                "word_count": word_count,
-                "text_to_analyze": text_to_analyze[:300]
-            })
+            # Approximate speaking time
+            # Standard English: ~150 words per min = 2.5 words per sec.
+            # Character based: ~12 chars per sec.
+            est_seconds_by_words = word_count / 2.5
+            est_seconds_by_chars = char_len / 12.0
             
-        prompt = f"""You are a video editor AI. Compute the required video clip duration for each scene based on the provided WORD COUNT.
+            # Use the lesser of the two estimates to avoid inflating short particle-heavy languages (e.g. Arabic, Urdu)
+            est_seconds = min(est_seconds_by_words, est_seconds_by_chars) if text_to_analyze else 0
 
-RULES:
-- If word_count is 0-13 -> 6s clip, needs_extend=false, total_clip_time=6
-- If word_count is 14-40 -> 10s clip, needs_extend=false, total_clip_time=10
-- If word_count is 41-70 -> 10s clip, needs_extend=true, extend_duration="6s", total_clip_time=16
-- If word_count is > 70 -> 10s clip, needs_extend=true, extend_duration="10s", total_clip_time=20
+            if est_seconds <= 5.5: # Fits easily into a 6s clip
+                match = {"clip_duration": "6s", "needs_extend": False, "extend_duration": None, "total_clip_time": 6}
+            elif est_seconds <= 9.5: # Fits into a 10s clip
+                match = {"clip_duration": "10s", "needs_extend": False, "extend_duration": None, "total_clip_time": 10}
+            elif est_seconds <= 15.5: # 10s + 6s extension
+                match = {"clip_duration": "10s", "needs_extend": True, "extend_duration": "6s", "total_clip_time": 16}
+            else: # 10s + 10s extension
+                match = {"clip_duration": "10s", "needs_extend": True, "extend_duration": "10s", "total_clip_time": 20}
 
-SCENES TO ANALYZE:
----
-{json.dumps(scene_texts, indent=2)}
----
+            scene['duration_config'] = match
+            scene['duration_in_seconds'] = match.get('total_clip_time', 6)
+            scene['duration'] = scene['duration_in_seconds']
+            
+            print(f"   ⏱️ Scene {scene.get('scene_number', '?')}: wc={word_count}, chars={char_len}, est_sec={est_seconds:.1f} -> {scene['duration_in_seconds']}s")
 
-OUTPUT STRICT JSON FORMAT ONLY:
-```json
-{{
-  "durations": [
-    {{
-      "scene_number": 1,
-      "clip_duration": "6s",
-      "needs_extend": false,
-      "extend_duration": null,
-      "total_clip_time": 6
-    }}
-  ]
-}}
-```"""
-        
-        try:
-            # 1. Try Hugging Face first
-            response_text = await self._call_hf_completion(prompt)
-            clean_text = self._clean_json_text(response_text)
-            data = json.loads(clean_text)
-            durations = data.get("durations", [])
-            print(f"   ✅ Computed durations via HuggingFace for {len(durations)} scenes.")
-        except Exception as e:
-            print(f"   ⚠️ HuggingFace failed for durations: {e}. Falling back to Gemini...")
-            try:
-                # 2. Try Gemini fallback
-                response_text = await self._call_gemini(prompt)
-                clean_text = self._clean_json_text(response_text)
-                data = json.loads(clean_text)
-                durations = data.get("durations", [])
-                print(f"   ✅ Computed durations via Gemini for {len(durations)} scenes.")
-            except Exception as e2:
-                print(f"   ❌ Both LLMs failed for duration computation: {e2}. Using safe defaults.")
-                # Safe default fallback based on pre-calculated word counts
-                durations = []
-                for st in scene_texts:
-                    wc = st.get("word_count", 0)
-                    if wc <= 13:
-                        d = {"clip_duration": "6s", "needs_extend": False, "extend_duration": None, "total_clip_time": 6}
-                    elif wc <= 40:
-                        d = {"clip_duration": "10s", "needs_extend": False, "extend_duration": None, "total_clip_time": 10}
-                    elif wc <= 70:
-                        d = {"clip_duration": "10s", "needs_extend": True, "extend_duration": "6s", "total_clip_time": 16}
-                    else:
-                        d = {"clip_duration": "10s", "needs_extend": True, "extend_duration": "10s", "total_clip_time": 20}
-                    
-                    d["scene_number"] = st["scene_number"]
-                    d["word_count"] = wc # Keep for debugging
-                    durations.append(d)
-
-        # Map back to scenes list
-        for scene in scenes:
-            s_num = scene.get('scene_number')
-            match = next((d for d in durations if d.get('scene_number') == s_num), None)
-            if match:
-                scene['duration_config'] = match
-                scene['duration_in_seconds'] = match.get('total_clip_time', 10)
-                scene['duration'] = scene['duration_in_seconds']
-            else:
-                scene['duration_config'] = {
-                    "clip_duration": "6s",
-                    "needs_extend": False,
-                    "extend_duration": None,
-                    "total_clip_time": 6
-                }
-                scene['duration_in_seconds'] = 10
-                scene['duration'] = 10
-                
         return scenes
 
     async def generate_viral_thumbnail_prompt(self, script_context: str, niche: str = "general") -> str:

@@ -166,12 +166,13 @@ const parseJsonScript = (jsonScript: string): ScriptBreakdown => {
         dialogue: s.dialogue || "",
         // Ensure duration is present
         duration: s.duration_in_seconds || s.duration || 6,
-        durationConfig: s.duration_config || {
-            clip_duration: (s.duration_in_seconds || s.duration || 6) + "s",
-            needs_extend: (s.duration_in_seconds || s.duration || 6) > 10,
-            extend_duration: (s.duration_in_seconds || s.duration || 6) > 10 ? "6s" : null,
-            total_clip_time: s.duration_in_seconds || s.duration || 6
-        },
+        durationConfig: s.duration_config || (() => {
+            const totalSec = s.duration_in_seconds || s.duration || 6;
+            if (totalSec <= 6) return { clip_duration: "6s", needs_extend: false, extend_duration: null, total_clip_time: 6 };
+            if (totalSec <= 10) return { clip_duration: "10s", needs_extend: false, extend_duration: null, total_clip_time: 10 };
+            if (totalSec <= 16) return { clip_duration: "10s", needs_extend: true, extend_duration: "6s", total_clip_time: 16 };
+            return { clip_duration: "10s", needs_extend: true, extend_duration: "10s", total_clip_time: 20 };
+        })(),
         // Computed Preview Prompt
         formattedPrompt: buildGrokPrompt(s)
     }));
@@ -790,7 +791,7 @@ function Step3SceneImages() {
         try {
             const result = await api.post<{ imageUrl: string }>('/scenes/generate-image', {
                 prompt: scene.textToImage,
-                character_images: characters.map((c) => ({ name: c.name, imageUrl: c.imageUrl })),
+                character_images: characters.map((c) => ({ name: c.name, prompt: c.prompt || '', imageUrl: c.imageUrl })),
                 niche_id: channelId,
                 scene_index: index,
                 is_shorts: format === 'short',
@@ -833,7 +834,7 @@ function Step3SceneImages() {
                 body: JSON.stringify({
                     niche_id: channelId,
                     scenes: scenesToGenerate,
-                    character_images: characters.map((c) => ({ name: c.name, imageUrl: c.imageUrl })),
+                    character_images: characters.map((c) => ({ name: c.name, prompt: c.prompt || '', imageUrl: c.imageUrl })),
                     video_type: format === 'short' ? 'shorts' : 'story',
                     thumbnail_prompt: shouldGenerateThumbnail ? threadThumbPrompt : undefined
                 })
@@ -1491,6 +1492,7 @@ function Step5Final() {
                 music_id: customBgmEnabled ? selectedMusicId : undefined,
                 is_shorts: format === 'short',
                 video_resolution: videoResolution,
+                subtitles_enabled: subtitlesEnabled,
                 script: breakdown?.scenes.map(s => s.dialogue).join("\n\n"),
                 scene_dialogues: scenes.map((s) => s.dialogue || ''),
                 audio_config: {

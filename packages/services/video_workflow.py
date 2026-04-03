@@ -275,53 +275,57 @@ async def video_upload_workflow(ctx: Context) -> dict:
 # ============================================
 
 async def generate_scene_images(script: dict, channel_config: dict) -> list[str]:
-    """Generate consistency character images for each scene using Google Whisk."""
-    from .whisk_agent import WhiskAgent
-    
-    # Initialize Whisk Agent
-    # Note: Requires 'python scripts/auth_whisk.py' to be run first for login
-    agent = WhiskAgent(headless=False) # Headful for alpha stability
+    """Generate scene images using HuggingFace FLUX.1-schnell."""
+    from .image_generator_factory import get_image_generator
+
+    generator = get_image_generator()
     storage = R2Storage()
     image_keys = []
-    
+
     # Determine Aspect Ratio
-    # If "shorts" is in the niche ID or style, use 9:16
-    is_shorts = "shorts" in channel_config.get("nicheId", "").lower() or "shorts" in channel_config.get("styleSuffix", "").lower()
+    is_shorts = (
+        "shorts" in channel_config.get("nicheId", "").lower()
+        or "shorts" in channel_config.get("styleSuffix", "").lower()
+    )
     logger.info(f"📐 Detected Mode: {'Shorts (9:16)' if is_shorts else 'Landscape (16:9)'}")
 
-    # Generate anchor/consistent character if needed (Optional: Whisk is prompt-based mostly)
-    # anchor_image_path = channel_config.get("anchorImage")
-    
-    # Prepare Batch
-    prompts = [scene.get("character_pose_prompt", "") for scene in script.get("scenes", [])]
     style = channel_config.get("styleSuffix", "")
-    
-    logger.info(f"🚀 Starting Auto-Whisk Batch Generation for {len(prompts)} scenes...")
-    
-    # Run Batch (Mimics Auto Whisk Extension)
-    # This keeps the browser open and loops through prompts efficiently
-    batch_results = await agent.generate_batch(
-        prompts=prompts,
-        is_shorts=is_shorts,
-        style_suffix=style,
-        delay_seconds=5
-    )
-    
-    # Process Results
-    for i, (scene, image_bytes) in enumerate(zip(script.get("scenes", []), batch_results)):
-        if not image_bytes:
-            logger.error(f"❌ Skipped scene {i+1} due to generation failure")
-            continue
-            
+    niche_id = channel_config.get("nicheId", "default")
+    characters = script.get("characters", [])  # list of {name, prompt, imageUrl} dicts
+
+    # Use deterministic seed from first character for consistency
+    seed = 42
+    if characters:
+        first_name = characters[0].get("name", "")
+        if first_name:
+            seed = generator._get_character_seed(first_name)
+
+    logger.info(f"🚀 Starting Image Generation for {len(script.get('scenes', []))} scenes...")
+
+    for i, scene in enumerate(script.get("scenes", [])):
+        raw_prompt = scene.get("character_pose_prompt", "")
+
+        # Embed character descriptions into prompt for visual consistency
+        scene_prompt = generator.build_scene_prompt(
+            scene_prompt=raw_prompt,
+            character_images=characters,
+            style_suffix=style,
+        )
+
         try:
-            # Upload to R2
-            key = f"clips/{script['niche_id']}/scene_{i:03d}_image.png"
+            image_bytes = await generator.generate(
+                prompt=scene_prompt,
+                style_suffix=style,
+                seed=seed,
+                is_shorts=is_shorts,
+            )
+            key = f"clips/{niche_id}/scene_{i:03d}_image.png"
             storage.upload_asset(image_bytes, key, "image/png")
             image_keys.append(key)
             logger.info(f"✅ Saved Scene {i+1}: {key}")
         except Exception as e:
-             logger.error(f"❌ Failed to upload scene {i+1}: {e}")
-    
+            logger.error(f"❌ Failed scene {i+1}: {e}")
+
     return image_keys
 
 def is_valid_video_content(p: Path) -> bool:
@@ -447,7 +451,9 @@ async def animate_scenes_with_grok(image_keys: list[str], script: dict) -> list[
                         base_duration = "10s" # Final fallback
                 
                 # Ensure base_duration is exactly "6s" or "10s" for Grok UI matching
-                if "6" in str(base_duration):
+                # Extract the numeric part and compare exactly (avoid substring bugs like "6" in "16s")
+                dur_numeric = ''.join(c for c in str(base_duration) if c.isdigit())
+                if dur_numeric == "6":
                     base_duration = "6s"
                 else:
                     base_duration = "10s"
@@ -638,6 +644,7 @@ async def render_final_video(
     """
     from .video_editor import FFmpegVideoEditor
     from .subtitle_engine import SubtitleEngine
+    from .speech_trimmer import SpeechTrimmer
     import ffmpeg
     
     storage = R2Storage()
@@ -652,10 +659,30 @@ async def render_final_video(
     
     # 1. Download Core Clips
     local_clips = []
+    clip_volumes = []
+    trimmer = SpeechTrimmer()
+    
     for i, clip_key in enumerate(clip_keys):
         local_path = storage.download(clip_key, Path(f"/tmp/clip_{i}.mp4"))
         if not is_valid_video_content(local_path):
              raise ValueError(f"Clip {clip_key} is corrupt.")
+             
+        scene = script.get("scenes", [])[i] if i < len(script.get("scenes", [])) else {}
+        has_voiceover = bool(scene.get("voiceover_text"))
+        has_dialogue = bool(scene.get("dialogue"))
+        
+        if has_voiceover:
+            clip_volumes.append(0.2)
+        else:
+            clip_volumes.append(1.0)
+            if has_dialogue:
+                logger.info(f"✂️ Trimming Grok native speech for scene {i+1}...")
+                try:
+                    trimmed_path = trimmer.trim_to_speech_end(str(local_path), padding=0.15)
+                    local_path = Path(trimmed_path)
+                except Exception as e:
+                    logger.warning(f"⚠️ Speech trimming failed for scene {i+1}: {e}")
+                    
         local_clips.append(local_path)
     
     # 2. Title Cards (Opening/Closing)
@@ -677,11 +704,13 @@ async def render_final_video(
         if tc.get("opening") and not should_skip_title(tc["opening"]):
             opener = editor.render_title_card(tc["opening"], style=style, output_path=Path("/tmp/title_opener.mp4"))
             local_clips.insert(0, opener)
+            clip_volumes.insert(0, 0.0)
             # Adjust audio keys index? Title cards have no audio usually.
             
         if tc.get("closing") and not should_skip_title(tc["closing"]):
             closer = editor.render_title_card(tc["closing"], style=style, output_path=Path("/tmp/title_closer.mp4"))
             local_clips.append(closer)
+            clip_volumes.append(0.0)
 
     # Determine Resolution
     is_shorts = "shorts" in channel_config.get("nicheId", "").lower() or "shorts" in channel_config.get("styleSuffix", "").lower()
@@ -701,6 +730,7 @@ async def render_final_video(
         "/tmp/stitched.mp4",
         target_resolution=target_res,
         transition_duration=0.5,
+        clip_audio_volumes=clip_volumes if not mute_source else None,
         mute_audio=mute_source
     )
     
