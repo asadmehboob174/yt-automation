@@ -225,255 +225,136 @@ class VideoSettings:
 
     @staticmethod
     async def configure(page: Page, duration: str = "10s", aspect: str = "9:16", resolution: str = "720p"):
-        """Sets the video generation parameters in the Grok UI row."""
+        """Sets the video generation parameters in the Grok UI row using robust fuzzy locators."""
         logger.info(f"⚙️ VideoSettings.configure: duration={duration}, aspect={aspect}, resolution={resolution}")
         
         # ── Step 0: Ensure "Video" mode is active ──
         try:
-            video_tab = page.locator('button[role="radio"][aria-selected="false"]:has-text("Video"), button:not([aria-selected="true"]):has-text("Video")').first
-            if await video_tab.count() > 0:
-                is_selected = await video_tab.evaluate("el => el.getAttribute('aria-selected') === 'true' || el.classList.contains('bg-white') || el.classList.contains('active')")
-                if not is_selected:
-                    logger.info("🎬 Mode: Switching to 'Video' mode...")
-                    await video_tab.click()
-                    await asyncio.sleep(0.5)
+            # Click elements that exactly match "Video"
+            await page.evaluate("""() => {
+                const els = Array.from(document.querySelectorAll('button, div, span'));
+                const videoBtn = els.find(el => {
+                    if (el.offsetWidth === 0 || el.offsetHeight === 0) return false;
+                    const text = (el.innerText || "").trim();
+                    return text === "Video";
+                });
+                if (videoBtn) videoBtn.click();
+            }""")
+            await asyncio.sleep(0.5)
         except: pass
 
         duration_key = str(duration)
         if not duration_key.endswith("s"): duration_key += "s"
 
-        # ═══════════════════════════════════════════════════════════
-        # CORE FIX: Use a single JS function that finds AND clicks
-        # the exact button by strict text equality. This avoids:
-        # 1. Playwright's `has-text` substring matching (9:16 vs 16:9)
-        # 2. `is_active` stale state from previous scenes
-        # We use a localized JS function to perform strict exact-matches on the button text
-        # inside the specific radiogroup container to avoid substring collisions.
-        async def js_strict_click(target: str, setting_name: str) -> bool:
-            # setting_name maps to the aria-label of the radiogroup: "Video duration" or "Video resolution"
-            aria_label = "Video duration" if setting_name == "Duration" else "Video resolution"
-            
-            # First check if it's already selected
-            is_already_active = await page.evaluate(f"""([target, ariaLabel]) => {{
-                const group = document.querySelector(`div[role="radiogroup"][aria-label="${{ariaLabel}}"]`);
-                if (!group) return false;
+        # ── Step 1: Duration & Resolution via Playwright Locators ──
+        async def robust_click(target: str, setting_name: str) -> bool:
+            # wait for target text to appear somewhere in a clickable element
+            try:
+                await page.wait_for_selector(f"text='{target}'", state="visible", timeout=3000)
+            except: pass
+
+            # Priority: find visible buttons/divs
+            selectors = [
+                f"button:visible:has-text('{target}')",
+                f"div[role='button']:visible:has-text('{target}')",
+                f"text='{target}'"
+            ]
+            for sel in selectors:
+                try:
+                    btn = page.locator(sel).first
+                    if await btn.count() > 0:
+                        await btn.scroll_into_view_if_needed()
+                        await btn.click(force=True, timeout=2000)
+                        logger.info(f"✅ Set {setting_name}: {target}")
+                        return True
+                except: continue
                 
-                const activeBtn = group.querySelector('button[role="radio"][aria-checked="true"]');
-                if (activeBtn) {{
-                    const text = (activeBtn.innerText || activeBtn.textContent || "").trim();
-                    return text === target;
-                }}
-                return false;
-            }}""", [target, aria_label])
-            
-            if is_already_active:
-                logger.info(f"✅ {setting_name} {target} is already selected.")
-                return True
-                
-            # If not active, find and click it
-            clicked = await page.evaluate(f"""([target, ariaLabel]) => {{
-                const group = document.querySelector(`div[role="radiogroup"][aria-label="${{ariaLabel}}"]`);
-                if (!group) return false;
-                
-                const buttons = Array.from(group.querySelectorAll('button[role="radio"]'));
-                // Match either the exact target (e.g. "10s") or the target with a "+" prefix (e.g. "+10s")
-                const match = buttons.find(b => {{
-                    const text = (b.innerText || b.textContent || "").trim();
-                    return (text === target || text === "+" + target) && b.offsetWidth > 0;
+            # JS Fallback if Playwright fails
+            clicked = await page.evaluate(f"""(target) => {{
+                const targetLower = target.toLowerCase();
+                const els = Array.from(document.querySelectorAll('button, div, span'));
+                const el = els.find(el => {{
+                    if (el.offsetWidth === 0 || el.offsetHeight === 0) return false;
+                    return (el.innerText || "").trim().toLowerCase() === targetLower;
                 }});
-                
-                if (match) {{
-                    match.click();
+                if (el) {{
+                    ['mousedown', 'mouseup', 'click'].forEach(t => el.dispatchEvent(new MouseEvent(t, {{ bubbles: true }})));
                     return true;
                 }}
                 return false;
-            }}""", [target, aria_label])
-            
-            if clicked:
-                logger.info(f"✅ Set {setting_name}: {target} (via exact JS match in group)")
-                return True
-                
-            return False
+            }}""", target)
+            if clicked: logger.info(f"✅ Set {setting_name}: {target} (via JS)")
+            return clicked
 
-        # ── Step 1: Handle Duration & Resolution via exact match in their radiogroup ──
-        dur_ok = await js_strict_click(duration_key, "Duration")
-        res_ok = await js_strict_click(resolution, "Resolution")
-        # ── Step 2: Handle Aspect Ratio (it's a DROPDOWN, not a direct button) ──
-        # The aspect ratio button shows the CURRENT value (e.g. "16:9 ∧")
-        # Clicking it opens a dropdown menu with options like 2:3, 3:2, 1:1, 9:16, 16:9
-        # So we need to: (a) open the dropdown, (b) click the exact option inside
-        
+        # Select Duration and Resolution
+        dur_ok = await robust_click(duration_key, "Duration")
+        res_ok = await robust_click(resolution, "Resolution")
+
+        # ── Step 2: Handle Aspect Ratio (Dropdown) ──
         aspect_ok = False
         
-        # 2a: Check if the desired aspect is already the active one shown on the button
-        current_aspect = await page.evaluate("""() => {
-            // The user provided HTML: <button aria-label="Aspect Ratio">...<span>16:9</span>...</button>
-            const aspectBtn = document.querySelector('button[aria-label="Aspect Ratio"], button[aria-label*="Aspect"]');
-            
-            if (aspectBtn) {
-                const text = (aspectBtn.innerText || "").trim().toLowerCase();
-                // Match exact tokens to avoid '16:9' matching '16'
-                if (text === '16:9' || text.endsWith('16:9')) return '16:9';
-                if (text === '9:16' || text.endsWith('9:16')) return '9:16';
-                if (text === '1:1'  || text.endsWith('1:1'))  return '1:1';
-                
-                // Try looking specifically at span inside
-                const span = aspectBtn.querySelector('span:last-child');
-                if (span) {
-                    const spanText = (span.innerText || "").trim();
-                    if (spanText === '16:9') return '16:9';
-                    if (spanText === '9:16') return '9:16';
-                    if (spanText === '1:1') return '1:1';
-                }
-            }
-            
-            // Fallback to searching all buttons if aria-label changed
-            const buttons = Array.from(document.querySelectorAll('button, div[role="button"]'));
-            const fallbackBtn = buttons.find(b => {
-                const text = (b.innerText || "").trim().toLowerCase();
-                return (text.includes('16:9') || text.includes('9:16') || text.includes('1:1')) && b.offsetWidth > 0;
-            });
-            
-            if (fallbackBtn) {
-                const text = fallbackBtn.innerText.trim();
-                // Ensure we don't return '16:9' just because we found '16'
-                if (text.includes('16:9')) return '16:9';
-                if (text.includes('9:16')) return '9:16';
-                if (text.includes('1:1')) return '1:1';
-            }
-            return null;
-        }""")
+        # Using the exact DOM structure provided by the user:
+        # Trigger: button[aria-label="Aspect Ratio"]
+        # Menu Items: [role="menuitem"] containing span with text (e.g., "9:16")
         
-        logger.info(f"📐 Current aspect ratio on button: {current_aspect}")
-        
-        if current_aspect == aspect:
-            logger.info(f"✅ Aspect ratio {aspect} is already selected.")
-            aspect_ok = True
-        else:
-            # 2b: Open the dropdown by clicking the aspect ratio button
-            logger.info(f"📂 Opening aspect ratio dropdown (current={current_aspect}, target={aspect})...")
-            
-            opened = False
+        for i in range(3):
             try:
-                # Radix UI often ignores JS .click() because it listens for pointerdown.
-                # Native Playwright click dispatches all correct trusted events.
-                aspect_btn = page.locator('button[aria-label="Aspect Ratio"]').first
-                if await aspect_btn.count() > 0:
-                    await aspect_btn.click(timeout=3000)
-                    opened = True
-                else:
-                    # Fallback locator
-                    buttons = page.locator('button')
-                    for i in range(await buttons.count()):
-                        btn = buttons.nth(i)
-                        text = await btn.inner_text()
-                        if ":" in text and await btn.is_visible():
-                            await btn.click(timeout=3000)
-                            opened = True
+                # 1. Look for the trigger button
+                trigger = page.get_by_role("button", name="Aspect Ratio")
+                if await trigger.count() == 0:
+                    # Fallback to finding by any button that looks like a ratio
+                    trigger = page.locator("button:visible").filter(has_text=":").first
+                
+                if await trigger.count() > 0:
+                    # Check if already open
+                    is_open = await trigger.get_attribute("data-state") == "open"
+                    if not is_open:
+                        logger.info("🖱️ Opening Aspect Ratio dropdown...")
+                        await trigger.click(force=True)
+                        await asyncio.sleep(0.5)
+                    
+                    # 2. Find the menu item
+                    # The user's DOM shows role="menuitem" with a span child
+                    item = page.get_by_role("menuitem").filter(has_text=aspect)
+                    if await item.count() > 0:
+                        await item.first.click(force=True)
+                        logger.info(f"✅ Set Aspect Ratio: {aspect}")
+                        aspect_ok = True
+                        break
+                    else:
+                        # Fallback for hidden menu items or different roles
+                        item_clicked = await page.evaluate(f"""(ratio) => {{
+                            const els = Array.from(document.querySelectorAll('[role="menuitem"], [role="option"], button, span'));
+                            const target = els.find(el => {{
+                                if (el.offsetWidth === 0 || el.offsetHeight === 0) return false;
+                                return (el.innerText || "").trim() === ratio;
+                            }});
+                            if (target) {{ target.click(); return true; }}
+                            return false;
+                        }}""", aspect)
+                        if item_clicked:
+                            logger.info(f"✅ Set Aspect Ratio: {aspect} (fallback)")
+                            aspect_ok = True
                             break
             except Exception as e:
-                logger.warning(f"⚠️ Failed to open aspect ratio dropdown natively: {e}")
-            
-            if opened:
-                logger.info("⏳ Waiting for aspect ratio dropdown to animate open...")
-                await page.wait_for_timeout(800) # Give Radix UI time to animate and mount
-                
-            # 2c: Click the target ratio in the popup
-            logger.info(f"🎯 Clicking {aspect} inside dropdown/popup...")
-            
-            # 2c: Click the target ratio in the popup
-            logger.info(f"🎯 Clicking {aspect} inside dropdown/popup...")
-            
-            aspect_ok = False
-            try:
-                # The user provided HTML indicates it uses role="menuitem" inside a Radix UI portal.
-                menu_item = page.locator(f'[role="menuitem"]:has-text("{aspect}"), [role="option"]:has-text("{aspect}")').first
-                if await menu_item.count() > 0:
-                    await menu_item.click(timeout=2000)
-                    aspect_ok = True
-                else:
-                    # Fallback to general text match inside the portal
-                    portal_item = page.locator('[data-radix-popper-content-wrapper], [role="menu"]').locator(f'text="{aspect}"').first
-                    if await portal_item.count() > 0:
-                        await portal_item.click(timeout=2000)
-                        aspect_ok = True
-                        
-                if aspect_ok:
-                    logger.info(f"✅ Set aspect ratio via native Playwright locator: {aspect}")
-                else:
-                    logger.warning(f"⚠️ Could not find {aspect} in the dropdown DOM.")
-                    
-            except Exception as e:
-                logger.warning(f"⚠️ Playwright native click failed for {aspect}: {e}")
-                
-            if not aspect_ok:
-                logger.warning(f"⚠️ Playwright native click failed for {aspect}, trying keyboard navigation...")
-                
-                # Ultimate fallback: Keyboard Navigation
-                # Radix UI and most modern comboboxes support arrow keys
-                aspect_ok = await page.evaluate(f"""async (target) => {{
-                    const wait = (ms) => new Promise(r => setTimeout(r, ms));
-                    
-                    // The dropdown should be open and focused.
-                    for (let i = 0; i < 5; i++) {{
-                        // Simulate ArrowDown
-                        document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'ArrowDown', code: 'ArrowDown', bubbles: true }}));
-                        await wait(100);
-                        
-                        // Check what is currently highlighted
-                        const activeEl = document.querySelector('[data-highlighted], [aria-selected="true"], :focus');
-                        if (activeEl) {{
-                            const text = (activeEl.innerText || activeEl.textContent || "").trim();
-                            if (text === target || (text.includes(target) && text.length < target.length + 5)) {{
-                                // Found it, press Enter!
-                                document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'Enter', code: 'Enter', bubbles: true }}));
-                                activeEl.click(); // Also dispatch a physical click just in case
-                                await wait(200);
-                                return true;
-                            }}
-                        }}
-                    }}
-                    return false;
-                }}""", aspect)
-                
-                if aspect_ok:
-                    logger.info(f"✅ Set aspect ratio via Keyboard Navigation: {aspect}")
-                else:
-                    logger.error(f"❌ Could not set aspect ratio {aspect} after all attempts.")
-                    
-                    # Capture the DOM of the popup for debugging
-                    dom = await page.evaluate("""() => {
-                        const portal = document.querySelector('[data-radix-popper-content-wrapper], [role="menu"], [role="listbox"], .z-50');
-                        return portal ? portal.outerHTML : document.body.innerHTML.substring(0, 1000);
-                    }""")
-                    logger.debug(f"Popup DOM during failure:\n{dom}")
-        if not dur_ok:
-            logger.info("📂 Duration not found in row, trying settings popup...")
-            # Some UI layouts put duration inside a popup
-            menu_open = await page.locator("div[role='menu'], .absolute.z-50, [data-testid='popover-content']").count() > 0
-            if not menu_open:
-                try:
-                    settings_btn = page.locator("button[aria-label='Settings'], button:has-text('Settings')").first
-                    if await settings_btn.count() > 0:
-                        await settings_btn.click()
-                        await asyncio.sleep(0.5)
-                except: pass
-            dur_ok = await js_strict_click(duration_key, "Duration (popup)")
+                logger.debug(f"Aspect ratio attempt {i} failed: {e}")
+            await asyncio.sleep(0.5)
 
-        # ── Step 4: Close any open popup ──
+        if not aspect_ok:
+            logger.warning(f"⚠️ FAILED to set aspect ratio to {aspect}!")
+
+        # ── Step 3: Close any open popups (like the aspect ratio menu if it didn't auto-close) ──
         try:
-            if await page.locator("div[role='menu'], .absolute.z-50, [data-testid='popover-content']").count() > 0:
-                await page.keyboard.press("Escape")
-                await asyncio.sleep(0.3)
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.3)
         except: pass
         
-        # ── Step 5: Final status ──
         if not dur_ok:
-            logger.warning(f"⚠️ FAILED to set duration to {duration_key}! Video may use wrong duration.")
+            logger.warning(f"⚠️ FAILED to set duration to {duration_key}!")
         if not aspect_ok:
             logger.warning(f"⚠️ FAILED to set aspect ratio to {aspect}!")
         if not res_ok:
-            logger.info(f"ℹ️ Resolution {resolution} not found (may use default).")
+            logger.info(f"ℹ️ FAILED to set resolution {resolution} (might not be available).")
 
     @staticmethod
     def verify_clip_duration(clip_path: Path, expected_duration: float) -> bool:
@@ -672,7 +553,68 @@ async def generate_single_clip(
             except:
                 logger.warning("Timeout waiting for prompt area, continuing anyway...")
             
-            # MANDATORY: Close any leftover popups from previous runs/failed settings
+            # MANDATORY: Close the Upload dialog that auto-opens on Grok Imagine
+            try:
+                # The upload dialog contains "Upload File" / "Drop your media" text
+                # and has a close (×) button. Try multiple strategies to dismiss it.
+                upload_dialog_selectors = [
+                    "button:has-text('Upload File')",
+                    "text='Drop your media here'",
+                    "text='Upload'",
+                ]
+                dialog_detected = False
+                for sel in upload_dialog_selectors:
+                    try:
+                        if await page.locator(sel).first.is_visible(timeout=2000):
+                            dialog_detected = True
+                            break
+                    except:
+                        continue
+
+                if dialog_detected:
+                    logger.info("🧹 Upload dialog detected, closing it...")
+                    closed = False
+
+                    # Strategy 1: Click the × (close) button on the dialog
+                    close_btn_selectors = [
+                        "button[aria-label='Close']",
+                        "button[aria-label='close']",
+                        "button[aria-label='Dismiss']",
+                        # Generic close buttons near dialog headers (× icon)
+                        "div[role='dialog'] button:has(svg)",
+                        "[data-state='open'] button:has(svg)",
+                    ]
+                    for close_sel in close_btn_selectors:
+                        try:
+                            close_btn = page.locator(close_sel).first
+                            if await close_btn.count() > 0 and await close_btn.is_visible(timeout=1000):
+                                await close_btn.click(timeout=2000)
+                                logger.info(f"✅ Closed upload dialog via {close_sel}")
+                                closed = True
+                                break
+                        except:
+                            continue
+
+                    # Strategy 2: Press Escape to dismiss overlays
+                    if not closed:
+                        await page.keyboard.press("Escape")
+                        logger.info("✅ Pressed Escape to close upload dialog.")
+                        closed = True
+
+                    await asyncio.sleep(0.5)
+
+                    # Strategy 3: Click outside the dialog to dismiss it (click on backdrop)
+                    if not closed:
+                        try:
+                            await page.mouse.click(10, 10)
+                            logger.info("✅ Clicked outside dialog to close it.")
+                        except:
+                            pass
+                        await asyncio.sleep(0.5)
+            except Exception as e:
+                logger.debug(f"Upload dialog check: {e}")
+
+            # Also close any other leftover popups from previous runs/failed settings
             try:
                 if await page.locator("div[role='menu'], .absolute.z-50").count() > 0:
                     logger.info("🧹 Clearing leftover overlays before starting...")
@@ -707,453 +649,308 @@ async def generate_single_clip(
                 prompt = re.sub(r'^[0-9]+s:?\s*', '', prompt)
                 prompt = target_prefix + prompt
             
-            print(f"\n🚀 FINAL REFINEMENT PROMPT:\n{prompt}\n")
-
             # ── Step 3: Attach Image (The SEED Pass) ──
             # We follow the User's "Seed + Continue" workflow:
-            # Pass 1: Image only, NO prompt.
-            logger.info(f"📤 Pass 1 (SEED): Attaching image: {image_path.name}...")
             upload_success = False
-            
-            upload_selectors = ["button:has-text('Upload image')", "button[aria-label*='Attach']", "input[type='file']"]
-            for selector in upload_selectors:
+            # Step 3a: Force-Upload via hidden input[type='file'] (Safest bypass of UI)
+            try:
+                # Grok hides its file input or disables it until a UI state change occurs. 
+                # This explicitly forces it alive.
+                await page.evaluate("""() => {
+                    let inp = document.querySelector('input[type="file"]');
+                    if (!inp) {
+                        inp = document.createElement('input');
+                        inp.type = 'file';
+                        inp.id = 'fake-grok-upload';
+                        document.body.appendChild(inp);
+                    }
+                    inp.style.display = 'block';
+                    inp.style.opacity = '1';
+                    inp.style.visibility = 'visible';
+                    inp.style.width = '100px';
+                    inp.style.height = '100px';
+                    inp.removeAttribute('disabled');
+                    inp.removeAttribute('aria-hidden');
+                }""")
+                await asyncio.sleep(0.5)
+                
+                # Use our fake or real input to trigger set_files
+                await page.locator("input[type='file']").first.set_input_files(str(image_path), timeout=3000)
+                logger.info("✅ Image attached via direct force input[type='file']")
+                
+                # Cleanup: Hide it again
+                await page.evaluate("""() => {
+                    const inp = document.querySelector('input[type="file"]');
+                    if (inp) {
+                        inp.style.display = 'none';
+                        inp.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                }""")
+                upload_success = True
+            except Exception as e:
+                logger.warning(f"⚠️ Direct input upload failed: {e}")
+                
+            # Step 3b: If direct input fails, use the robust Option 3 Visual UI method
+            if not upload_success:
                 try:
-                    btn = page.locator(selector).first
-                    if await btn.count() > 0:
-                        async with page.expect_file_chooser(timeout=5000) as fc_info:
-                            await btn.click()
-                        file_chooser = await fc_info.value
-                        await file_chooser.set_files(str(image_path))
-                        logger.info(f"✅ Image attached via {selector}")
-                        upload_success = True
-                        break
-                except: continue
+                    # 1. Click the + button FIRST to open the popup menu
+                    plus_btn_clicked = await page.evaluate("""() => {
+                        const els = Array.from(document.querySelectorAll('button, div'));
+                        const btn = els.find(el => {
+                            if (el.offsetWidth === 0 || el.offsetHeight === 0) return false;
+                            const text = (el.innerText || "").trim();
+                            const aria = (el.getAttribute('aria-label') || "").toLowerCase();
+                            // Look for the '+' icon button
+                            return text === "+" || aria.includes('attach') || (text === "" && el.querySelector('svg'));
+                        });
+                        if (btn) { btn.click(); return true; }
+                        return false;
+                    }""")
+                    
+                    await asyncio.sleep(1)
+                    
+                    # 2. Now wait for the file chooser triggered by "Upload"
+                    async with page.expect_file_chooser(timeout=8000) as fc_info:
+                        await page.evaluate("""() => {
+                            const els = Array.from(document.querySelectorAll('button, div, [role="menuitem"]'));
+                            const uploadBox = els.find(el => {
+                                if (el.offsetWidth === 0 || el.offsetHeight === 0) return false;
+                                const text = (el.innerText || "").toLowerCase();
+                                return text.includes("upload") || text.includes("image");
+                            });
+                            if (uploadBox) uploadBox.click();
+                        }""")
+                    
+                    file_chooser = await fc_info.value
+                    await file_chooser.set_files(str(image_path))
+                    logger.info("✅ Image attached via Visual + PopUp Menu")
+                    upload_success = True
+                    
+                except Exception as e:
+                    logger.warning(f"⚠️ UI-driven upload sequence failed entirely: {e}")
             
             # ── Step 3.5: Click "Make video" for the Seed ──
-            # Since prompt is empty, Grok will just animate the image "sensibly"
-            logger.info("🎬 Pass 1/2: Clicking 'Make video' for the initial Seed animation...")
-            
-            # 3.5.1: Wait for upload to complete (indicated by the appearance of the "Remove" button)
-            logger.info("⏳ Waiting for image upload to finalize...")
+            # GROK UI FIX: The arrow button is DISABLED if the prompt is empty.
+            # We MUST type a tiny character (like '.') to enable it, THEN start.
             try:
-                # Look for the close/remove button on the attached image thumbnail
-                await page.wait_for_selector("button[aria-label*='Remove'], button:has(svg:has-path[d*='M6']), .absolute.top-1.right-1 button", state="visible", timeout=10000)
-                logger.info("✅ Upload confirmed (Remove button detected).")
-                
-                # IMPORTANT: Add a short stabilization sleep after the "Remove" button appears.
-                # The frontend UI and internal React/Next.js state might still be propagating changes 
-                # (e.g., enabling the "Make a video" button).
+                # 3.5.1: Stabilize UI
                 await asyncio.sleep(2)
-            except:
-                logger.warning("🕒 Upload confirmation (Remove button) timed out, attempting click anyway...")
+                prompt_input = page.locator(".ProseMirror, textarea, [contenteditable='true']").first
+                await prompt_input.click()
+                await prompt_input.fill("") # Clear any junk
+                await page.keyboard.type(".")
+                logger.info("⌨️ Typed '.' to enable the 'Make video' button for the seed.")
+            except: pass
 
-            make_video_clicked = False
-            # Broad selectors covering button, div, span, and role variants
-            make_video_selectors = [
-                "button[aria-label='Make video']",
-                "button:has-text('Make video')",
-                "button[data-slot='button']:has-text('Make video')",
-                "button[data-slot='button'][aria-label='Make video']",
-                "button[data-testid='make-video-button']",
-                "[data-testid='submit-button']",
-                "button[aria-label='Submit']",
-                "div:has-text('Make video')",
-                "span:has-text('Make video')",
-                "[role='button']:has-text('Make video')",
-                ".absolute.bottom-4.right-4 button", 
-                ".absolute.bottom-4.right-4 div",
-                "button:has(svg):has-text('Make video')",
-                "text='Make video'"
-            ]
-            combined_selector = ", ".join(make_video_selectors)
-            
-            for attempt in range(25): 
+            async def robust_make_video_click(page_obj, attempt_num):
+                # Aggressive locator: look for the black circle button with up arrow
+                submit_selectors = [
+                    "button.bg-neutral-900.rounded-full",
+                    "button[aria-label='Submit']",
+                    "button[data-testid='send-chat-message-button']",
+                    "button:has(svg:has(path[d*='M6']))",
+                    "button:right-of('.ProseMirror')"
+                ]
+                for sel in submit_selectors:
+                    try:
+                        btn = page_obj.locator(sel).last
+                        if await btn.count() > 0 and await btn.is_visible(timeout=500):
+                            await btn.scroll_into_view_if_needed()
+                            await btn.click(force=True, timeout=2000)
+                            return True
+                    except: continue
+                # Coordinate Fallback relative to prompt container
                 try:
-                    # 1. Try Playwright Locator first
-                    btn = await page.wait_for_selector(combined_selector, state="visible", timeout=1500)
-                    if btn:
-                        # Check disabled state
-                        is_disabled = await btn.evaluate("""el => {
-                            const style = window.getComputedStyle(el);
-                            const text = (el.innerText || "").toLowerCase();
-                            // If it's the search button, ignore it
-                            if (text.includes('search') || el.getAttribute('aria-label') === 'Search') return true;
-                            
-                            return el.disabled || 
-                                   el.getAttribute('aria-disabled') === 'true' || 
-                                   el.classList.contains('opacity-50') ||
-                                   el.classList.contains('disabled') ||
-                                   style.pointerEvents === 'none';
-                        }""")
-                        
-                        if is_disabled:
-                            if attempt % 5 == 0:
-                                logger.info(f"⏳ 'Make video' button is disabled (Attempt {attempt+1}). Waking up UI...")
-                                try:
-                                    # More aggressive wake up: Click input, type something, select all, delete
-                                    prompt_area = page.locator(".ProseMirror, textarea, [contenteditable='true']").first
-                                    await prompt_area.click()
-                                    await page.keyboard.press("Control+a")
-                                    await page.keyboard.press("Backspace")
-                                    await page.keyboard.type(".")
-                                    await asyncio.sleep(0.5)
-                                    await page.keyboard.press("Control+a")
-                                    await page.keyboard.press("Backspace")
-                                    logger.info("⌨️ Performed aggressive UI wake-up (Type/Delete).")
-                                except: pass
-                            
-                            await asyncio.sleep(1)
-                            continue
+                    pm = page_obj.locator(".ProseMirror, textarea").first
+                    box = await pm.bounding_box()
+                    if box:
+                        # Click near the bottom right of the prompt box where the button is
+                        await page_obj.mouse.click(box['x'] + box['width'] - 20, box['y'] + box['height'] - 20)
+                        return True
+                except: pass
+                return False
 
-                        await btn.scroll_into_view_if_needed()
-                        await btn.click(force=True, timeout=3000)
-                        logger.info("✅ Successfully clicked 'Make video' via Playwright.")
-                        make_video_clicked = True
+            logger.info("🎬 Pass 1/2: Clicking 'Make video' for the initial Seed animation...")
+            make_video_clicked = False
+            for attempt in range(15): 
+                if await robust_make_video_click(page, attempt):
+                    logger.info("✅ Successfully clicked 'Make video' for seed.")
+                    make_video_clicked = True
+                    break
+                await asyncio.sleep(1)
+            
+            if not make_video_clicked:
+                logger.error("❌ Failed to click 'Make video' for seed after all attempts.")
+
+            # ── NEW WORKFLOW: Cancel-Trick Injection ──
+            logger.info("⚡ Executing Cancel-Trick: Cancelling initial seed to attach image context...")
+            
+            # Wait for text "Generating" or the Cancel button
+            for i in range(20):
+                try:
+                    if await page.locator("button:has-text('Cancel Video'), text='Generating', .animate-pulse").first.is_visible(timeout=500):
                         break
-                except:
-                    # 2. JS Fallback (Aggressive text/attribute search)
-                    res = await page.evaluate("""() => {
-                        const candidates = Array.from(document.querySelectorAll('button, div, span, [role="button"]'));
-                        // Prioritize buttons
-                        const findMatch = (tag) => candidates.find(el => {
-                            if (tag && el.tagName !== tag.toUpperCase()) return false;
-                            const text = (el.innerText || "").trim().toLowerCase();
-                            const aria = (el.getAttribute('aria-label') || "").toLowerCase();
-                            const isVisible = el.offsetWidth > 0 && el.offsetHeight > 0 && window.getComputedStyle(el).visibility !== 'hidden';
-                            
-                            // Filter out search/other unrelated buttons
-                            if (text.includes('search') || aria.includes('search')) return false;
-                            
-                            // Match 'make video'
-                            const isMakeVideo = text.includes('make video') || aria.includes('make video') || aria === 'make video';
-                            return isVisible && isMakeVideo;
-                        });
+                except: pass
+                await asyncio.sleep(0.5)
 
-                        const b = findMatch('BUTTON') || findMatch();
-                        
-                        if (b) {
-                            const style = window.getComputedStyle(b);
-                            // IMPORTANT: Check for disabled on the element itself OR any parent button
-                            const parentBtn = b.closest('button');
-                            const target = parentBtn || b;
-                            
-                            if (target.disabled || target.getAttribute('aria-disabled') === 'true' || style.pointerEvents === 'none') {
-                                return { found: true, disabled: true, tag: target.tagName };
-                            }
-                            
-                            target.scrollIntoView();
-                            // Dispatch mouse events for more reliability
-                            const box = target.getBoundingClientRect();
-                            const clickEvent = new MouseEvent('click', {
-                                view: window,
-                                bubbles: true,
-                                cancelable: true,
-                                clientX: box.left + box.width / 2,
-                                clientY: box.top + box.height / 2
-                            });
-                            target.dispatchEvent(clickEvent);
-                            target.click(); // Standard click as well
-                            
-                            return { found: true, clicked: true, tag: target.tagName, text: target.innerText };
+            # Click the Cancel Video button with ultra-robust strategy (Native + Coordinates + JS)
+            cancel_clicked = False
+            for attempt in range(25):
+                try:
+                    # 1. Primary: Text locator filtered for visibility
+                    btn = page.locator("text='Cancel Video'").last
+                    if await btn.count() > 0 and await btn.is_visible(timeout=500):
+                        await btn.scroll_into_view_if_needed()
+                        await btn.hover() # Trigger any hover states
+                        await btn.click(force=True, timeout=2000)
+                        cancel_clicked = True
+                        break
+                    
+                    # 2. Secondary: Find coordinates via JS for precise mouse action
+                    coords = await page.evaluate("""() => {
+                        const els = Array.from(document.querySelectorAll('*'));
+                        const target = els.find(el => {
+                            if (el.offsetWidth === 0 || el.offsetHeight === 0) return false;
+                            const text = (el.innerText || "").toLowerCase();
+                            return text.includes("cancel video") || text.includes("cancel");
+                        });
+                        if (target) {
+                            const rect = target.getBoundingClientRect();
+                            return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, found: true };
                         }
                         return { found: false };
                     }""")
                     
-                    if res.get("clicked"):
-                        logger.info(f"✅ Triggered 'Make video' click via JS ({res.get('tag')}). Verifying...")
-                        # Verification: Wait a moment and see if the button disappears or state changes
-                        await asyncio.sleep(2)
-                        btn_still_there = False
-                        try:
-                           btn_still_there = await page.locator(combined_selector).first.is_visible(timeout=500)
-                        except: pass
-                        
-                        if not btn_still_there:
-                            logger.info("✅ Click confirmed (Button is no longer visible).")
-                            make_video_clicked = True
-                            break
-                        else:
-                            logger.warning("⚠️ Button still visible after JS click. Retrying...")
-                    elif res.get("disabled"):
-                        logger.info(f"⏳ Button found ({res.get('tag')}) but it is DISABLED. Retrying...")
-                        
-                    # 3. Coordinate-Based Last Resort (Attempt 10+)
-                    if attempt >= 10:
-                        try:
-                            # Search for the text content and get its box
-                            # Use text selector strictly
-                            box = await page.locator("text='Make video'").first.bounding_box()
-                            if box:
-                                logger.info(f"🎯 Coordinate Fallback: Clicking at ({box['x'] + box['width']/2}, {box['y'] + box['height']/2})")
-                                await page.mouse.click(box['x'] + box['width']/2, box['y'] + box['height']/2)
-                                make_video_clicked = True
-                                break
-                        except: pass
-
-                await asyncio.sleep(0.5)
-
-            # ── Step 4: Multi-Pass Polling (Seed -> Extend -> Refine -> Download) ──
-            logger.info("⏳ Starting Multi-Pass Polling (Seed + Refine)...")
+                    if coords and coords['found']:
+                        logger.info(f"🖱️ Found Cancel button at ({coords['x']}, {coords['y']}). Force clicking via Mouse...")
+                        await page.mouse.move(coords['x'], coords['y'])
+                        await page.mouse.down()
+                        await page.mouse.up()
+                        cancel_clicked = True
+                        break
+                except: pass
+                await asyncio.sleep(0.3)
             
+            if cancel_clicked:
+                logger.info("✅ Cancel button clicked. ⏳ Waiting for generation overlay to disappear...")
+                # Synchronization: Wait until the button is GONE to avoid double-gen
+                for i in range(30):
+                    try:
+                        still_there = await page.evaluate("""() => {
+                            const text = document.body.innerText.toLowerCase();
+                            // Check for the "Generating" pill or "Cancel" text
+                            return text.includes("cancel video") || text.includes("generating");
+                        }""")
+                        if not still_there:
+                            logger.info("✅ Generation overlay is gone.")
+                            break
+                        # Also check if it's already flipped to a video element
+                        if await page.locator("video").first.is_visible(timeout=100):
+                            break
+                    except: break
+                    await asyncio.sleep(0.3)
+            else:
+                logger.warning("⚠️ Could not find Cancel button. Proceeding to inject prompt anyway...")
+                
+            await asyncio.sleep(1)
+            
+            # ── Paste Final Prompt ──
+            logger.info(f"⌨️ Injecting full prompt: {prompt[:50]}...")
+            try:
+                prompt_area = page.locator(".ProseMirror, textarea, [contenteditable='true']").first
+                await prompt_area.click()
+                await prompt_area.fill("")
+                # Use evaluate to force clear just in case
+                await page.evaluate("() => { const el = document.querySelector('.ProseMirror'); if(el) el.innerHTML = '<p></p>'; }")
+                await prompt_area.fill(prompt)
+            except:
+                await page.evaluate(f"((p)=>{{ const el=document.querySelector('.ProseMirror, textarea'); if(el) el.innerText=p; }})('{prompt}')")
+            
+            await asyncio.sleep(1)
+            
+            # ── Click Make Video Again ──
+            logger.info("🎬 Clicking 'Make video' for Final Generation...")
+            final_clicked = False
+            for attempt in range(10):
+                if await robust_make_video_click(page, attempt):
+                    logger.info("✅ Successfully clicked 'Make video' for Final Generation.")
+                    final_clicked = True
+                    break
+                await asyncio.sleep(1)
+                
+            if not final_clicked:
+                logger.error("❌ Failed to trigger Final Generation!")
+                
+            # ── Step 4: Simple Polling until Download Ready ──
+            logger.info("⏳ Waiting for Final Generation to complete...")
             output_dir = Path(os.getcwd()) / "generated_videos"
             output_dir.mkdir(exist_ok=True)
             output = output_dir / f"clip_{uuid4()}.mp4"
             
-            # Multi-Pass State Management
-            current_pass = "SEED" 
-            pass_start_time = asyncio.get_event_loop().time()
-            is_extended = False
-            is_refined = False
-            last_video_src = None # Track URL to detect NEW generation
-
-            max_wait = 400 # Increased for dual-pass
+            max_wait = 400
             poll_interval = 4
             start_time = asyncio.get_event_loop().time()
+            is_generating_last_check = True
 
             while (asyncio.get_event_loop().time() - start_time) < max_wait:
                 if page.is_closed(): break
                 elapsed = int(asyncio.get_event_loop().time() - start_time)
 
-                # 1. Check for standard generation indicators
+                # Check if generating
                 is_generating = False
-                gen_selectors = [
-                    "text='Generating...'", "text='Thinking...'", "text='Generative...'",
-                    "text='Finalizing...'", ".animate-pulse", "button:has-text('Cancel Video')",
-                    "div[role='progressbar']", "svg.animate-spin"
-                ]
-                for ind in gen_selectors:
+                for ind in ["text='Generating...'", "text='Thinking...'", "text='Generative...'", "text='Finalizing...'", ".animate-pulse", "button:has-text('Cancel Video')", "div[role='progressbar']", "svg.animate-spin"]:
                     try:
                         if await page.locator(ind).first.is_visible():
                             is_generating = True
-                            if elapsed % 20 == 0: logger.info(f"⏳ Grok is busy ({current_pass} pass)...")
+                            if elapsed % 20 == 0: logger.info("⏳ Grok is busy generating...")
                             break
                     except: continue
 
-                # 2. Check for dual-video scenario ("I prefer this" buttons)
+                # Look for "I prefer this" dual-video branch
                 try:
                     prefer_buttons = page.locator("button:has-text('I prefer this'), button:has-text('prefer this')")
-                    prefer_count = await prefer_buttons.count()
-                    if prefer_count > 0:
-                        logger.info(f"🎭 Grok generated {prefer_count} video options! Clicking 'I prefer this' on the first one...")
+                    if await prefer_buttons.count() > 0:
+                        logger.info("🎭 Grok generated 2 options! Clicking 'I prefer this' on the first one...")
                         await prefer_buttons.first.click()
-                        await asyncio.sleep(3) # Wait for UI to settle after selection
-                        logger.info("✅ Selected preferred video. Resuming flow...")
-                        continue # Re-enter loop to pick up the selected video
+                        await asyncio.sleep(3)
+                        continue
                 except: pass
 
-                # 3. Check if video is "Ready" enough to continue/download
-                video_ready = await page.evaluate("""
-                    () => {
-                        const v = document.querySelector('video');
-                        if (!v) return { ready: false };
-                        return { ready: v.readyState >= 3, duration: v.duration, src: v.src };
-                    }
-                """)
+                # Check video tags
+                video_ready = await page.evaluate("""() => {
+                    const v = document.querySelector('video');
+                    if (!v) return { ready: false };
+                    return { ready: v.readyState >= 3, duration: v.duration, src: v.src };
+                }""")
                 
-                # A video is "Truly New" if its SRC is different from the last pass
-                is_new_video = video_ready.get("src") != last_video_src
-                ready = video_ready.get("ready") and video_ready.get("duration", 0) > 0 and not is_generating and is_new_video
-
-                # --- STALL DETECTION FALLBACK ---
-                # If we've been in a pass for > 30s and NOT generating, but video isn't "Ready" (often stuck in UI)
-                pass_elapsed = asyncio.get_event_loop().time() - (pass_start_time if 'pass_start_time' in locals() else start_time)
+                ready = video_ready.get("ready") and video_ready.get("duration", 0) > 0 and not is_generating
                 
-                if pass_elapsed > 70 and not is_generating and not ready:
-                    logger.warning(f"🚜 SEVERE STALL detected ({current_pass} pass, {int(pass_elapsed)}s). Hard-resetting via Submit/Retry click...")
-                    try:
-                        # 1. Try the Submit (Up Arrow) button - usually on the right
-                        # 2. Try any button to the LEFT of the input area (user's "white arrow on left")
-                        retry_selectors = [
-                            "button[aria-label='Submit']",
-                            "button:has(svg.fa-arrow-up)", 
-                            ".ProseMirror-parent button", # Circular buttons around input
-                            "button:has(svg):left-of(.ProseMirror)", # Playwright pseudo-selector
-                            "button.rounded-full:has(svg)"
-                        ]
-                        for sel in retry_selectors:
-                            try:
-                                btn = page.locator(sel).first
-                                if await btn.count() > 0:
-                                    await btn.click(force=True)
-                                    logger.info(f"✅ Hard-clicked retry button ({sel}). Waiting for recovery...")
-                                    await asyncio.sleep(8)
-                                    pass_start_time = asyncio.get_event_loop().time() # Reset pass timer
-                                    break
-                            except: continue
-                        continue
-                    except Exception as e:
-                        logger.debug(f"Severe retry fallback failed: {e}")
-
-                elif pass_elapsed > 30 and not is_generating and not ready:
-                    logger.warning(f"⚠️ Video load stall detected ({current_pass} pass, {int(pass_elapsed)}s). Force-clicking 2nd sidebar thumbnail...")
-                    try:
-                        # Target the small status/percentage boxes on the left
-                        # Logic: Grok usually puts the current generation as the 2nd item in history/sidebar
-                        # We look for text matching "##%"
-                        sidebar_items = page.locator("div, button, span").filter(has_text=re.compile(r"^\d+%$"))
-                        count = await sidebar_items.count()
-                        if count >= 2:
-                            # 2nd item is almost always the current one that got 'stuck'
-                            await sidebar_items.nth(1).click()
-                            logger.info("✅ Force-clicked 2nd sidebar thumbnail. Waiting for UI refresh...")
-                            await asyncio.sleep(5)
-                            # Re-poll immediately after click
-                            continue
-                    except Exception as e:
-                        logger.debug(f"Sidebar click fallback failed: {e}")
-
                 if ready:
-                    # --- BRANCH A: Handle Initial Seed Complete ---
-                    if current_pass == "SEED":
-                        last_video_src = video_ready.get("src")
-                        logger.info(f"🌱 Seed Pass Complete (src={last_video_src[:40]}...).")
-                        
-                        # MANDATORY: Give Grok UI 5 seconds to show buttons (Continue/Extend)
-                        await asyncio.sleep(5)
-                        
-                        if needs_extend and not is_extended:
-                            logger.info("🔄 Needs Extend: Clicking 'Extend video' for duration...")
-                            extend_clicked = False
-                            # Strictly look for 'Extend' for duration
-                            for sel in ["button:has-text('Extend video')", "button:has-text('Extend')", "[aria-label*='Extend']"]:
-                                try:
-                                    btn = page.locator(sel).first
-                                    if await btn.count() > 0:
-                                        await btn.click(); extend_clicked = True; break
-                                except: continue
-                            
-                            if extend_clicked:
-                                await asyncio.sleep(3)
-                                ext_dur = extend_duration or "6s"
-                                await VideoSettings.configure(page, duration=ext_dur, aspect=aspect)
-                                await asyncio.sleep(1)
-                                try: await page.keyboard.press("Enter")
-                                except: pass
-                                
-                                logger.info(f"🎬 Extension ({ext_dur}) started. Waiting for EXTENDED clip...")
-                                current_pass = "EXTENDING"
-                                pass_start_time = asyncio.get_event_loop().time()
-                                start_time = asyncio.get_event_loop().time()
-                                await asyncio.sleep(5) 
-                                continue
-                        
-                        # Move directly to Refinement if no extension
-                        current_pass = "REFINING"
-                        pass_start_time = asyncio.get_event_loop().time()
-                        is_extended = True
-                        # Don't 'continue' here, fall through to click REFINEMENT immediately
-                    
-                    # --- BRANCH B: Handle Extension Complete ---
-                    if current_pass == "EXTENDING":
-                        last_video_src = video_ready.get("src")
-                        logger.info(f"✅ Extension Complete (src={last_video_src[:40]}...). Moving to Refinement...")
-                        current_pass = "REFINING"
-                        pass_start_time = asyncio.get_event_loop().time()
-                        is_extended = True
-                        # Fall through to click REFINEMENT
-
-                    # --- BRANCH C: Trigger Refinement (Manual Continue) ---
-                    if current_pass == "REFINING" and not is_refined:
-                        logger.info("🎭 PASS 2/2: Refining Scene — Typing 'Continue this frame' into Input...")
-                        
+                    logger.info("🎯 Final Video is ready! Starting download...")
+                    for sel in ["button[aria-label='Download']", "button:has-text('Download')", "[data-testid='download-button']"]:
                         try:
-                            # 1. Type the Refinement Prompt into the main input box
-                            prompt_input = page.locator(".ProseMirror, textarea, [contenteditable='true']").first
-                            await prompt_input.click()
-                            
-                            # Prefix with "Continue this frame" as per user request
-                            refine_text = f"Continue this frame. {prompt}"
-                            
-                            logger.info(f"⌨️ Injecting refinement prompt: {refine_text[:50]}...")
-                            try:
-                                await prompt_input.fill("") # Clear first
-                                await prompt_input.fill(refine_text)
-                            except:
-                                # JS Fallback for filling
-                                await page.evaluate(f"""(text) => {{
-                                    const el = document.querySelector('.ProseMirror, textarea, [contenteditable="true"]');
-                                    if (el) {{
-                                        if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') el.value = text;
-                                        else el.innerText = text;
-                                        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                                        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                                    }}
-                                }}""", refine_text)
-                            
-                            await asyncio.sleep(1)
-                            
-                            # 2. Click the 'Submit' (Up Arrow) button
-                            submit_clicked = False
-                            submit_selectors = [
-                                "button[aria-label='Submit']",
-                                "button:has(svg.fa-arrow-up)", 
-                                "button:has(svg):has-text('')", # Often an icon-only button
-                                ".absolute.bottom-2.right-2 button", # Position-based fallback
-                                "button.rounded-full:has(svg)" # Circular icon button
-                            ]
-                            
-                            for sel in submit_selectors:
-                                try:
-                                    btn = page.locator(sel).last # Usually the rightmost/last button
-                                    if await btn.count() > 0 and await btn.is_visible():
-                                        await btn.click(force=True)
-                                        submit_clicked = True
-                                        break
-                                except: continue
+                            btn = page.locator(sel).first
+                            if await btn.count() > 0:
+                                async with page.expect_download(timeout=30000) as dl_info:
+                                    await btn.click()
+                                download = await dl_info.value
+                                await download.save_as(output)
                                 
-                            if not submit_clicked:
-                                # Final Keyboard Fallback
-                                await page.keyboard.press("Enter")
-                                submit_clicked = True
-                                logger.info("⌨️ Submitted via Enter key.")
-                            
-                            if not submit_clicked:
-                                # LAST RESORT: Coordinate click based on typical arrow position
-                                try:
-                                    logger.info("🚜 Last Resort: Coordinate click for Send arrow...")
-                                    # Often it's near the bottom right of the .ProseMirror
-                                    area = page.locator(".ProseMirror, textarea").first
-                                    box = await area.bounding_box()
-                                    if box:
-                                        # Click 20px in from the right and 20px up from the bottom of the input container
-                                        await page.mouse.click(box['x'] + box['width'] - 25, box['y'] + box['height'] - 20)
-                                        submit_clicked = True
-                                        logger.info("✅ Coordinate clicked Send arrow.")
-                                except: pass
-                            current_pass = "DOWNLOADING" 
-                            pass_start_time = asyncio.get_event_loop().time()
-                            is_refined = True
-                            start_time = asyncio.get_event_loop().time() 
-                            last_video_src = video_ready.get("src") # Capture to wait for CHANGE
-                            await asyncio.sleep(10) 
-                            continue
-                            
-                        except Exception as e:
-                            logger.error(f"❌ Refinement injection failed: {e}")
-                            logger.warning("⚠️ Falling back to current Seed/Extended clip.")
-                            current_pass = "DOWNLOADING"
-
-                    # --- BRANCH D: Final Download ---
-                    if current_pass == "DOWNLOADING":
-                        logger.info("🎯 Final Refined Clip is ready! Starting download...")
-                        
-                        for sel in ["button[aria-label='Download']", "button:has-text('Download')", "[data-testid='download-button']"]:
-                            try:
-                                btn = page.locator(sel).first
-                                if await btn.count() > 0:
-                                    async with page.expect_download(timeout=30000) as dl_info:
-                                        await btn.click()
-                                    download = await dl_info.value
-                                    await download.save_as(output)
-                                    
-                                    if output.exists() and output.stat().st_size > 150000:
-                                        logger.info(f"✅ Final Video generated and downloaded! ({output.stat().st_size} bytes)")
-                                        return output
-                            except: continue
+                                if output.exists() and output.stat().st_size > 150000:
+                                    logger.info(f"✅ Final Video generated and downloaded! ({output.stat().st_size} bytes)")
+                                    return output
+                        except: continue
+                    
+                    # Fallback download logic if button missing
+                    src = video_ready.get("src")
+                    if src and src.startswith("blob:"):
+                        logger.info("📥 Downloading via blob extraction...")
+                        # ... blob extraction could go here, for now rely on UI
+                        pass
 
                 await asyncio.sleep(poll_interval)
 
-            raise RuntimeError(f"Grok Multi-Pass generation failed or timed out after {max_wait}s")
+            raise RuntimeError(f"Grok single-pass generation failed or timed out after {max_wait}s")
 
         finally:
             # ONLY CLOSE IF WE OPENED IT

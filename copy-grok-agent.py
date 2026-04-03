@@ -587,6 +587,67 @@ async def generate_single_clip(
             # Wait for page to fully load
             await asyncio.sleep(3)
             
+            # MANDATORY: Close the Upload dialog that auto-opens on Grok Imagine
+            try:
+                # The upload dialog contains "Upload File" / "Drop your media" text
+                # and has a close (×) button. Try multiple strategies to dismiss it.
+                upload_dialog_selectors = [
+                    "button:has-text('Upload File')",
+                    "text='Drop your media here'",
+                    "text='Upload'",
+                ]
+                dialog_detected = False
+                for sel in upload_dialog_selectors:
+                    try:
+                        if await page.locator(sel).first.is_visible(timeout=2000):
+                            dialog_detected = True
+                            break
+                    except:
+                        continue
+
+                if dialog_detected:
+                    logger.info("🧹 Upload dialog detected, closing it...")
+                    closed = False
+
+                    # Strategy 1: Click the × (close) button on the dialog
+                    close_btn_selectors = [
+                        "button[aria-label='Close']",
+                        "button[aria-label='close']",
+                        "button[aria-label='Dismiss']",
+                        # Generic close buttons near dialog headers (× icon)
+                        "div[role='dialog'] button:has(svg)",
+                        "[data-state='open'] button:has(svg)",
+                    ]
+                    for close_sel in close_btn_selectors:
+                        try:
+                            close_btn = page.locator(close_sel).first
+                            if await close_btn.count() > 0 and await close_btn.is_visible(timeout=1000):
+                                await close_btn.click(timeout=2000)
+                                logger.info(f"✅ Closed upload dialog via {close_sel}")
+                                closed = True
+                                break
+                        except:
+                            continue
+
+                    # Strategy 2: Press Escape to dismiss overlays
+                    if not closed:
+                        await page.keyboard.press("Escape")
+                        logger.info("✅ Pressed Escape to close upload dialog.")
+                        closed = True
+
+                    await asyncio.sleep(0.5)
+
+                    # Strategy 3: Click outside the dialog to dismiss it (click on backdrop)
+                    if not closed:
+                        try:
+                            await page.mouse.click(10, 10)
+                            logger.info("✅ Clicked outside dialog to close it.")
+                        except:
+                            pass
+                        await asyncio.sleep(0.5)
+            except Exception as e:
+                logger.debug(f"Upload dialog check: {e}")
+            
             # Check rate limit FIRST
             if await check_rate_limit(page):
                 raise RateLimitError("Rate limit detected")
