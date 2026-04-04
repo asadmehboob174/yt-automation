@@ -124,7 +124,7 @@ class FFmpegVideoEditor:
             v_label = f"vraw{i}"
             filter_parts.append(
                 f"[{i}:v]scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
-                f"crop={target_w}:{target_h},setsar=1,tpad=stop_mode=clone:stop=-1,trim=duration={target_dur},setpts=PTS-STARTPTS[{v_label}]"
+                f"crop={target_w}:{target_h},setsar=1,trim=duration={target_dur},setpts=PTS-STARTPTS[{v_label}]"
             )
             v_labels.append(f"[{v_label}]")
             

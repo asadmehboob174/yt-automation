@@ -953,12 +953,20 @@ async def render_final_video(
         # Story Mode (Original Audio): Audio already in stitched clips
         # We need to mix BGM with the *video's existing audio*
         
+        # This variable will hold the video file that has the correct audio already embedded
+        video_with_audio = None
+        
         if bg_music_local:
             if mute_source:
-                 # If source is muted and no fresh audio, it's just BGM
-                 final_audio_path = bg_music_local
+                 # If source is muted and no fresh audio, replace audio with just BGM
+                 video_with_audio = editor.replace_audio_track(
+                     stitched_path,
+                     bg_music_local,
+                     output_path=Path("/tmp/stitched_w_bgm.mp4")
+                 )
             else:
-                final_audio_path = editor.add_background_music(
+                # add_background_music returns a COMPLETE video file with mixed audio
+                video_with_audio = editor.add_background_music(
                     stitched_path,
                     bg_music_local,
                     "/tmp/final_video_w_music.mp4",
@@ -966,19 +974,11 @@ async def render_final_video(
                 )
         else:
             if mute_source:
-                # Silent video? create silent audio track
-                # editor.finalize will handle it? No, finalize expects audio path.
-                # If mute_source and no BGM, we effectively have no audio track.
-                # Creates a valid path with silent audio
-                import shutil
-                shutil.copy(stitched_path, "/tmp/silent.mp4") # Placeholder?
-                # Actually, finalize() uses map 1:a. If we pass stitched_path as audio_path, it uses its audio.
-                # If we want silence, we need a silent audio file.
-                # For now assume mute_source isn't primary use case here.
-                pass# We can generate 1s of silence or just rely on stitched_path having silent track (from anullsrc)
-                final_audio_path = stitched_path # It has anullsrc audio track now
+                # Stitched path already has anullsrc silent audio track from stitch_clips_with_fade
+                video_with_audio = stitched_path
             else:
-                final_audio_path = stitched_path
+                # Audio is already embedded in the stitched clips from Grok
+                video_with_audio = stitched_path
             
         # Subtitles for Story
         subtitle_scenes = []
@@ -990,12 +990,18 @@ async def render_final_video(
             
         srt_path = subtitle_engine.generate_from_script(subtitle_scenes, "/tmp/subtitles.srt")
         
-        final_path = editor.finalize(
-             video_path=final_audio_path,
-             audio_path=final_audio_path, # Embedded
-             subtitle_path=srt_path,
-             output_path="/tmp/final_video.mp4"
-        )
+        # video_with_audio already has the correct audio embedded
+        # Just burn subtitles directly (no need for finalize which re-maps audio)
+        if srt_path:
+            final_path = editor.burn_subtitles(
+                video_with_audio,
+                srt_path,
+                Path("/tmp/final_video.mp4")
+            )
+        else:
+            import shutil
+            final_path = Path("/tmp/final_video.mp4")
+            shutil.copy(str(video_with_audio), str(final_path))
 
     # Upload
     final_key = f"videos/{script['niche_id']}/{script['title'].replace(' ', '_')}.mp4"
