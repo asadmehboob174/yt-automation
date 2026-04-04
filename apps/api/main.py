@@ -878,12 +878,24 @@ async def generate_scene_batch(request: GenerateBatchRequest):
                 character_images=request.character_images,
                 style_suffix=request.style_suffix,
             )
+
+            # Multi-character detection for batch
+            scene_refs = []
+            if request.character_images:
+                prompt_lower = scene_prompt.lower()
+                for char in request.character_images:
+                    name = char.get("name", "").lower()
+                    if name and name in prompt_lower:
+                        scene_refs.append(char.get("imageUrl"))
+                    if len(scene_refs) >= 3: break
+
             try:
                 img_bytes = await generator.generate(
                     prompt=scene_prompt,
                     style_suffix=request.style_suffix,
                     seed=seed,
                     is_shorts=request.is_shorts,
+                    reference_images=scene_refs
                 )
                 image_key = f"scenes/{request.niche_id}/batch_{uuid.uuid4().hex[:8]}_scene_{i}.png"
                 storage.upload_asset(img_bytes, image_key, content_type="image/png")
@@ -971,11 +983,22 @@ async def generate_scene_image(request: GenerateSceneImageRequest):
             if first_name:
                 seed = generator._get_character_seed(first_name)
 
+        # Multi-character detection for single scene
+        scene_refs = []
+        if request.character_images:
+            prompt_lower = scene_prompt.lower()
+            for char in request.character_images:
+                name = char.get("name", "").lower()
+                if name and name in prompt_lower:
+                    scene_refs.append(char.get("imageUrl"))
+                if len(scene_refs) >= 3: break
+
         image_bytes = await generator.generate(
             prompt=scene_prompt,
             style_suffix=style_suffix,
             seed=seed,
             is_shorts=request.is_shorts,
+            reference_images=scene_refs
         )
 
         storage = R2Storage()
@@ -1054,11 +1077,22 @@ async def generate_images_batch(request: GenerateBatchSceneImagesRequest):
                         print(f"     🔄 Retry {attempt+1}/{MAX_RETRIES} for Scene {idx+1}...")
                         await asyncio.sleep(2)
 
+                    # Multi-character detection for images-batch
+                    batch_scene_refs = []
+                    if request.character_images:
+                        prompt_lower = scene_prompt.lower()
+                        for char in request.character_images:
+                            name = char.get("name", "").lower()
+                            if name and name in prompt_lower:
+                                batch_scene_refs.append(char.get("imageUrl"))
+                            if len(batch_scene_refs) >= 3: break
+
                     image_bytes = await generator.generate(
                         prompt=scene_prompt,
                         style_suffix=style_suffix,
                         seed=seed,
                         is_shorts=is_shorts,
+                        reference_images=batch_scene_refs
                     )
                     image_key = f"scenes/{request.niche_id}/{uuid.uuid4().hex[:8]}_scene_{idx}.png"
                     storage.upload_asset(image_bytes, image_key, content_type="image/png")
@@ -1081,6 +1115,7 @@ async def generate_images_batch(request: GenerateBatchSceneImagesRequest):
                     style_suffix=style_suffix,
                     seed=42,
                     is_shorts=False,  # thumbnails are always 16:9
+                    reference_images=None # Thumbnail usually doesn't need IP-Adapter
                 )
                 thumb_key = f"thumbnails/{request.niche_id}/{uuid.uuid4().hex[:8]}_thumb.png"
                 storage.upload_asset(thumb_bytes, thumb_key, content_type="image/png")
@@ -1206,11 +1241,24 @@ async def generate_images_stream(request: GenerateBatchSceneImagesRequest):
                         if attempt > 0:
                             await asyncio.sleep(2)
 
+                        # 1. Identify characters for consistency (Multi-Character Synergy v14.0)
+                        scene_refs = []
+                        if request.character_images:
+                            prompt_lower = scene_prompt.lower()
+                            for char in request.character_images:
+                                name = char.get("name", "").lower()
+                                if name and (name in prompt_lower or f"[{name.upper()}]" in scene_prompt.upper()):
+                                    img_url = char.get("imageUrl")
+                                    if img_url:
+                                        scene_refs.append(img_url)
+                                if len(scene_refs) >= 3: break
+
                         image_bytes = await generator.generate(
                             prompt=scene_prompt,
                             style_suffix=style_suffix,
                             seed=seed,
                             is_shorts=is_shorts,
+                            reference_images=None # Standalone testing prompt usually contains text-only
                         )
                         image_key = f"scenes/{request.niche_id}/{uuid.uuid4().hex[:8]}_scene_{idx}.png"
                         storage.upload_asset(image_bytes, image_key, content_type="image/png")

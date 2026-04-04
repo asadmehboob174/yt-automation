@@ -275,37 +275,89 @@ async def video_upload_workflow(ctx: Context) -> dict:
 # ============================================
 
 async def generate_scene_images(script: dict, channel_config: dict) -> list[str]:
-    """Generate scene images using HuggingFace FLUX.1-schnell."""
+    """
+    Generate scene images with character consistency.
+    1. Pre-generate 'Master Character' portraits.
+    2. Use them as IP-Adapter references for each scene.
+    """
     from .image_generator_factory import get_image_generator
 
     generator = get_image_generator()
     storage = R2Storage()
     image_keys = []
 
-    # Determine Aspect Ratio
+    # Determine Aspect Ratio & Niche
+    niche_id = channel_config.get("nicheId", "default")
     is_shorts = (
-        "shorts" in channel_config.get("nicheId", "").lower()
+        "shorts" in niche_id.lower()
         or "shorts" in channel_config.get("styleSuffix", "").lower()
     )
-    logger.info(f"📐 Detected Mode: {'Shorts (9:16)' if is_shorts else 'Landscape (16:9)'}")
-
     style = channel_config.get("styleSuffix", "")
-    niche_id = channel_config.get("nicheId", "default")
-    characters = script.get("characters", [])  # list of {name, prompt, imageUrl} dicts
+    
+    # --- STEP 1: MASTER CHARACTER GENERATION ---
+    characters = script.get("characters", [])
+    char_refs = {} # name -> local_path
+    
+    if characters:
+        logger.info(f"🎭 Birth of the Cast: Generating {len(characters)} master characters...")
+        for char in characters:
+            name = char.get("name", "Unknown")
+            prompt = char.get("prompt", "")
+            
+            try:
+                # generate_character_image handles square cropping and local saving
+                image_bytes = await generator.generate_character_image(
+                    name=name,
+                    prompt=prompt,
+                    niche_id=niche_id,
+                    style_suffix=style,
+                    is_shorts=is_shorts
+                )
+                
+                # Upload master to R2 for archival
+                safe_name = name.lower().replace(" / ", "_").replace("/", "_").replace(" ", "_")
+                char_key = f"characters/{niche_id}/{safe_name}_master.png"
+                storage.upload_asset(image_bytes, char_key, "image/png")
+                
+                # Store local path for IP-Adapter injection
+                local_path = Path("tmp") / "characters" / niche_id / f"{safe_name}.png"
+                char_refs[name.lower().strip()] = str(local_path)
+                logger.info(f"   ✅ Master Character Born: {name}")
+                
+            except Exception as e:
+                logger.error(f"   ❌ Failed to generate master for {name}: {e}")
 
-    # Use deterministic seed from first character for consistency
+    # --- STEP 2: SCENE GENERATION WITH CONSISTENCY ---
+    # Use deterministic seed from first character or default
     seed = 42
     if characters:
-        first_name = characters[0].get("name", "")
-        if first_name:
-            seed = generator._get_character_seed(first_name)
+        seed = generator._get_character_seed(characters[0].get("name", ""))
 
-    logger.info(f"🚀 Starting Image Generation for {len(script.get('scenes', []))} scenes...")
+    logger.info(f"🎬 Starting Scene Generation for {len(script.get('scenes', []))} scenes...")
 
     for i, scene in enumerate(script.get("scenes", [])):
-        raw_prompt = scene.get("character_pose_prompt", "")
+        raw_prompt = scene.get("character_pose_prompt", "") or scene.get("text_to_image_prompt", "")
 
-        # Embed character descriptions into prompt for visual consistency
+        # 1. Identify which characters are present in this scene (UP TO 3 - Triple Synergy v15.0)
+        scene_refs = []
+        prompt_lower = raw_prompt.lower()
+        
+        # We use a set to avoid adding the same character twice if multiple aliases match
+        detected_names = set()
+        
+        for char_name, local_path in char_refs.items():
+            # Check for name or aliases (e.g., "Blue Fairy" or "Neeli")
+            aliases = [a.strip().lower() for a in char_name.replace(" / ", "/").split("/")]
+            if any(alias in prompt_lower for alias in aliases if len(alias) > 2):
+                if char_name not in detected_names:
+                    scene_refs.append(local_path)
+                    detected_names.add(char_name)
+                    logger.info(f"   👤 Character #{len(scene_refs)} detected in Scene {i+1}: {char_name}")
+                
+                if len(scene_refs) >= 3: # Upgraded to 3 slots
+                    break
+
+        # 2. Build the final prompt (text augmentation)
         scene_prompt = generator.build_scene_prompt(
             scene_prompt=raw_prompt,
             character_images=characters,
@@ -313,16 +365,20 @@ async def generate_scene_images(script: dict, channel_config: dict) -> list[str]
         )
 
         try:
+            # 3. Generate with Dual IP-Adapter (if multiple found)
             image_bytes = await generator.generate(
                 prompt=scene_prompt,
+                reference_images=scene_refs if scene_refs else None, # INJECTION POINT (LIST)
                 style_suffix=style,
                 seed=seed,
                 is_shorts=is_shorts,
             )
+            
             key = f"clips/{niche_id}/scene_{i:03d}_image.png"
             storage.upload_asset(image_bytes, key, "image/png")
             image_keys.append(key)
             logger.info(f"✅ Saved Scene {i+1}: {key}")
+            
         except Exception as e:
             logger.error(f"❌ Failed scene {i+1}: {e}")
 

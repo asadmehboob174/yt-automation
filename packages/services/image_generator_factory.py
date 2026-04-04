@@ -5,18 +5,28 @@ from typing import Union, Optional
 from .cloudflare_ai import CloudflareImageGenerator
 from .gemini_image_generator import GeminiImageGenerator
 from .huggingface_image_generator import HuggingFaceImageGenerator
+from .kaggle_image_generator import KaggleImageGenerator
 
 logger = logging.getLogger(__name__)
 
-def get_image_generator() -> Union[CloudflareImageGenerator, GeminiImageGenerator, HuggingFaceImageGenerator]:
+def get_image_generator() -> Union[KaggleImageGenerator, CloudflareImageGenerator, GeminiImageGenerator, HuggingFaceImageGenerator]:
     """
     Factory function to return the best available image generator.
     Priority: Cloudflare (Flux-1-Schnell) -> Gemini (Pro Plan) -> Hugging Face (Credits/Pollinations).
     """
+    kaggle_domain = os.getenv("KAGGLE_NGROK_DOMAIN")
     cf_token = os.getenv("CF_API_TOKEN") or os.getenv("CLOUDFLARE_API_TOKEN")
     gemini_key = os.getenv("GEMINI_API_KEY")
     
-    # ⚡ 1st Choice: Cloudflare Workers AI (Flux-1-Schnell)
+    # 🏔️ 1st Choice: Kaggle (Free GPU T4 x2)
+    if kaggle_domain:
+        try:
+            logger.info(f"🏔️ Attempting to use Kaggle GPU Image Generator ({kaggle_domain})...")
+            return KaggleImageGenerator()
+        except Exception as e:
+            logger.warning(f"⚠️ Kaggle Generator initialization failed: {e}. Falling back...")
+
+    # ⚡ 2nd Choice: Cloudflare Workers AI (Flux-1-Schnell)
     if cf_token:
         try:
             logger.info("🌤️ Attempting to use Cloudflare Workers AI Image Generator (Flux)...")
